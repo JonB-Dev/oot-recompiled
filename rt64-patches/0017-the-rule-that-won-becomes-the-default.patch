@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 19:20:00 +0100
+Subject: [PATCH] The rule that won becomes the default
+
+Patch 0017 of the renderer series (OoT: Recompiled).
+
+The user, 2026-09-30, on the rung carrying all three parts at once: "alpha cut, keep hit, shadows
+hits ALL fixes!!". So the foliage in this game now takes light, keeps a fairy's glow alive on a
+sun shadowed wall, shows no quad shaped artifact, and casts its own shadow rather than a slab or
+nothing.
+
+That rule is now what the program does with no row touched. A fix nobody can find is not shipped,
+and the Experiment row is a debugging row whose twenty-fifth option no player will ever reach.
+
+Done without renumbering anything, because somebody is mid-test on this row. Each of the three
+parts flips from "on at or above rung N" to "on UNLESS a ladder rung below N is selected". Off
+gets all of it, the unrelated shader experiments get all of it, and every rung of the ladder still
+does exactly the reduced thing it did, so the whole comparison stays available and the chain can
+be walked again by anyone who wants to see why.
+
+The classification the default used to carry (a coverage cut or an alpha compare, patch 0010)
+moves to a rung of its own rather than being kept as a fallback. It never matched one of this
+game's trees, which is what the ladder was built to find out, and a fallback nobody selects is
+dead code.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -64,6 +64,18 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+ // because the primary ray's cut-out compare needs it long before those buffers exist.
+ bool hitWritesDepth(int instanceId);
+ 
++// IS A LADDER RUNG BELOW `rung` SELECTED (patch 0017)? The foliage work was settled on the
++// Experiment row and then made the DEFAULT, because a fix nobody can find is not shipped: that
++// row is for debugging and no player will ever cycle to its twenty-fifth option.
++//
++// So each of the three parts is on UNLESS a rung that deliberately does less is selected. Off
++// gets all of it, the unrelated shader experiments (1 to 7) get all of it, and every rung of the
++// ladder still does exactly the reduced thing it did, so the whole comparison stays available
++// and nothing renumbers under somebody mid-test.
++bool ladderBelow(float rung) {
++    return (RtParams.tuneExperiment.x >= 8.0f) && (RtParams.tuneExperiment.x < rung);
++}
++
+ // The eye, from the inverse view matrix. The parameter block is written by hlslpp on the CPU
+ // with row vectors, so its translation is the fourth row there; HLSL packs the same bytes as a
+ // column major matrix, which reads that row as the fourth column.
+@@ -222,7 +234,7 @@ void PrimaryRayGen() {
+             // every transparent texel became surface and it was worse than the fault. The compare
+             // was the only thing dropping them. Now the alpha test drops them first and on their
+             // own merit, so the compare has nothing left to catch here.
+-            if ((RtParams.tuneExperiment.x >= 24.0f) && !hitWritesDepth(payload.instanceId)) {
++            if (!ladderBelow(24.0f) && !hitWritesDepth(payload.instanceId)) {
+                 break;
+             }
+             depthsWeighed = float2(rasterDepth, hitDepth);
+@@ -1309,7 +1321,7 @@ void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersect
+     //
+     // So on this rung the two uses are separated. The any hit keeps its rejection; the surface
+     // that survives it reports itself whole and takes its full share of light.
+-    if (RtParams.tuneExperiment.x >= 20.0f) {
++    if (!ladderBelow(20.0f)) {
+         const RenderIndices ri = instanceRenderIndices[InstanceID()];
+         const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
+         const OtherMode om = { rp.omL, rp.omH };
+@@ -1378,7 +1390,7 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+     // texel, so turning the test on alone would change nothing at all. An eighth is the same cut
+     // the coverage rule uses for the game's own edge textures; a half is offered beside it for a
+     // texture whose transparent regions are not fully transparent.
+-    const bool reclassifiedFoliage = (RtParams.tuneExperiment.x >= 17.0f) &&
++    const bool reclassifiedFoliage = !ladderBelow(17.0f) &&
+                                      (otherMode.zMode() == ZMODE_XLU) && !otherMode.zUpd();
+     if ((alphaCompare != G_AC_THRESHOLD) && (alphaCompare != G_AC_DITHER) && !coverageCut && !reclassifiedFoliage) {
+         return 1.0f;
+@@ -1432,7 +1444,7 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+     // that asks for it. Taken as a maximum like every other, so a draw that DOES declare a compare
+     // keeps its own and is unaffected by any of this.
+     if (reclassifiedFoliage) {
+-        threshold = max(threshold, (RtParams.tuneExperiment.x >= 19.0f) ? 0.5f : 0.125f);
++        threshold = max(threshold, ladderBelow(19.0f) ? 0.125f : 0.5f);
+     }
+     if (alphaCompare == G_AC_THRESHOLD) {
+         threshold = max(threshold, instanceRDPParams[ri.instanceIndex].blendColor.a);
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1914,7 +1914,21 @@ namespace RT64 {
+                             // survive it. 24 keeps the shadow off, 25 puts it back.
+                             case 24: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
+                             case 25: solidDraw = otherMode.zCmp() && manyTriangles; break;
+-                            default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
++                            // Patch 0010's rule, which was the default until patch 0017 and never
++                            // matched one of this game's trees. Kept as a rung rather than as the
++                            // fallback, so the thing the ladder disproved can still be seen.
++                            case 26: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
++                            // THE DEFAULT IS NOW THE RULE THAT WON (patch 0017), which is rung 25:
++                            // a draw in the translucent z mode that READS depth and is more than a
++                            // sprite is solid, and it casts. The user, 2026-09-30, on that rung:
++                            // "alpha cut, keep hit, shadows hits ALL fixes!!".
++                            //
++                            // The coverage and alpha compare test that used to be here (patch
++                            // 0010) never matched a single one of this game's trees, which is what
++                            // the whole ladder was built to discover. It is not kept as a fallback
++                            // because a fallback nobody selects is just dead code; its rung is
++                            // still there for anyone who wants to see it.
++                            default: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                         }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+                         const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);

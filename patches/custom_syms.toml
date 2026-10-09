@@ -1,0 +1,19 @@
+# Symbols the patches define that the game does not have.
+#
+# The recompiler resolves a patch's references against the exported symbol tables. Anything a patch
+# introduces itself, a new global or a new function that no original code knows about, has no entry
+# there, so it goes here.
+#
+# Empty at Phase 15, which is correct: the proof patch replaces an existing function and introduces
+# nothing. Entries arrive when a patch needs storage or a helper the game never had.
+#
+# The section below is required structure rather than content: the recompiler expects a section
+# array, and an entirely empty file is not valid input.
+
+[[section]]
+name = "..custom_syms"
+rom = 0x00000000
+vram = 0x80801000   # librecomp's patch_rdram_start, matching patches/patches.ld
+size = 0x0
+
+symbols = []

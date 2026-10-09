@@ -1,0 +1,40 @@
+<rml>
+<head>
+    <title>HUD</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim" id="hud-scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">HUD</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">Up and down to move, left and right to change, Escape or the pad's B goes back</div>
+            </div>
+
+            <!-- THE GAME'S HUD, HOW IT FADES (the user, 2026-10-09: "auto-dim/auto-hide hud when not
+                 in use ... dim at all times, or hide/dim hud on mapped key or button"). The rows are
+                 the settings table's, picked out by key (is_hud_setting in ui_shell.cpp), each shown
+                 only while it applies; src/game/hud.h has the rest. -->
+            <div class="rows long" id="hud-rows"></div>
+
+            <div class="foot">
+                <span>Saved as you change it</span>
+                <span id="hud-foot">The HUD button is on the controls screen, Tab or the right stick's click by default</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

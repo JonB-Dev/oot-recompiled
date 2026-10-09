@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 17:21:37 -0400
+Subject: [PATCH] The tall window's light lands on the patch the game painted
+ for it
+
+Patch 0045 of the renderer series (OoT: Recompiled).
+
+The Temple of Time's tall window behind the Master Sword's pedestal: the game painted a bright patch
+on the floor and steps where its own beam through that window fell, and it cannot be taken out
+without taking the floor's texture with it. The user aimed the traced light onto it with 0044's
+Debugging rows and gave the values: "these are the exact settings that pretty much get it lined up
+exactly where it needs to be"; "it was only window 1" (2026-10-08).
+
+A small table of built aims: a window found by its glass (its middle and its size, each within
+8 world units) is turned and made steeper by whole degrees and its glass moved, before the
+Debugging menu's aim, which now moves on from wherever the window already is. One entry: the tall
+window, glass at -10 1280 -768, 192 by 640, 3 degrees steeper, 1 turned, moved -40 30 80.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -596,6 +596,28 @@ namespace RT64 {
+         return hlslpp::float3(std::cos(drop) * std::cos(heading), -std::sin(drop), std::cos(drop) * std::sin(heading));
+     }
+ 
++    // THE BUILT AIMS (patch 0045). A window found by its glass (its middle and its size, each
++    // within BuiltWindowMatch world units) is aimed this way before anything else: degrees
++    // steeper and turned (as aimWindowLight takes them) and its glass moved, in world units.
++    struct BuiltWindowAim {
++        float x, y, z;
++        float width, height;
++        float steeper, turn;
++        float moveX, moveY, moveZ;
++    };
++
++    static const float BuiltWindowMatch = 8.0f;
++
++    static const BuiltWindowAim BuiltWindowAims[] = {
++        // The Temple of Time's tall window behind the Master Sword's pedestal. The game painted
++        // a bright patch on the floor and steps where its own beam through this window fell,
++        // which cannot be taken out without taking the floor's texture with it, so the traced
++        // light is aimed onto it instead: the user's own values from the Debugging menu's aim
++        // (2026-10-08: "these are the exact settings that pretty much get it lined up exactly
++        // where it needs to be"; "it was only window 1"). Its own fall is 0.00 -0.80 0.60.
++        { -10.0f, 1280.0f, -768.0f, 192.0f, 640.0f, 3.0f, 1.0f, -40.0f, 30.0f, 80.0f },
++    };
++
+     // EVERY WINDOW IN A DRAW, NOT ONE WINDOW PER DRAW (patch 0032). The hall's side windows are
+     // drawn by one actor (Bg_Toki_Hikari) in ONE draw: four windows on the two side walls and one
+     // at the front, five separate pieces facing three ways, which is not one flat plane, so the
+@@ -3149,11 +3171,25 @@ namespace RT64 {
+                         kept.direction = interop::float3(rtWindowSunDirection);
+                     }
+ 
++                    // A WINDOW WITH A BUILT AIM (patch 0045) is aimed so first, and the Debugging
++                    // menu's aim (0044) then moves it on from there.
++                    for (const BuiltWindowAim &built : BuiltWindowAims) {
++                        const bool same = (float(hlslpp::length(center - hlslpp::float3(built.x, built.y, built.z))) < BuiltWindowMatch) &&
++                                          (std::abs(kept.pointRadius * 2.0f - built.width) < BuiltWindowMatch) &&
++                                          (std::abs(kept.spotMaxCosine * 2.0f - built.height) < BuiltWindowMatch);
++                        if (same) {
++                            const hlslpp::float3 builtFalls = kept.direction;
++                            kept.direction = interop::float3(aimWindowLight(builtFalls, built.steeper, built.turn));
++                            kept.position = interop::float3(center + hlslpp::float3(built.moveX, built.moveY, built.moveZ));
++                        }
++                    }
++
+                     if ((aimWindow == 0u) || (aimWindow == windowCount)) {
+                         const hlslpp::float3 ownFalls = kept.direction;
+                         const hlslpp::float3 falls = (aimFromShaft && rtShaftKnown) ? rtShaftDirection : ownFalls;
++                        const hlslpp::float3 aimedFrom = kept.position;
+                         kept.direction = interop::float3(aimWindowLight(falls, aimSteeper, aimTurn));
+-                        kept.position = interop::float3(center + aimMove);
++                        kept.position = interop::float3(aimedFrom + aimMove);
+                     }
+ 
+                     kept.flickerIntensity = first ? 1.0f : 0.0f;

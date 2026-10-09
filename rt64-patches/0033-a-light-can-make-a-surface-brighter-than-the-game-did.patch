@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 13:58:23 -0400
+Subject: [PATCH] A light can make a surface brighter than the game did
+
+Patch 0033 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, in the Temple of Time's window light: "similarly to how we have a darkness
+setting which actually darkens shadows, I would love a setting that also amplifies how bright
+lights can light up a ground area ... right now it just lightens it to like its default base
+brightness rather than adding any additional light. Like it's instead of lighting the area, it's
+just cutting out the shadows".
+
+That is the direct pass's knee: whatever a light adds above the game's own full light is
+compressed, one over one plus itself, and capped at twice that light, so a lit patch lands near the
+surface's normal brightness. A new configuration value, the Light brightness row (0 to 1, carried
+in the reflections' spare slot of the parameter block), scales the traced local light up to three
+times, loosens the knee until at 1 there is none, and raises the cap to four times the game's full
+light. At 0 the sum is exactly what it was.
+
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -834,7 +834,8 @@ namespace RT64 {
+         // names them.
+         rtParams.tuneOcclusion = hlslpp::float4(rtConfig.occlusionStrength, rtConfig.occlusionRadius, rtConfig.shadowStrength, rtConfig.lightStrength);
+         rtParams.tuneBounce = hlslpp::float4(rtConfig.bounceStrength, rtConfig.bounceRange, std::max(rtConfig.glowSize, 0.0f), 0.0f);   // z the Glow size row (2026-09-24)
+-        rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, 0.0f, 0.0f);
++        // z the Light brightness row (patch 0033), in the reflections' spare slot.
++        rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, std::clamp(rtConfig.lightBrightness, 0.0f, 1.0f), 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -94,6 +94,7 @@ namespace RT64 {
+         int filterSteps = 2;                 // 0 off, 1 or 2 a trous steps
+         int experiment = 0;                  // the lighting menu's Experiment row: 0 off, else a variant of a disputed sum
+         float darkness = 0.0f;               // the Darkness row (2026-09-24): how much of the game's own ambient is taken away where no traced light falls; 0 off
++        float lightBrightness = 0.0f;        // the Light brightness row (patch 0033): how far traced light may lift a surface above the game's own full light; 0 the knee as it was, 1 none
+         int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1160,7 +1160,18 @@ void DirectRayGen() {
+     const float rung = RtParams.tuneExperiment.x;
+     const bool localAfterKnee = (rung == 31.0f) || (rung == 33.0f);
+     const bool localLiftsShade = (rung == 32.0f) || (rung == 33.0f);
+-    float3 localTerm = local;
++    // THE LIGHT BRIGHTNESS ROW (patch 0033, the user, 2026-10-08: "similarly to how we have a
++    // darkness setting which actually darkens shadows, I would love a setting that also amplifies
++    // how bright lights can light up a ground area ... right now it just lightens it to like its
++    // default base brightness rather than adding any additional light. Like it's instead of
++    // lighting the area, it's just cutting out the shadows"). That is the knee below doing its
++    // job: whatever a light adds above the game's own full light is compressed, one over one plus
++    // itself, so a lit patch lands near the surface's normal brightness. The row, 0 to 1, scales
++    // the traced local light up to three times, loosens the knee until at 1 there is none, and
++    // raises the cap from twice the game's full light to four times. At 0 nothing differs.
++    const float brightness = saturate(RtParams.tuneReflection.z);
++    const float brightCap = shadeCap + 2.0f * brightness;
++    float3 localTerm = local * (1.0f + 2.0f * brightness);
+     if (localLiftsShade) {
+         // How much of the sun this surface is missing, per channel, as a share of the sun it
+         // would have had. Nothing in full sun, everything in full shadow.
+@@ -1171,9 +1182,9 @@ void DirectRayGen() {
+     }
+     const float3 shadedRaw = bounceTerm + sunTermShaded + (localAfterKnee ? float3(0.0f, 0.0f, 0.0f) : localTerm);
+     const float3 excess = max(shadedRaw - lit, 0.0f);
+-    float3 shaded = min(min(shadedRaw, lit) + excess / (1.0f + excess), shadeCap);
++    float3 shaded = min(min(shadedRaw, lit) + excess / (1.0f + excess * (1.0f - brightness)), brightCap);
+     if (localAfterKnee) {
+-        shaded = min(shaded + localTerm, shadeCap);
++        shaded = min(shaded + localTerm, brightCap);
+     }
+     float3 factor;
+     factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;

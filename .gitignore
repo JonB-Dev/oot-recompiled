@@ -1,0 +1,62 @@
+# ROM and anything derived from it. NEVER COMMIT.
+*.z64
+*.n64
+*.v64
+*.elf
+RecompiledFuncs/
+RecompiledPatches/
+src/rsp/*.cpp
+patches/*.elf
+patches/*.bin
+patches/*.map
+patches/*.o
+
+# Read-only upstream clones (they have their own .git)
+upstream/
+
+# Build output
+build/
+build-cmake/
+out/
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+.cache
+
+# Editor
+.vs/
+.idea/
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/tasks.json
+
+# Runtime
+rt64.log
+imgui.ini
+
+# Captures. A screenshot of the game is a picture of its assets and is Restricted, the same class
+# as the ROM. The harness writes under build-cmake\harness (already excluded above); these lines
+# catch a capture saved anywhere near the tooling by mistake.
+tools/**/*.png
+tools/**/*.bmp
+**/harness-out/
+
+# patch build output
+patches/*.o
+patches/*.d
+patches/**/*.o
+patches/**/*.d
+patches/*.elf
+patches/*.bin
+patches/*.map
+RecompiledPatches/
+
+# Handed-over builds, copied aside so a version stays playable while work continues. They
+# hold the user's ROM beside the executable: never committed.
+#
+# ANCHORED TO THE ROOT, and that leading slash is load-bearing. Without it the rule matches a
+# directory called `release` ANYWHERE, which silently swallowed tools/release/ and its uploader:
+# git simply never mentioned the file, which is the worst way for this to go wrong.
+/release/

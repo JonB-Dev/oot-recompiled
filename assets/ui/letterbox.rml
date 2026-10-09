@@ -1,0 +1,38 @@
+<rml>
+<head>
+    <title>Letterbox</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <style>
+        /* THE BARS OF A Z TARGET AND A CUTSCENE (2026-09-24; the user: "the black bar at top and
+           bottom of screen animates in very very chappy rather than smooth when z targeting").
+           The game makes them by scissoring the picture, and that scissor can only move once per
+           game update; these are drawn over the picture instead and their height is set every
+           frame the program presents, so they slide rather than step.
+
+           No transition and no animation here on purpose: the easing is done in the program, in
+           the game's own units and at the game's own speed, so the bars arrive exactly when the
+           game believes they have. A transition on top would fight it. */
+        body {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .bar {
+            position: absolute;
+            left: 0;
+            width: 100%;
+            height: 0px;
+            background-color: #000000ff;
+        }
+        .bar.top { top: 0; }
+        .bar.bottom { bottom: 0; }
+    </style>
+</head>
+<body>
+    <div class="bar top" id="letterbox-top"></div>
+    <div class="bar bottom" id="letterbox-bottom"></div>
+</body>
+</rml>

@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:42:20 -0400
+Subject: [PATCH] A shaft is a shaft whatever the foliage rule says, and the
+ dust is pushed for real
+
+Patch 0039 of the renderer series (OoT: Recompiled).
+
+The user's test in the Temple of Time, 2026-10-08: the Master Sword room's drawn shaft and its
+floor patch were still there, and the tall window's light there read as "just ... a cutout in the
+shadow, not actual additional light being added", the floor lit far less than the hall's while the
+dust in the air above it showed the light. And on the dust: "link is passing right through the
+particles rather than him interacting with them".
+
+THE SHAFT. The foliage rule (patch 0017, the default) makes every translucent draw of more than two
+triangles that reads depth solid. The pedestal shaft has four, the Deku sprout's six, a grotto's
+twelve, so none was ever a candidate for 0029's beam test: no light of its own, never hidden by
+0034, and as solid traced geometry the pedestal shaft stood in its window's light and blocked it,
+which is the dim floor. Now every translucent draw is tested, and one found to be a shaft is a
+see-through overlay no ray traces, drawn after the composite like a glow. In a place with windows,
+while the local lights are traced, every shaft that leans in from above is drawn as nothing,
+whether or not it was traced to a window in that frame; its direction still sets its window's
+light. An upright shaft, a song's cylinder, is drawn as before.
+
+THE PUSH. 0037 carried a mote gently and never past half a cell, so a figure walked through the
+dust. Now a fresh trail sample's body sweeps the air clear (a mote within 32 units of its middle
+is pushed out to that edge), and the carry, the spill and the lift are stronger, to 100 units in
+all. The march looks each point of the ray up through the push, the cell the air there came from,
+so a mote pushed in from a cell the ray never crosses is still found.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2628,12 +2628,26 @@ namespace RT64 {
+                         // beamFromDraw). Only a draw this scene leaves out as see-through, that
+                         // tests depth, with a fading texture: a shaft is never solid and never a
+                         // cut-out. Rung 37 leaves every shaft as the game drew it.
+-                        if (wasTranslucent && !solidDraw && !depthlessOverlay && otherMode.zCmp() && (cutoutRule != 37) &&
++                        //
++                        // A SHAFT IS A SHAFT WHATEVER THE FOLIAGE RULE SAYS (patch 0039). The
++                        // foliage rule (patch 0017, the default) makes every translucent draw of
++                        // more than two triangles that reads depth SOLID, so a shaft of four
++                        // triangles (the Temple of Time's pedestal beam), six (the Deku sprout's)
++                        // or twelve (a grotto's) was never a candidate here: no light of its own,
++                        // never hidden by 0034, and as solid traced geometry it stood in its own
++                        // window's light and blocked it, which is why that light read as only a
++                        // hole in the shadow (the user, 2026-10-08: "this window seems to just be a
++                        // cutout in the shadow, not actual additional light being added"). So the
++                        // test takes every translucent draw, and a draw it finds to be a shaft is a
++                        // see-through overlay no ray traces, drawn after the composite in its own
++                        // brightness, like a glow.
++                        if (wasTranslucent && !depthlessOverlay && otherMode.zCmp() && (cutoutRule != 37) &&
+                             (call.callDesc.tileCount > 0) && (beamLights.size() < MaxBeamLights)) {
+                             const DrawCallTile &beamTile = drawData.callTiles[call.callDesc.tileIndex];
+                             interop::PointLight beam;
+                             if (beamTile.valid && !beamTile.tileCopyUsed && (textureAlphaKind(beamTile.tmemHashOrID) == TextureAlphaKind::Fade) &&
+                                 beamFromDraw(drawData, call, beam)) {
++                                raytracing.queryMask = TranslucentRayQueryMask;
+                                 addBeam(beamLights, beam);
+ 
+                                 // THE SHAFT GOES WHERE ITS WINDOW'S LIGHT STANDS IN FOR IT (patch
+@@ -2647,8 +2661,17 @@ namespace RT64 {
+                                 // A shaft falling any other way (a song's upright cylinder) is.
+                                 const hlslpp::float3 falls = beam.direction;
+                                 const bool lightsTraced = (rtResources->rtParams.level >= 2) && (rtResources->rtParams.tuneOcclusion.w > 0.0f);
+-                                if (rtExternalEnvironment.windowLights && rtWindowSunKnown && lightsTraced &&
+-                                    (float(hlslpp::dot(falls, rtWindowSunDirection)) > 0.995f)) {
++                                // EVERY SLANTED SHAFT, NOT ONLY THE ONE TRACED TO A WINDOW (patch
++                                // 0039, the user, 2026-10-08: "fully remove the light, you know, the
++                                // mimicked light from the Master Sword Room and instead replace it
++                                // with the same brightness and lighting behavior that the windows in
++                                // the main room are doing"). A shaft is only ever traced to a window
++                                // drawn in the same frame, and the tall window and its shaft are not
++                                // always both drawn, so the shaft stayed. In a place with windows a
++                                // shaft leaning in from above is the game's stand-in for a window's
++                                // light and goes; an upright one (a song's cylinder) stays.
++                                const bool upright = (-float(falls.y)) > 0.97f;
++                                if (rtExternalEnvironment.windowLights && lightsTraced && !upright) {
+                                     hideShaft = true;
+                                 }
+                             }
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1490,9 +1490,17 @@ static const float DustDrift = 0.3f;          // how far a mote wanders from its
+ // that pass over it.)
+ static const float MoverLife = 1.0f;          // seconds a trail sample pushes for
+ static const float MoverSpreadRate = 1.5f;    // how much wider a wake grows each second, as a share of the reach
+-static const float MoverCarry = 0.1f;         // seconds of the motion a mote at the heart of the push is carried
+-static const float MoverSpill = 0.05f;        // how far out the air spills behind, per unit a second of the motion
+-static const float MoverLift = 0.03f;         // how far up it billows, the same way
++// A REAL PUSH (patch 0039, the user, 2026-10-08: "link is passing right through the particles
++// rather than him interacting with them"). 0037's push was a gentle carry held under half a cell,
++// so a figure thirty units across walked straight through. Now the newest samples' bodies sweep the
++// air clear: a mote inside MoverBody of a fresh sample is pushed out to its edge. The carry, the
++// spill and the lift are stronger, and the march finds a pushed mote by looking it up through the
++// push (dustInLight), so a push may reach well past the mote's own cell.
++static const float MoverBody = 32.0f;         // world units round a mover's middle that its body sweeps clear
++static const float MoverFresh = 0.2f;         // seconds a sample counts as where the body still is
++static const float MoverCarry = 0.18f;        // seconds of the motion a mote at the heart of the push is carried
++static const float MoverSpill = 0.1f;         // how far out the air spills behind, per unit a second of the motion
++static const float MoverLift = 0.05f;         // how far up it billows, the same way
+ static const float MoverTopSpeed = 400.0f;    // world units a second; anything faster pushes as hard as this
+ 
+ float moverSpread(PointLight light) {
+@@ -1500,14 +1508,20 @@ float moverSpread(PointLight light) {
+ }
+ 
+ float3 moverPush(float3 mote, PointLight light) {
+-    const float life = saturate(1.0f - light.flickerIntensity / MoverLife);
++    const float age = light.flickerIntensity;
++    const float life = saturate(1.0f - age / MoverLife);
+     if (life <= 0.0f) {
+         return float3(0.0f, 0.0f, 0.0f);
+     }
+ 
+-    const float spread = moverSpread(light);
+     const float3 r = mote - light.position;
+-    const float weight = exp(-dot(r, r) / (spread * spread)) * life * life;
++    const float distance = length(r);
++    const float3 away = (distance > 1.0e-3f) ? (r / distance) : float3(0.0f, 1.0f, 0.0f);
++    const float fresh = saturate(1.0f - age / MoverFresh);
++    const float clear = max(MoverBody - distance, 0.0f) * fresh;
++
++    const float spread = moverSpread(light);
++    const float weight = exp(-(distance * distance) / (spread * spread)) * life * life;
+     const float3 velocity = light.direction;
+     const float rawSpeed = length(velocity);
+     const float speed = min(rawSpeed, MoverTopSpeed);
+@@ -1515,8 +1529,8 @@ float3 moverPush(float3 mote, PointLight light) {
+     const float3 side = float3(r.x, 0.0f, r.z);
+     const float sideLength = length(side);
+     const float3 outward = (sideLength > 1.0e-3f) ? (side / sideLength) : float3(0.0f, 0.0f, 0.0f);
+-    const float passed = saturate(light.flickerIntensity * 4.0f);   // the spill and the lift come once the mover has gone by
+-    return weight * (carried * MoverCarry + outward * (speed * MoverSpill * passed) + float3(0.0f, speed * MoverLift * passed, 0.0f));
++    const float passed = saturate(age * 4.0f);   // the spill and the lift come once the mover has gone by
++    return away * clear + weight * (carried * MoverCarry + outward * (speed * MoverSpill * passed) + float3(0.0f, speed * MoverLift * passed, 0.0f));
+ }
+ 
+ uint4 dustHash(uint4 v) {
+@@ -1602,6 +1616,18 @@ float3 windOffset(float seconds) {
+ static const float AmbienceFadeStart = 0.2f;  // the share of the distance where the fade begins
+ static const uint DustMaxSteps = 128;
+ static const uint DustMaxMovers = 4;          // the movers near one ray that push the motes it passes
++static const float AirPushLimit = 100.0f;     // patch 0039: world units at most that the movers together push a mote
++
++// Everything the movers near this ray do to the air at a point (patch 0039), held to AirPushLimit.
++float3 airPush(float3 x, uint movers[DustMaxMovers], uint moverCount) {
++    float3 pushed = float3(0.0f, 0.0f, 0.0f);
++    for (uint k = 0; k < moverCount; k++) {
++        pushed += moverPush(x, SceneLights[movers[k]]);
++    }
++
++    const float pushedLength = length(pushed);
++    return (pushedLength > AirPushLimit) ? (pushed * (AirPushLimit / pushedLength)) : pushed;
++}
+ 
+ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, float medianSize, bool outdoors) {
+     const float fadeEnd = RtParams.tuneAmbience.x;
+@@ -1634,7 +1660,11 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+     int3 lastCell = int3(2147483647, 2147483647, 2147483647);
+     float3 sum = 0.0f;
+     for (uint s = 0; s < steps; s++) {
+-        const float3 p = origin + direction * (float(s) * stepLength) - carried;
++        // LOOKED UP THROUGH THE PUSH (patch 0039): the air at this point of the ray came from
++        // about where the movers' push takes it back to, so that is the cell searched, and a mote
++        // pushed in from a cell the ray never crosses is still found.
++        const float3 world = origin + direction * (float(s) * stepLength);
++        const float3 p = world - carried - ((moverCount > 0u) ? airPush(world, movers, moverCount) : float3(0.0f, 0.0f, 0.0f));
+         const int3 cell = int3(floor(p / DustCell));
+         if (all(cell == lastCell)) {
+             continue;
+@@ -1660,17 +1690,12 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+             const float3 drift = sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
+             float3 mote = (float3(cell) + 0.1f + h.xyz * 0.8f) * DustCell + drift + carried;
+ 
+-            // Pushed by whatever moves near it, never further than its own cell allows, so it is
+-            // still found where the march looks for it.
+-            float3 pushed = float3(0.0f, 0.0f, 0.0f);
+-            for (uint k = 0; k < moverCount; k++) {
+-                pushed += moverPush(mote, SceneLights[movers[k]]);
++            // Pushed by whatever moves near it (patch 0039: as far as AirPushLimit, the march
++            // having looked it up through the push).
++            if (moverCount > 0u) {
++                mote += airPush(mote, movers, moverCount);
+             }
+ 
+-            const float pushedLength = length(pushed);
+-            const float pushLimit = DustCell * 0.45f;
+-            mote += (pushedLength > pushLimit) ? (pushed * (pushLimit / pushedLength)) : pushed;
+-
+             const float along = dot(mote - origin, direction);
+             if ((along <= DustNear) || (along >= range)) {
+                 continue;

@@ -1,0 +1,716 @@
+From 2e8a6c3c771658cd020ec0b7c42972162dd4844c Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 24 Sep 2026 06:26:38 -0400
+Subject: [PATCH] Ambient occlusion and the game's own local lights
+
+Patch 0006 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md).
+
+Level 2 of the row. Two passes join the shadows, and the direct pass folds all three into the
+one factor the composite multiplies the game's picture by. The occlusion pass sends a few cosine
+weighted rays over the hemisphere as far as a design constant in world units, each blocked ray
+counting more the closer it was stopped, and writes the fraction of ambient light the surface can
+see. The local lights pass takes the game's own point lights (a torch, a candle, a fire) at the
+game's own falloff, 1 - (d / r)^2, each with a shadow ray toward a point on the flame, and writes
+their sum. The direct pass divides the game's lighting with the occlusion on its ambient, the
+sun's shadow on its directional term and the local lights added, by the game's lighting as it
+was, so a torch's light reaches a surface through the surface's own color and a shadow darkens
+to the game's ambient and never below.
+
+The lights come from the program, not the light manager: this game hands the microcode a per
+actor directional stand-in for each point light and none at all for the rooms (Lights_BindPoint
+in the decompilation), so the light manager never sees one. The program reads the game's light
+list once a frame and publishes it to the render queues under their lock; the queue hands it to
+the framebuffer renderer every frame, and the traced scene takes it before the projection's own.
+
+The directional light is carried whether or not the frame has a sky; the sky decides only
+whether it casts a shadow (a room's directional light is a fill the game invents, and it stays
+in the arithmetic as the game's own lighting). Translucent draws (the microcode's XLU z mode)
+carry a query mask of their own and no ray sees them: a flame's billboard would otherwise stand
+between every surface and its torch.
+
+Pinned edits, each marked "patch 0006": the level, the sample count and the shadow flag in the
+parameter block where the padding words were; two visualization modes; the two textures in the
+common descriptor set and the shader's register block; the query mask; the lights' path through
+the shared queue resources, the workload queue and the framebuffer renderer; the two dispatches
+with their timer spans and the barrier before the direct pass; the debug views.
+
+diff --git a/src/common/rt64_common.h b/src/common/rt64_common.h
+index f79adbf..3ddad50 100644
+--- a/src/common/rt64_common.h
++++ b/src/common/rt64_common.h
+@@ -30,6 +30,9 @@ namespace RT64 {
+     static const unsigned int DepthRayQueryMask = 0x1;
+     static const unsigned int NoDepthRayQueryMask = 0x2;
+     static const unsigned int ShadowCatcherRayQueryMask = 0x4;
++    // A translucent draw (the microcode's XLU z mode), which no ray traces (patch 0006): a
++    // flame's billboard would otherwise stand between every surface and its torch.
++    static const unsigned int TranslucentRayQueryMask = 0x8;
+ 
+     // Error string for last error or exception that was caught.
+     extern std::string GlobalLastError;
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index 8858dac..8e23269 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <mutex>
++#include <vector>
+ 
+ #include "common/rt64_common.h"
+ #include "common/rt64_emulator_configuration.h"
+@@ -105,6 +106,18 @@ namespace RT64 {
+             rtConfig = newRtConfig;
+             rtConfigChanged = true;
+         }
++
++        // The game's point lights for the traced passes (patch 0006), published by the program
++        // once a frame from the game's own light list and taken by the workload queue every
++        // frame, which reads them under the configuration mutex it already holds. The light
++        // manager never sees one: this game hands the microcode a directional stand-in per
++        // actor for each.
++        std::vector<interop::PointLight> rtLights;
++
++        void setRtLights(const std::vector<interop::PointLight> &newRtLights) {
++            std::scoped_lock<std::mutex> configurationLock(configurationMutex);
++            rtLights = newRtLights;
++        }
+ #   endif
+     };
+ };
+\ No newline at end of file
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index d546d24..f1f1c2f 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -248,6 +248,12 @@ namespace RT64 {
+             framebufferRenderer->setRaytracingConfig(ext.sharedResources->rtConfig, ext.sharedResources->fbConfigChanged || sizeChanged);
+             ext.sharedResources->rtConfigChanged = false;
+         }
++
++        // The game's point lights for the traced passes, every frame (patch 0006), read here
++        // because this function holds the shared resources' configuration mutex already.
++        if (workloadConfig.raytracingEnabled) {
++            framebufferRenderer->setRaytracingLights(ext.sharedResources->rtLights);
++        }
+ #   endif
+         
+         workloadConfig.postBlendNoise = ext.sharedResources->emulatorConfig.dither.postBlendNoise;
+diff --git a/src/render/rt64_descriptor_sets.h b/src/render/rt64_descriptor_sets.h
+index 69a82ac..68ee26e 100644
+--- a/src/render/rt64_descriptor_sets.h
++++ b/src/render/rt64_descriptor_sets.h
+@@ -212,6 +212,8 @@ namespace RT64 {
+         uint32_t gFilteredDirectLight;
+         uint32_t gFilteredIndirectLight;
+         uint32_t gBlueNoise;
++        uint32_t gOcclusion;    // patch 0006
++        uint32_t gLocalLight;   // patch 0006
+ 
+         FramebufferRendererDescriptorCommonSet(const SamplerLibrary &samplerLibrary, bool raytracing, RenderDevice *device = nullptr) {
+             builder.begin();
+@@ -282,6 +284,8 @@ namespace RT64 {
+             gFilteredDirectLight = builder.addReadWriteTexture(65);
+             gFilteredIndirectLight = builder.addReadWriteTexture(66);
+             gBlueNoise = builder.addTexture(67);
++            gOcclusion = builder.addReadWriteTexture(68);    // patch 0006
++            gLocalLight = builder.addReadWriteTexture(69);   // patch 0006
+             builder.end();
+ 
+             if (device != nullptr) {
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 8fd6866..4e84a9e 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -370,6 +370,8 @@ namespace RT64 {
+             descCommonSet->setBuffer(descCommonSet->interleavedRasters, interleavedRastersBuffer.get(), sizeof(interop::InterleavedRaster) * std::max(interleavedRastersCount, 1U), RenderBufferStructuredView(sizeof(interop::InterleavedRaster)));
+             descCommonSet->setTexture(descCommonSet->gBlueNoise, blueNoiseTexture, RenderTextureLayout::SHADER_READ);
+             descCommonSet->setBuffer(descCommonSet->instanceExtraParams, drawBuffers->extraParamsBuffer.get(), RenderBufferStructuredView(sizeof(interop::ExtraParams)));
++            descCommonSet->setTexture(descCommonSet->gOcclusion, rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL);     // patch 0006
++            descCommonSet->setTexture(descCommonSet->gLocalLight, rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL);   // patch 0006
+             descCommonSet->setBuffer(descCommonSet->RtParams, rtResources->rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
+         }
+ #   endif
+@@ -779,7 +781,9 @@ namespace RT64 {
+                 RenderTextureBarrier(rtResources->filteredDirectLightTexture[0].get(), RenderTextureLayout::GENERAL),
+                 RenderTextureBarrier(rtResources->filteredDirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
+                 RenderTextureBarrier(rtResources->filteredIndirectLightTexture[0].get(), RenderTextureLayout::GENERAL),
+-                RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL)
++                RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
++                RenderTextureBarrier(rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL),    // patch 0006
++                RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL)    // patch 0006
+             };
+ 
+             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCreationBarriers, uint32_t(std::size(afterCreationBarriers)));
+@@ -828,6 +832,28 @@ namespace RT64 {
+ 
+         worker->commandList->barriers(RenderBarrierStage::COMPUTE, shadingBarriers, uint32_t(std::size(shadingBarriers)));
+ 
++        // The occlusion and the local lights (patch 0006), whose results the direct pass folds
++        // into its factor. Both read the primary pass's position and normal alone, so they run
++        // back to back and one barrier covers their outputs before the direct pass reads them.
++        RT64_LOG_PRINTF("Dispatching occlusion rays");
++        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 5;
++        rtResources->timerBegin(worker, RaytracingResources::Span::Occlusion);
++        worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++        rtResources->timerEnd(worker, RaytracingResources::Span::Occlusion);
++
++        RT64_LOG_PRINTF("Dispatching local light rays");
++        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 6;
++        rtResources->timerBegin(worker, RaytracingResources::Span::Lights);
++        worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++        rtResources->timerEnd(worker, RaytracingResources::Span::Lights);
++
++        RenderTextureBarrier factorInputBarriers[] = {
++            RenderTextureBarrier(rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL)
++        };
++
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, factorInputBarriers, uint32_t(std::size(factorInputBarriers)));
++
+         // Dispatch rays for direct light.
+         RT64_LOG_PRINTF("Dispatching direct light rays");
+         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 1;
+@@ -1312,6 +1338,10 @@ namespace RT64 {
+     }
+ 
+ #if RT_ENABLED
++    void FramebufferRenderer::setRaytracingLights(const std::vector<interop::PointLight> &lights) {
++        rtExternalLights = lights;   // patch 0006
++    }
++
+     void FramebufferRenderer::setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged) {
+         assert(rtResources != nullptr);
+         rtResources->setRaytracingConfig(rtConfig, resolutionChanged);
+@@ -1641,7 +1671,13 @@ namespace RT64 {
+                         raytracing.cullDisable = !call.shaderDesc.flags.culling;
+ 
+                         const interop::OtherMode &otherMode = call.callDesc.otherMode;
+-                        raytracing.queryMask = (otherMode.zCmp() || otherMode.zUpd()) ? DepthRayQueryMask : NoDepthRayQueryMask;
++                        // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
++                        if (otherMode.zMode() == ZMODE_XLU) {
++                            raytracing.queryMask = TranslucentRayQueryMask;
++                        }
++                        else {
++                            raytracing.queryMask = (otherMode.zCmp() || otherMode.zUpd()) ? DepthRayQueryMask : NoDepthRayQueryMask;
++                        }
+                         if (drawData.extraParams[call.callDesc.callIndex].shadowCatcherFactor > 0.0f) {
+                             raytracing.queryMask |= ShadowCatcherRayQueryMask;
+                         }
+@@ -1793,10 +1829,11 @@ namespace RT64 {
+                         // whichever projection is current, which in this game is the sky's, so the
+                         // pair's projections are searched for the strongest directional light and
+                         // that projection's sun and ambient are the scene's. The shadow pass leaves
+-                        // the ambient standing where the sun is blocked. The sun is a sun only under
+-                        // a sky: a room's directional light is a fill the game invents, and traced
+-                        // against the room's own walls it shadowed the whole room, so a frame with
+-                        // no sky draw has no sun and its interiors are left to the local lights.
++                        // the ambient standing where the sun is blocked. The light is carried
++                        // whether or not the frame has a sky, as the game's own lighting for the
++                        // passes' arithmetic (patch 0006); the sky decides whether it casts a
++                        // shadow, because a room's directional light is a fill the game invents,
++                        // and traced against the room's own walls it shadowed the whole room.
+                         {
+                             const LightManager *lit = nullptr;
+                             const LightManager::Directional *sun = nullptr;
+@@ -1836,7 +1873,8 @@ namespace RT64 {
+                             rtScene.sunDirection = hlslpp::float3(0.0f, 0.0f, 0.0f);
+                             rtScene.sunColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
+                             rtScene.ambientColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
+-                            if (hasSky && (sun != nullptr) && (sun->intensityTotal > 0.0f)) {
++                            rtScene.sunShadows = hasSky;   // patch 0006
++                            if ((sun != nullptr) && (sun->intensityTotal > 0.0f)) {
+                                 rtScene.sunDirection = hlslpp::normalize(sun->dir);
+                                 rtScene.sunColor = sun->colTotal / sun->intensityTotal;
+                                 if (lit->ambientSum > 0) {
+@@ -1845,7 +1883,13 @@ namespace RT64 {
+                             }
+                         }
+ 
+-                        if (proj.pointLightCount > 0) {
++                        // The game's own light list, published by the program (patch 0006), before
++                        // the projection's, which in this game is always empty.
++                        if (!rtExternalLights.empty()) {
++                            rtScene.pointLights = rtExternalLights.data();
++                            rtScene.lightCount = uint32_t(rtExternalLights.size());
++                        }
++                        else if (proj.pointLightCount > 0) {
+                             rtScene.pointLights = proj.pointLights.data();
+                             rtScene.lightCount = proj.pointLightCount;
+                         }
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index 3add9c3..6fceade 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -177,6 +177,11 @@ namespace RT64 {
+         void updateRaytracingScene(RenderWorker *worker, const RaytracingScene &rtScene);
+         void submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene);
+         void setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged);
++        void setRaytracingLights(const std::vector<interop::PointLight> &lights);
++
++        // The game's point lights for the traced scene (patch 0006), set every frame by the
++        // workload queue from what the program published; taken before the projection's own.
++        std::vector<interop::PointLight> rtExternalLights;
+ #   endif
+     };
+ };
+\ No newline at end of file
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index 93dd957..bc92fc1 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -243,8 +243,8 @@ namespace RT64 {
+             const uint32_t i = uint32_t(span);
+             return (spanFrames[i] > 0) ? (spanMilliseconds[i] / spanFrames[i]) : 0.0;
+         };
+-        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao 0.000 lights 0.000 gi 0.000 reflect 0.000 scatter 0.000 filter 0.000 ms (gpu), recording %.3f ms, %u frames\n",
+-            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), recordingMs, buildFrames);
++        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao %.3f lights %.3f gi 0.000 reflect 0.000 scatter 0.000 filter 0.000 ms (gpu), recording %.3f ms, %u frames\n",
++            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), spanMs(Span::Occlusion), spanMs(Span::Lights), recordingMs, buildFrames);
+ 
+         // The scene's lights as the passes see them (patch 0005), beside the budget line.
+         std::fprintf(stderr, "[rt] light sun (%.2f %.2f %.2f) toward (%.2f %.2f %.2f) ambient (%.2f %.2f %.2f) point lights %u\n",
+@@ -346,6 +346,7 @@ namespace RT64 {
+         rtParams.ambientBaseColor = hlslpp::float4(rtScene.ambientColor, 0.0f);
+         rtParams.sunDirection = hlslpp::float4(rtScene.sunDirection, SunAngularRadius);
+         rtParams.sunColor = hlslpp::float4(rtScene.sunColor, 0.0f);
++        rtParams.sunShadows = rtScene.sunShadows ? 1u : 0u;   // patch 0006
+ 
+         const uint64_t size = sizeof(interop::PointLight) * std::max(count, 1u);
+         const uint32_t slot = ringIndex % RingDepth;
+@@ -385,6 +386,8 @@ namespace RT64 {
+         retire(flowTexture);
+         retire(reactiveMaskTexture);
+         retire(lockMaskTexture);
++        retire(occlusionTexture);
++        retire(localLightTexture);
+         retire(lumaAverageTexture);
+         retire(downscaledOutputTexture);
+         retire(upscaledOutputTexture);
+@@ -420,6 +423,11 @@ namespace RT64 {
+         flowTexture = makeStorage(device, width, height, RenderFormat::R32G32_FLOAT);
+         reactiveMaskTexture = makeStorage(device, width, height, RenderFormat::R16_FLOAT);
+         lockMaskTexture = makeStorage(device, width, height, RenderFormat::R16_FLOAT);
++
++        // The occlusion pass's fraction of open sky over the surface and the local lights' sum
++        // at it (patch 0006), both read by the shadow pass for its factor.
++        occlusionTexture = makeStorage(device, width, height, RenderFormat::R16_FLOAT);
++        localLightTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
+         lumaAverageTexture = makeStorage(device, 1, 1, RenderFormat::R32_FLOAT);
+         downscaledOutputTexture = makeStorage(device, std::max(width / 8, 1u), std::max(height / 8, 1u), RenderFormat::R32G32B32A32_FLOAT);
+         upscaledOutputTexture = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::RENDER_TARGET);
+@@ -540,6 +548,8 @@ namespace RT64 {
+         rtParams.diSamples = uint32_t(std::max(rtConfig.diSamples, 0));
+         rtParams.giSamples = uint32_t(std::max(rtConfig.giSamples, 0));
+         rtParams.maxLights = uint32_t(std::max(rtConfig.maxLights, 0));
++        rtParams.level = uint32_t(std::max(rtConfig.level, 0));                       // patch 0006
++        rtParams.occlusionSamples = uint32_t(std::max(rtConfig.occlusionSamples, 0));  // patch 0006
+         rtParams.motionBlurStrength = rtConfig.motionBlurStrength;
+         rtParams.motionBlurSamples = uint32_t(std::max(rtConfig.motionBlurSamples, 0));
+         rtParams.visualizationMode = rtConfig.visualizationMode;
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index a953af7..c552999 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -64,6 +64,11 @@ namespace RT64 {
+         int giSamples = 0;
+         int maxLights = 16;
+         int maxReflections = 0;
++
++        // The row's level (patch 0006): 1 runs the structures and the shadows, 2 adds the
++        // occlusion and the local lights, 3 the rest. The occlusion's rays per pixel per frame.
++        int level = 1;
++        int occlusionSamples = 4;
+         int motionBlurSamples = 0;
+         float motionBlurStrength = 0.0f;
+         interop::VisualizationMode visualizationMode = interop::VisualizationMode::Final;
+@@ -103,6 +108,11 @@ namespace RT64 {
+         hlslpp::float3 sunDirection = hlslpp::float3(0.0f, 0.0f, 0.0f);
+         hlslpp::float3 sunColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
+         hlslpp::float3 ambientColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
++
++        // Whether the directional light casts shadows (patch 0006): only under a sky. A room's
++        // directional light is a fill the game invents; it stays in the passes' arithmetic as
++        // the game's own lighting but shadows nothing.
++        bool sunShadows = false;
+     };
+ 
+     struct RaytracingResources {
+@@ -160,6 +170,11 @@ namespace RT64 {
+         std::unique_ptr<RenderTexture> flowTexture;
+         std::unique_ptr<RenderTexture> reactiveMaskTexture;
+         std::unique_ptr<RenderTexture> lockMaskTexture;
++
++        // The occlusion pass's result and the local lights' sum (patch 0006), one channel and
++        // color, read by the direct pass for its factor.
++        std::unique_ptr<RenderTexture> occlusionTexture;
++        std::unique_ptr<RenderTexture> localLightTexture;
+         std::unique_ptr<RenderTexture> downscaledOutputTexture;
+         std::unique_ptr<RenderTexture> lumaAverageTexture;
+         std::unique_ptr<RenderTexture> upscaledOutputTexture;
+@@ -250,6 +265,8 @@ namespace RT64 {
+         enum class Span : uint32_t {
+             Build = 0,
+             Shadows,
++            Occlusion,   // patch 0006
++            Lights,      // patch 0006
+             Count
+         };
+ 
+diff --git a/src/render/rt64_raytracing_shader_cache.cpp b/src/render/rt64_raytracing_shader_cache.cpp
+index e69f39c..7748cf7 100644
+--- a/src/render/rt64_raytracing_shader_cache.cpp
++++ b/src/render/rt64_raytracing_shader_cache.cpp
+@@ -63,6 +63,8 @@ namespace RT64 {
+             RenderRaytracingPipelineLibrarySymbol("IndirectRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
+             RenderRaytracingPipelineLibrarySymbol("ReflectionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
+             RenderRaytracingPipelineLibrarySymbol("RefractionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("OcclusionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("LightsRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
+             RenderRaytracingPipelineLibrarySymbol("SurfaceMiss", RenderRaytracingPipelineLibrarySymbolType::MISS),
+             RenderRaytracingPipelineLibrarySymbol("ShadowMiss", RenderRaytracingPipelineLibrarySymbolType::MISS),
+             RenderRaytracingPipelineLibrarySymbol("SurfaceClosestHit", RenderRaytracingPipelineLibrarySymbolType::CLOSEST_HIT),
+@@ -96,6 +98,8 @@ namespace RT64 {
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Indirect)] = state.pipeline->getProgram("IndirectRayGen");
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Reflection)] = state.pipeline->getProgram("ReflectionRayGen");
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Refraction)] = state.pipeline->getProgram("RefractionRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Occlusion)] = state.pipeline->getProgram("OcclusionRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Lights)] = state.pipeline->getProgram("LightsRayGen");
+         state.missPrograms[uint32_t(RaytracingMiss::Surface)] = state.pipeline->getProgram("SurfaceMiss");
+         state.missPrograms[uint32_t(RaytracingMiss::Shadow)] = state.pipeline->getProgram("ShadowMiss");
+ 
+diff --git a/src/render/rt64_raytracing_shader_cache.h b/src/render/rt64_raytracing_shader_cache.h
+index 18d2a09..3c4f04f 100644
+--- a/src/render/rt64_raytracing_shader_cache.h
++++ b/src/render/rt64_raytracing_shader_cache.h
+@@ -47,6 +47,8 @@ namespace RT64 {
+         Indirect = 2,
+         Reflection = 3,
+         Refraction = 4,
++        Occlusion = 5,   // patch 0006: after the pinned five, whose indices the renderer's dispatch names
++        Lights = 6,      // patch 0006
+         Count
+     };
+ 
+diff --git a/src/shaders/DebugPS.hlsl b/src/shaders/DebugPS.hlsl
+index fe40a25..a11f5e1 100644
+--- a/src/shaders/DebugPS.hlsl
++++ b/src/shaders/DebugPS.hlsl
+@@ -110,6 +110,16 @@ float4 getLockMask(float2 pos) {
+     return float4(l, l, l, 1.0f);
+ }
+ 
++// Patch 0006: the occlusion pass's fraction, and the local lights' sum.
++float4 getAmbientOcclusion(float2 pos) {
++    float o = gOcclusion[pos];
++    return float4(o, o, o, 1.0f);
++}
++
++float4 getLocalLight(float2 pos) {
++    return float4(LinearToSrgb(gLocalLight[pos].rgb), 1.0f);
++}
++
+ float4 getDepth(float2 pos) {
+     float d = gDepth[pos].r;
+     return float4(d, d, d, 1.0f);
+@@ -149,6 +159,10 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
+         return getLockMask(uv * RtParams.resolution.xy);
+     case VisualizationMode::Depth:
+         return getDepth(uv * RtParams.resolution.xy);
++    case VisualizationMode::AmbientOcclusion:
++        return getAmbientOcclusion(uv * RtParams.resolution.xy);
++    case VisualizationMode::LocalLight:
++        return getLocalLight(uv * RtParams.resolution.xy);
+     default:
+         return float4(0.5f, 0.5f, 0.5f, 1.0f);
+     }
+diff --git a/src/shaders/FbRendererRT.hlsli b/src/shaders/FbRendererRT.hlsli
+index eff6ff8..e6c12b3 100644
+--- a/src/shaders/FbRendererRT.hlsli
++++ b/src/shaders/FbRendererRT.hlsli
+@@ -54,6 +54,8 @@ RWTexture2D<float4> gPrevIndirectLightAccum : register(u64, space0);
+ RWTexture2D<float4> gFilteredDirectLight : register(u65, space0);
+ RWTexture2D<float4> gFilteredIndirectLight : register(u66, space0);
+ Texture2D<float4> gBlueNoise : register(t67, space0);
++RWTexture2D<float> gOcclusion : register(u68, space0);      // patch 0006
++RWTexture2D<float4> gLocalLight : register(u69, space0);    // patch 0006
+ 
+ // Set 3 - Framebuffer.
+ Texture2D<float4> gBackgroundColor : register(t1, space3);
+\ No newline at end of file
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+index 6676c39..419c6c3 100644
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -40,6 +40,7 @@ struct SurfacePayload {
+ 
+ struct ShadowPayload {
+     float visibility;       // 1 when the ray escaped, 0 when something stood in the way
++    float hitDistance;      // where it was stopped, for the occlusion pass's falloff; 0 when it escaped
+ };
+ 
+ // The eye, from the inverse view matrix. The parameter block is written by hlslpp on the CPU
+@@ -88,6 +89,8 @@ void clearOutputs(uint2 launchIndex) {
+     gLockMask[launchIndex] = 0.0f;
+     gNormalRoughness[launchIndex] = 0.0f;
+     gDepth[launchIndex] = 0.0f;
++    gOcclusion[launchIndex] = 1.0f;
++    gLocalLight[launchIndex] = 0.0f;
+ }
+ 
+ [shader("raygeneration")]
+@@ -158,6 +161,134 @@ void tangentFrame(float3 n, out float3 t, out float3 b) {
+ static const float ShadowBiasBase = 0.5f;          // world units off the surface, Link is about 60
+ static const float ShadowBiasPerUnit = 0.002f;     // more with distance, where the hit position is coarser
+ 
++// The surface point a secondary ray leaves from: off the surface along its normal, further with
++// distance from the eye, where the hit position is coarser.
++float3 rayOrigin(float3 position, float3 normal) {
++    return position + normal * (ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition()));
++}
++
++// One shadow ray: 1 when nothing stands between the origin and tMax along the direction.
++float traceVisibility(float3 origin, float3 direction, float tMax, out float hitDistance) {
++    RayDesc ray;
++    ray.Origin = origin;
++    ray.Direction = direction;
++    ray.TMin = 0.0f;
++    ray.TMax = tMax;
++
++    ShadowPayload payload;
++    payload.visibility = 1.0f;
++    payload.hitDistance = 0.0f;
++    TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, DepthRayQueryMask, 1, 0, 1, ray, payload);
++    hitDistance = payload.hitDistance;
++    return payload.visibility;
++}
++
++// THE OCCLUSION PASS (phase 55, patch 0006). A few cosine weighted rays over the hemisphere, as
++// far as a design constant in world units, each blocked ray counting more the closer it was
++// stopped; the result is the fraction of the ambient light the surface can see, which the direct
++// pass applies to the game's ambient term alone (the sun and the local lights have their own
++// shadows). Phase 57 accumulates the frames.
++// The radius is short on purpose: this is the darkening where surfaces meet (a corner, a foot on
++// the floor, a shelf against a wall), not a room's whole ambient light, which the game's own
++// ambient already is. At 120 units a room of this game's size read as evenly darker everywhere.
++static const float OcclusionRadius = 40.0f;    // world units; Link is about 60 tall
++static const float OcclusionStrength = 0.7f;
++
++[shader("raygeneration")]
++void OcclusionRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    if (gInstanceId[launchIndex] < 0) {
++        return;
++    }
++
++    const uint samples = RtParams.occlusionSamples;
++    if ((RtParams.level < 2) || (samples == 0)) {
++        gOcclusion[launchIndex] = 1.0f;
++        return;
++    }
++
++    const float3 position = gShadingPosition[launchIndex].xyz;
++    const float3 normal = gShadingNormal[launchIndex].xyz;
++    const float3 origin = rayOrigin(position, normal);
++    float occluded = 0.0f;
++    for (uint s = 0; s < samples; s++) {
++        const float3 direction = getCosHemisphereSampleBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount * samples + s, normal);
++        float hitDistance;
++        const float visibility = traceVisibility(origin, direction, OcclusionRadius, hitDistance);
++        occluded += (1.0f - visibility) * (1.0f - saturate(hitDistance / OcclusionRadius));
++    }
++
++    gOcclusion[launchIndex] = 1.0f - OcclusionStrength * (occluded / float(samples));
++}
++
++// THE LOCAL LIGHTS PASS (phase 55, patch 0006). The game's own point lights (a torch, a candle,
++// a fire), at the game's own falloff, 1 - (d / r)^2 (Lights_BindPoint in z_lights.c), each with a
++// shadow ray toward a point on the flame so the shadow softens with the light's size. The sum is
++// light the game never put on the room (it lights only actors with these, as a directional
++// stand-in each), which the direct pass adds through the surface's own color.
++static const float LightClearance = 48.0f;   // world units around a light its holder may fill (a sconce's bracket)
++
++[shader("raygeneration")]
++void LightsRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    if (gInstanceId[launchIndex] < 0) {
++        return;
++    }
++
++    const uint count = min(RtParams.lightsCount, RtParams.maxLights);
++    if ((RtParams.level < 2) || (count == 0)) {
++        gLocalLight[launchIndex] = 0.0f;
++        return;
++    }
++
++    const float3 position = gShadingPosition[launchIndex].xyz;
++    const float3 normal = gShadingNormal[launchIndex].xyz;
++    const float3 origin = rayOrigin(position, normal);
++    const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 17);
++    float3 sum = 0.0f;
++    for (uint i = 0; i < count; i++) {
++        const PointLight light = SceneLights[i];
++        const float3 toLight = light.position - position;
++        const float distance2 = dot(toLight, toLight);
++        const float radius2 = light.attenuationRadius * light.attenuationRadius;
++        if ((distance2 <= 0.0f) || (distance2 >= radius2)) {
++            continue;
++        }
++
++        const float distance = sqrt(distance2);
++        const float3 direction = toLight / distance;
++        const float ndl = saturate(dot(normal, direction));
++        if (ndl <= 0.0f) {
++            continue;
++        }
++
++        float3 tangent;
++        float3 bitangent;
++        tangentFrame(direction, tangent, bitangent);
++        const float angle = 6.28318531f * noise.x;
++        const float spread = sqrt(noise.y) * light.pointRadius;
++        const float3 target = light.position + tangent * (spread * cos(angle)) + bitangent * (spread * sin(angle));
++        const float3 toTarget = target - origin;
++        const float targetDistance = length(toTarget);
++        // The last stretch before the light is not traced: a flame sits in or on its holder (a
++        // sconce, a torch stand, a lantern), and traced to the point the holder shadowed every
++        // surface from its own light.
++        float hitDistance;
++        const float visibility = traceVisibility(origin, toTarget / targetDistance, max(targetDistance - max(light.pointRadius, LightClearance), 0.0f), hitDistance);
++        const float falloff = 1.0f - distance2 / radius2;
++        sum += light.diffuseColor * (falloff * ndl * visibility);
++    }
++
++    gLocalLight[launchIndex] = float4(sum, 1.0f);
++}
++
++// THE DIRECT PASS: the factor the composite multiplies the game's own picture by. The game lit
++// each surface with its ambient plus its directional light times the cosine (the denominator,
++// which is what the raster color already holds); the numerator is the same light with the
++// occlusion on the ambient, the sun's shadow on the directional term where the frame has a sky,
++// and the local lights added. The ratio relights the pixel through its own color, so a torch's
++// light arrives at the surface's real albedo and a shadow darkens to the game's ambient and never
++// below. A pixel whose game lighting is zero keeps its color whatever the rays find.
+ [shader("raygeneration")]
+ void DirectRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+@@ -165,47 +296,37 @@ void DirectRayGen() {
+         return;
+     }
+ 
+-    // The scene's directional light comes in the parameter block (rt64_framebuffer_renderer.cpp
+-    // finds it among the game's own lights each frame); a scene without one has a zero color.
+-    float3 factor = 1.0f;
++    const float3 position = gShadingPosition[launchIndex].xyz;
++    const float3 normal = gShadingNormal[launchIndex].xyz;
++    const float3 ambient = RtParams.ambientBaseColor.rgb;
+     const float3 sunColor = RtParams.sunColor.rgb;
+-    if (any(sunColor > 0.0f)) {
+-        const float3 position = gShadingPosition[launchIndex].xyz;
+-        const float3 normal = gShadingNormal[launchIndex].xyz;
+-        const float3 toSun = RtParams.sunDirection.xyz;
+-        const float ndl = saturate(dot(normal, toSun));
+-        if (ndl > 0.0f) {
+-            // One point on the disc per pixel per frame, placed by the blue noise so neighbors
+-            // and frames differ; the penumbra is the disc's angular radius. Phase 57 accumulates
+-            // the frames.
+-            const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount);
+-            const float angularRadius = RtParams.sunDirection.w;
+-            const float angle = 6.28318531f * noise.x;
+-            const float radius = sqrt(noise.y) * angularRadius;
+-            float3 tangent;
+-            float3 bitangent;
+-            tangentFrame(toSun, tangent, bitangent);
+-            const float3 direction = normalize(toSun + tangent * (radius * cos(angle)) + bitangent * (radius * sin(angle)));
+-
+-            RayDesc ray;
+-            ray.Origin = position + normal * (ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition()));
+-            ray.Direction = direction;
+-            ray.TMin = 0.0f;
+-            ray.TMax = 1.0e6f;
+-
+-            ShadowPayload payload;
+-            payload.visibility = 1.0f;
+-            TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, DepthRayQueryMask, 1, 0, 1, ray, payload);
+-
+-            const float3 ambient = RtParams.ambientBaseColor.rgb;
+-            const float3 lit = ambient + sunColor * ndl;
+-            const float3 shaded = ambient + sunColor * (ndl * payload.visibility);
+-            factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;
+-            factor.y = (lit.y > 1.0e-4f) ? (shaded.y / lit.y) : 1.0f;
+-            factor.z = (lit.z > 1.0e-4f) ? (shaded.z / lit.z) : 1.0f;
+-        }
++    const float3 toSun = RtParams.sunDirection.xyz;
++    const float ndl = any(sunColor > 0.0f) ? saturate(dot(normal, toSun)) : 0.0f;
++
++    // The sun's shadow: one point on its disc per pixel per frame, placed by the blue noise so
++    // neighbors and frames differ; the penumbra is the disc's angular radius.
++    float visibility = 1.0f;
++    if ((RtParams.sunShadows != 0) && (ndl > 0.0f)) {
++        const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount);
++        const float angularRadius = RtParams.sunDirection.w;
++        const float angle = 6.28318531f * noise.x;
++        const float radius = sqrt(noise.y) * angularRadius;
++        float3 tangent;
++        float3 bitangent;
++        tangentFrame(toSun, tangent, bitangent);
++        const float3 direction = normalize(toSun + tangent * (radius * cos(angle)) + bitangent * (radius * sin(angle)));
++        float hitDistance;
++        visibility = traceVisibility(rayOrigin(position, normal), direction, 1.0e6f, hitDistance);
+     }
+ 
++    const float occlusion = (RtParams.level >= 2) ? gOcclusion[launchIndex] : 1.0f;
++    const float3 local = (RtParams.level >= 2) ? gLocalLight[launchIndex].rgb : float3(0.0f, 0.0f, 0.0f);
++    const float3 lit = ambient + sunColor * ndl;
++    const float3 shaded = ambient * occlusion + sunColor * (ndl * visibility) + local;
++    float3 factor;
++    factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;
++    factor.y = (lit.y > 1.0e-4f) ? (shaded.y / lit.y) : 1.0f;
++    factor.z = (lit.z > 1.0e-4f) ? (shaded.z / lit.z) : 1.0f;
+     gDirectLightAccum[launchIndex] = float4(factor, 1.0f);
+ }
+ 
+@@ -259,10 +380,12 @@ void SurfaceMiss(inout SurfacePayload payload) {
+ [shader("anyhit")]
+ void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
+     payload.visibility = 0.0f;
++    payload.hitDistance = RayTCurrent();
+     AcceptHitAndEndSearch();
+ }
+ 
+ [shader("miss")]
+ void ShadowMiss(inout ShadowPayload payload) {
+     payload.visibility = 1.0f;
++    payload.hitDistance = 0.0f;
+ }
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+index d4aaad7..6d81083 100644
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -27,6 +27,8 @@ namespace interop {
+         ReactiveMask,
+         LockMask,
+         Depth,
++        AmbientOcclusion,   // patch 0006
++        LocalLight,         // patch 0006
+         Count
+     };
+ 
+@@ -73,9 +75,13 @@ namespace interop {
+         // The three words of padding are the shader's: it aligns a float4 to sixteen bytes and
+         // the CPU side's float4 does not, so without them the CPU packs the sun eight bytes
+         // early and the passes read its color as zero.
+-        uint sunPadding0;
+-        uint sunPadding1;
+-        uint sunPadding2;
++        // The three words that pad the sun to the shader's alignment carry the row's level
++        // (1 shadows, 2 adds the occlusion and the local lights), the occlusion's rays per
++        // pixel, and whether the directional light casts a shadow (only under a sky).
++        // Patch 0006.
++        uint level;
++        uint occlusionSamples;
++        uint sunShadows;
+         float4 sunDirection;
+         float4 sunColor;
+ 

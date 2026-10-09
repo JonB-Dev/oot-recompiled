@@ -1,0 +1,208 @@
+/* The controls document: the case's rows with the two additions the plan names (a device row
+ * whose value cycles, and a scanning state for the slot a capture is listening for) and the
+ * capture panel from the decision's binding capture surface. Tokens only, as case.rcss;
+ * tools/check_tokens.py holds this file to it too.
+ */
+
+/* The `.rows.long` rule moved to case.rcss on 2026-09-23, when the settings and launcher lists
+ * became scrolling lists too. Four documents share it now, and only two of them link this file.
+ * The scrollbar's rules were already there. */
+
+/* A binding row's two slots, right aligned in fixed columns so the names line up down the
+ * list. The picked slot in the focused row takes the accent and an underline, which is what
+ * says left and right choose a slot. */
+.slots
+{
+	display: flex;
+	align-items: center;
+}
+
+.slot
+{
+	font-family: var(--font-mono);
+	color: var(--text-dim);
+	width: var(--slot-width);
+	text-align: right;
+	margin-left: var(--pad-row-side);
+	border-bottom: var(--rule) transparent;
+	transition: color var(--duration-fast) linear-in-out,
+	            border-bottom-color var(--duration-fast) linear-in-out;
+}
+
+.row.on .slot
+{
+	color: var(--text);
+}
+
+.row.on .slot.pick
+{
+	color: var(--accent);
+	border-bottom-color: var(--accent);
+}
+
+/* The column names, above the first binding row. The row sits in the list but is not one of the
+ * rows: nothing selects it, so it takes no focus color and no hover. It exists because both
+ * columns are live at once and the second read as a duplicate of the first without a name on it.
+ *
+ * NOT CALLED `heading`, and that is the whole story of a bug the user caught in 0.3.5. This file
+ * links case.rcss, which already has a `.heading` for a section title, and it is `display:
+ * block`. A row of `class="row heading"` therefore stopped being a flex row: the label and the
+ * two columns stacked, so the names sat a couple of hundred pixels left of the values they
+ * named. The columns themselves were always the right width and the right distance apart, which
+ * is why it looked like an alignment bug rather than a display one. A class name in a shared
+ * stylesheet is a shared name. */
+.row.cols
+{
+	color: var(--text-dim);
+	font-size: var(--size-caption);
+	border-bottom: var(--rule) var(--line);
+}
+
+.row.cols .slot
+{
+	color: var(--text-dim);
+	font-family: var(--font-body);
+	font-size: var(--size-caption);
+}
+
+/* THE BADGE BESIDE A CONTROL THAT DOES NOTHING YET (2026-10-09): the settings row it needs, while
+ * that row is Off (ui_controls.h, row_badge). A small plate in the caption's size, quiet, so it
+ * reads as a note on the row rather than as part of the control's name. */
+.badge
+{
+	margin-left: var(--pad-row);
+	padding: 0 var(--pad-row);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius-tight);
+	font-family: var(--font-body);
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+
+.row.on .badge
+{
+	color: var(--text-dim);
+	border-color: var(--line-bright);
+}
+
+/* A badged binding's name with its badge on a line of its own under it, never folded: beside the
+ * name, "Needs Video recording on" broke in two in the panel's label column. On the section's
+ * divider the badge stays beside the section's name, where there is room. */
+.badge
+{
+	white-space: nowrap;
+}
+
+.label.badged
+{
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+}
+
+.label.badged .badge
+{
+	margin-left: 0;
+	margin-top: var(--badge-drop);
+}
+
+/* A binding that is bound, saved and currently ignored: the four C buttons on the right stick
+ * while free aim holds that stick. Struck through rather than hidden, because it is still
+ * there and comes back the moment free aim goes off. */
+.slot.idle
+{
+	color: var(--text-dim);
+	text-decoration: line-through;
+}
+
+.row.on .slot.idle
+{
+	color: var(--text-dim);
+}
+
+/* The line under the rows that says why. Empty most of the time, and then it takes no room. */
+.notice
+{
+	color: var(--text-dim);
+	font-size: var(--size-caption);
+	padding: var(--pad-row) var(--pad-row-side);
+	border-top: var(--rule) var(--line);
+}
+
+.notice.gone
+{
+	display: none;
+}
+
+/* Scanning: the slot a capture is listening for, in the existing focus color with the
+ * existing short transition. Nothing new is invented here. */
+.row.scanning .slot.pick
+{
+	color: var(--accent);
+	background-color: var(--accent-soft);
+}
+
+/* The capture panel, the decision's binding capture surface: a modal state over the rows with
+ * no way out but a press or a cancel, and the countdown that makes the trap obvious. */
+.capture
+{
+	display: none;
+}
+
+.capture.open
+{
+	display: flex;
+	position: absolute;
+	top: 0;
+	left: 0;
+	width: 100%;
+	height: 100%;
+	align-items: center;
+	justify-content: center;
+	background-color: var(--scrim);
+}
+
+.capture-case
+{
+	width: var(--capture-width);
+	padding: var(--pad);
+	border: var(--rule) var(--line-bright);
+	border-radius: var(--radius);
+	decorator: gradient(vertical var(--case-top) var(--case-bottom));
+	text-align: center;
+}
+
+/* THE THREE LINES STACK. RmlUi gives a div no display of its own, so without these the title,
+ * the instruction and the countdown ran on as one line (the user, 2026-09-23: "it shouldn't be
+ * all in a row like this. It should stack"). */
+.capture .ctitle
+{
+	display: block;
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-heading);
+	color: var(--text-dim);
+	margin-bottom: var(--pad-row);
+}
+
+.capture .big
+{
+	display: block;
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-title);
+	color: var(--text);
+	margin-bottom: var(--pad-row);
+}
+
+.capture .line
+{
+	display: block;
+	margin-top: var(--pad-row);
+	padding-top: var(--pad-row);
+	border-top: var(--rule) var(--line);
+	letter-spacing: 0.06em;
+	font-family: var(--font-mono);
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}

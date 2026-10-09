@@ -1,0 +1,58 @@
+<rml>
+<head>
+    <title>Launch</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="frame">
+        <div class="case window">
+
+            <!-- The lid is the window's title bar: the mark and the title, then our own
+                 minimize and close. The band is draggable (main/launch.cpp's hit test). -->
+            <div class="lid">
+                <div class="head">
+                    <div class="mark"></div>
+                    <div class="title">OoT: Recompiled</div>
+                </div>
+                <div class="chrome">
+                    <div class="win-btn" id="win-min"><div class="glyph-min"></div></div>
+                    <div class="win-btn" id="win-max"><div class="glyph-max"></div></div>
+                    <div class="win-btn" id="win-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                </div>
+            </div>
+
+            <!-- THE ROWS ARE BUILT FROM THE MODEL, NOT LISTED HERE, exactly as the controls
+                 document and the debug menu build theirs. This used to be a fixed run of row
+                 elements, and on 2026-09-22 adding two settings pushed three rows off the end of
+                 it: a row with no element simply does not appear, so Controls, Your files and
+                 Debug vanished while the menu looked perfectly normal. Slots were added, and then
+                 the user asked the better question ("but can we not just add scrollable areas?"),
+                 which is this. There is now no number here to get wrong, and a list longer than
+                 the case scrolls instead of being cut off. -->
+            <div class="rows long" id="launch-rows"></div>
+
+            <!-- Play and Quit are ACTIONS, not settings, and the user asked twice for them to
+                 look like it: out of the list, under a divider, Quit on the left as a secondary
+                 and Play on the right as the primary. They keep their place in the keyboard and
+                 pad order; only where they are drawn has changed. -->
+            <div class="actions">
+                <div class="act-btn act-quit" id="act-quit"><span class="act-label" id="act-quit-label">Quit</span></div>
+                <div class="act-btn act-play" id="act-play"><span class="act-label" id="act-play-label">Play</span></div>
+            </div>
+
+            <!-- ONE foot row (the user, 2026-09-20: "it's just a single row"). The key hints
+                 on the left; the version and what Windows says of this program's own file
+                 together on the right, as one clickable thing that opens About. The ROM blurb
+                 that used to sit left of the hints is gone: the ROM row already says it. -->
+            <div class="foot">
+                <span id="launch-foot">F2 is about, F3 is controls</span>
+                <span class="link" id="launch-signed">Not signed</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

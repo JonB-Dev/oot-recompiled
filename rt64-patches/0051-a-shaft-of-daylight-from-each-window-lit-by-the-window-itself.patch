@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Fri, 9 Oct 2026 09:11:59 -0400
+Subject: [PATCH] A shaft of daylight from each window, lit by the window itself
+
+Patch 0051 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-09: "can you add the beam back in in the temple of time since we now aligned the
+light?", and then, preferring it: "make our own visible light that starts at window and fades
+closer to the floor but looks way more natural and uses actual lighting somehow".
+
+The air pass (ScatterRayGen) gains the windows' shafts (windowShafts). Each window light knows its
+glass and the way its daylight falls, so its beam is the glass's outline pushed along that
+direction. For each window the stretch of the pixel's ray inside the beam is found exactly (each
+bound is linear along the ray) and marched in ShaftSteps jittered points; at each, the window's own
+soft edged outline, a fade with the distance from the glass (exp of travel over the Shaft length),
+and one shadow ray back toward the glass, so a pillar in the beam cuts a gap through the air. The
+light is the window's own. tuneShafts, a new parameter group: x the Window shafts row (0 off), y the
+Shaft length, z the Debugging menu's Drawn beam row, read on the CPU, which shows the game's painted
+beam again where 0034/0039 hide it.
+
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1843,6 +1843,119 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+     return sum;
+ }
+ 
++// A SHAFT OF DAYLIGHT FROM EACH WINDOW, LIT BY THE WINDOW ITSELF (patch 0051, the user, 2026-10-09:
++// "can you add the beam back in in the temple of time since we now aligned the light?", and then,
++// preferring it: "make our own visible light that starts at window and fades closer to the floor
++// but looks way more natural and uses actual lighting somehow").
++//
++// The game paints one beam, a fading cylinder that lights nothing, and 0034/0039 hide it while the
++// windows give traced light. This is the air the windows' own light passes through. Each window
++// is a light that knows its glass (its middle, its inward normal, its half width and height, the
++// pointed top) and the way its daylight falls, so the beam it makes is the glass's outline pushed
++// along that direction: a point is in the shaft when the light reaching it came through the glass.
++//
++// For each window, the stretch of this pixel's ray that lies inside its beam is found exactly (the
++// beam is the glass pushed along the light, so each bound is linear along the ray), and only that
++// stretch is marched, ShaftSteps points jittered by the blue noise. At each, the same soft edged
++// outline the window lights surfaces with, a fade with how far the light has come from the glass,
++// and one shadow ray back up toward the glass, so a pillar standing in the beam cuts a dark gap
++// through the air below it. The light is the window's own color and strength.
++//
++// The Window shafts row (tuneShafts.x, 0 off) scales the air's brightness per world unit of beam
++// crossed, and the Shaft length row (tuneShafts.y) is the distance from the glass over which the
++// shaft fades to about a third. Nothing here touches the light on surfaces.
++static const uint ShaftSteps = 12;
++static const float ShaftFadeReach = 5.0f;   // past this many fade lengths a shaft is not marched at all
++
++// Narrows [t0, t1] to where a + b t lies within [lo, hi].
++void clipShaftSlab(float a, float b, float lo, float hi, inout float t0, inout float t1) {
++    if (abs(b) < 1.0e-6f) {
++        if ((a < lo) || (a > hi)) {
++            t1 = -1.0f;
++        }
++        return;
++    }
++
++    const float ta = (lo - a) / b;
++    const float tb = (hi - a) / b;
++    t0 = max(t0, min(ta, tb));
++    t1 = min(t1, max(ta, tb));
++}
++
++float3 windowShafts(float3 origin, float3 direction, float end, float jitter) {
++    const float strength = RtParams.tuneShafts.x;
++    if (strength <= 0.0f) {
++        return float3(0.0f, 0.0f, 0.0f);
++    }
++
++    const float shaftLength = max(RtParams.tuneShafts.y, 50.0f);
++    const uint count = min(RtParams.lightsCount, RtParams.maxLights);
++    float3 sum = 0.0f;
++    for (uint i = 0; i < count; i++) {
++        const PointLight light = SceneLights[i];
++        if ((light.groupBits & WindowLightBit) == 0u) {
++            continue;
++        }
++
++        const float3 falls = light.direction;
++        const float3 inward = light.specularColor;
++        const float approach = dot(falls, inward);
++        if (approach <= 0.05f) {
++            continue;
++        }
++
++        // The ray in the window's own terms: how far inside the glass's plane a point is (i0 + i1 t),
++        // and where on the glass the light reaching it came through (A + B t).
++        const float3 across = normalize(cross(float3(0.0f, 1.0f, 0.0f), inward));
++        const float3 rel = origin - light.position;
++        const float i0 = dot(rel, inward);
++        const float i1 = dot(direction, inward);
++        const float3 onGlassA = rel - falls * (i0 / approach);
++        const float3 onGlassB = direction - falls * (i1 / approach);
++        const float reach = ShaftFadeReach * shaftLength;
++        const float margin = 2.0f + WindowEdge * reach;
++        float t0 = 0.0f;
++        float t1 = end;
++        clipShaftSlab(i0, i1, WindowGlassDepth, reach * approach, t0, t1);
++        clipShaftSlab(dot(onGlassA, across), dot(onGlassB, across), -light.pointRadius - margin, light.pointRadius + margin, t0, t1);
++        clipShaftSlab(onGlassA.y, onGlassB.y, -light.spotMaxCosine - margin, light.spotMaxCosine + margin, t0, t1);
++        if (t1 <= t0) {
++            continue;
++        }
++
++        const float stepLength = (t1 - t0) / float(ShaftSteps);
++        float lit = 0.0f;
++        for (uint s = 0; s < ShaftSteps; s++) {
++            const float t = t0 + (float(s) + jitter) * stepLength;
++            const float3 p = origin + direction * t;
++            const float inside = dot(p - light.position, inward);
++            if (inside <= WindowGlassDepth) {
++                continue;
++            }
++
++            const float travel = inside / approach;
++            const float3 offset = (p - falls * travel) - light.position;
++            const float edge = WindowEdge * travel + 2.0f;
++            const float openWidth = windowOpenWidth(light, offset.y);
++            const float acrossShare = 1.0f - smoothstep(openWidth - edge, openWidth + edge, abs(dot(offset, across)));
++            const float upShare = 1.0f - smoothstep(light.spotMaxCosine - edge, light.spotMaxCosine + edge, abs(offset.y));
++            const float share = acrossShare * upShare;
++            if (share <= 0.0f) {
++                continue;
++            }
++
++            const float tMax = max(travel - WindowClearance, 0.0f);
++            float hitDistance;
++            const float visible = (tMax > 1.0f) ? traceVisibilityRange(p, -falls, 0.0f, tMax, hitDistance) : 1.0f;
++            lit += share * exp(-travel / shaftLength) * visible;
++        }
++
++        sum += light.diffuseColor * (lit * stepLength);
++    }
++
++    return sum * strength;
++}
++
+ [shader("raygeneration")]
+ void ScatterRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+@@ -1882,7 +1995,8 @@ void ScatterRayGen() {
+     const float sunHaze = RtParams.tuneScatter.y;
+     const float fadeEnd = max(RtParams.tuneScatter.z, 10.0f);
+     const float fadeStart = fadeEnd * 0.35f;
+-    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f) && !dust) {
++    const bool shafts = (RtParams.tuneShafts.x > 0.0f);   // the windows' shafts (patch 0051)
++    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f) && !dust && !shafts) {
+         gScatter[launchIndex] = 0.0f;
+         return;
+     }
+@@ -1978,6 +2092,12 @@ void ScatterRayGen() {
+         sum += dustInLight(origin, direction, end, launchIndex, dustDensity, dustVisibility, dustSize, outdoors);
+     }
+ 
++    // The windows' shafts (patch 0051), as far as the surface this pixel shows: a tall hall is
++    // deeper than the air's own range.
++    if (shafts) {
++        sum += windowShafts(origin, direction, min(length(gShadingPosition[launchIndex].xyz - origin), 8000.0f), noise.y);
++    }
++
+     // No history here (patch 0008): the glow is smooth on its own and follows a moving light
+     // (Navi), and a history of it painted a trail behind her.
+     gScatter[launchIndex] = float4(sum, 1.0f);
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -114,6 +114,7 @@ namespace interop {
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+         float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w the dust's clock in displayed seconds (patch 0048)
+         float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0); patch 0050, read on the CPU: y the Glow test row (see overlayDepthTest)
++        float4 tuneShafts;       // patch 0051: x the Window shafts row (the air's brightness per world unit of beam, 0 off), y the Shaft length row (world units from the glass to a third), z 1 to draw the game's own beam again (the Debugging menu's Drawn beam row, read on the CPU)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -133,7 +133,13 @@ namespace RT64 {
+         // The Glow test row from the Debugging menu (patch 0050): how a glow laid over the picture
+         // is hidden by what stands in front of it (rt64_framebuffer_renderer.cpp, overlayDepthTest).
+         int glowTest = 0;
+-        int shadowRays = 4;                // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
++        // The windows' shafts (patch 0051): the air's brightness per world unit of beam crossed
++        // (0 off), the distance from the glass over which a shaft fades to a third, and whether
++        // the game's own drawn beam is shown again where the windows give light.
++        float shaftStrength = 0.0f;
++        float shaftLength = 600.0f;
++        int drawnBeam = 0;
++        int shadowRays = 4;               // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+         float motionBlurStrength = 0.0f;
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -855,6 +855,9 @@ namespace RT64 {
+                                                  std::clamp(rtConfig.windowMoveZ, -1000.0f, 1000.0f), 0.0f);
+         // The candidates the Debugging menu cycles (patch 0049).
+         rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), float(std::clamp(rtConfig.glowTest, 0, 3)), 0.0f, 0.0f);
++        // The windows' shafts (patch 0051).
++        rtParams.tuneShafts = hlslpp::float4(std::clamp(rtConfig.shaftStrength, 0.0f, 1.0f), std::clamp(rtConfig.shaftLength, 50.0f, 10000.0f),
++                                             (rtConfig.drawnBeam != 0) ? 1.0f : 0.0f, 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2923,7 +2923,12 @@ namespace RT64 {
+                                 // shaft leaning in from above is the game's stand-in for a window's
+                                 // light and goes; an upright one (a song's cylinder) stays.
+                                 const bool upright = (-float(falls.y)) > 0.97f;
+-                                if (rtExternalEnvironment.windowLights && lightsTraced && !upright) {
++                                // THE GAME'S OWN BEAM CAN BE SHOWN AGAIN (patch 0051, the user,
++                                // 2026-10-09: "can you add the beam back in in the temple of time
++                                // since we now aligned the light?"): the Debugging menu's Drawn
++                                // beam row, beside the shafts of light the windows now make.
++                                const bool drawnBeamShown = (rtResources->rtParams.tuneShafts.z != 0.0f);
++                                if (rtExternalEnvironment.windowLights && lightsTraced && !upright && !drawnBeamShown) {
+                                     hideShaft = true;
+                                 }
+                             }

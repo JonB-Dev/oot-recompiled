@@ -1,0 +1,47 @@
+# Statics of the game's own files that a reproduced function shares with the rest of its file.
+#
+# The exported table (OoTRecompSyms) lists the game's global symbols. A `static` at file scope has
+# no symbol in the matching build, so when a reproduced function reads or writes one that ANOTHER
+# function of the same file also uses, the patch has to be told its address here, or the patch
+# would keep a copy of its own and the two halves of the game would stop agreeing.
+#
+# Every address is recomputed from our own recompiled output (the `sh` or `lh` the function's
+# recompiled C makes to it, at a `lui`/offset pair the source lines identify), never copied from
+# the reference project, and each entry says which function needs it and how the address was read.
+# A static that only the reproduced function itself uses is not listed: the reproduction keeps
+# its own copy, which is the same thing.
+
+[[section]]
+name = "..game_statics"
+rom = 0x00000000
+vram = 0x800F7000
+size = 0x1000
+
+symbols = [
+    # z_parameter.c `sEnvHazardActive` (s16). Raised by Interface_Update when a hot room or the
+    # water starts the timer, cleared by Interface_SetTimer and Interface_SetSubTimer, consumed by
+    # Interface_Draw when the timer runs out (phase 44 reproduces Interface_Draw). Read from the
+    # recompiled Interface_SetTimer: `lui $at, 0x800F; sh $zero, 0x753C($at)`, the one store of
+    # zero to a static in that function, beside the timer position stores into gSaveContext.
+    { name = "sEnvHazardActive", vram = 0x800F753C },
+]
+
+# An OVERLAY's statics. The section is the overlay's own from the exported table (same name,
+# rom, vram and size, so the recompiler places these symbols in it and relocates them with the
+# overlay, the way the reference project's static table does); the symbols are the ones a
+# reproduced function shares with the rest of the overlay.
+[[section]]
+name = "..ovl_kaleido_scope"
+rom = 0x00BB11E0
+vram = 0x808137C0
+size = 0x1C990
+
+symbols = [
+    # z_kaleido_scope.c `D_8082AB8C`, `D_8082AB90`, `D_8082AB94` (s16 each): the cursor's
+    # environment color, written by KaleidoScope_DrawPages (phase 45 reproduces it) and read by
+    # KaleidoScope_DrawCursor, which stays the game's. The decompilation names an unnamed
+    # static by its address in the overlay's own address space, which is what these are.
+    { name = "D_8082AB8C", vram = 0x8082AB8C },
+    { name = "D_8082AB90", vram = 0x8082AB90 },
+    { name = "D_8082AB94", vram = 0x8082AB94 },
+]

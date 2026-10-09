@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 18:09:40 -0400
+Subject: [PATCH] The dust moves at the displayed frame rate, not the game's
+
+Patch 0048 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08: "the movement ... of the particles, seems to be very jerky. Like maybe it's set
+in 20 frames a second rather than using the frame rate that I'm currently using and frame
+interpolation".
+
+0047 stepped the wind by the wall clock each time a traced scene was updated. With frame
+interpolation the workload queue draws every displayed frame between two of the game's updates in
+one quick burst, and the present queue shows them afterwards at an even pace, so the wall clock saw
+a few frames a moment apart and then a fiftieth of a second's gap, and the dust moved twenty times a
+second. The dust's own clock, the frame count over sixty, ran fast on any display above sixty.
+
+addFramebuffer now keeps the time the displayed frame stands for (the queue's deltaTimeMs, which is
+in seconds: one over the display rate with interpolation, one over the game's rate without), and
+updateRaytracingScene steps the wind once per displayed frame (once per frame count) by exactly
+that. The same step advances the dust's clock, which the march reads from tuneWindField.w in place
+of the frame count.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1325,11 +1325,11 @@ namespace RT64 {
+         float gustWaverPhase = 0.0f;
+         float baseHeading = 0.0f;
+         float clock = 0.0f;
++        double displayClock = 0.0;   // patch 0048: the dust's own clock, in displayed time
+         hlslpp::float3 air = hlslpp::float3(0.0f, 0.0f, 0.0f);
+         hlslpp::float3 carried = hlslpp::float3(0.0f, 0.0f, 0.0f);
+         uint32_t seed = 0x9E3779B9u;
+         bool started = false;
+-        std::chrono::steady_clock::time_point last;
+ 
+         float random(float low, float high) {
+             seed = seed * 1664525u + 1013904223u;
+@@ -1348,20 +1348,29 @@ namespace RT64 {
+     static const float WindGustUp = 18.0f * 0.0174533f;     // radians above level at most
+     static const float WindGustWaver = 8.0f * 0.0174533f;
+ 
+-    static hlslpp::float4 stepWind(const hlslpp::float4 &tuneWind) {
++    // STEPPED IN DISPLAYED TIME, ONE STEP A DISPLAYED FRAME (patch 0048, the user, 2026-10-08:
++    // "the movement ... of the particles, seems to be very jerky. Like maybe it's set in 20 frames
++    // a second rather than using the frame rate that I'm currently using and frame interpolation").
++    // 0047 stepped the wind by the wall clock as each frame was drawn. With frame interpolation the
++    // renderer draws all the frames between two of the game's updates in one quick burst and the
++    // present queue shows them later at an even pace, so the wall clock saw a few frames a moment
++    // apart and then a fiftieth of a second's gap: the dust moved twenty times a second. And the
++    // dust's own clock was the frame count over sixty, which runs fast on a display above sixty.
++    // Now each displayed frame steps the wind, and the dust's clock, by the time it stands for
++    // (the workload queue's deltaTimeMs, which despite its name is seconds: one over the display
++    // rate with interpolation, one over the game's rate without), once a frame however many
++    // framebuffers it draws. tuneWindField.w is that clock.
++    static hlslpp::float4 stepWind(const hlslpp::float4 &tuneWind, float frameSeconds) {
+         static WindModel wind;
+-        const auto now = std::chrono::steady_clock::now();
+-        float dt = 0.0f;
+-        if (wind.started) {
+-            dt = std::min(std::chrono::duration<float>(now - wind.last).count(), WindMaxStep);
+-        }
+-        else {
++        const float dt = std::clamp(frameSeconds, 0.0f, WindMaxStep);
++        if (!wind.started) {
+             wind.started = true;
+             wind.baseHeading = wind.random(0.0f, 6.2831853f);
+         }
+ 
+-        wind.last = now;
+         wind.clock += dt;
++        // Wrapped once a day of play, so a float keeps it to the millisecond.
++        wind.displayClock = std::fmod(wind.displayClock + double(dt), 86400.0);
+ 
+         const float speed = std::max(float(tuneWind.z), 0.0f);
+         const float gusts = std::clamp(float(tuneWind.w), 0.0f, 1.0f);
+@@ -1432,7 +1441,7 @@ namespace RT64 {
+ 
+         wind.air += (target - wind.air) * std::min(1.0f, WindAirDrag * dt);
+         wind.carried += wind.air * dt;
+-        return hlslpp::float4(float(wind.carried.x), float(wind.carried.y), float(wind.carried.z), float(hlslpp::length(wind.air)));
++        return hlslpp::float4(float(wind.carried.x), float(wind.carried.y), float(wind.carried.z), float(wind.displayClock));
+     }
+ 
+     void FramebufferRenderer::updateRaytracingScene(RenderWorker *worker, const RaytracingScene &rtScene) {
+@@ -1466,7 +1475,11 @@ namespace RT64 {
+         rtParams.tonemapWhite = preset.tonemapWhite;
+         rtParams.tonemapBlack = preset.tonemapBlack;
+         // The wind, gust by gust, and how far it has carried the dust (patch 0047).
+-        rtParams.tuneWindField = stepWind(rtParams.tuneWind);
++        // Once a displayed frame (patch 0048): the frame count moves once per displayed frame.
++        if (frameParams.frameCount != rtWindFrame) {
++            rtWindFrame = frameParams.frameCount;
++            rtParams.tuneWindField = stepWind(rtParams.tuneWind, rtFrameSeconds);
++        }
+ 
+         const auto &proj = rtScene.curProjMatrix;
+         rtParams.fovRadians = fovFromProj(proj);
+@@ -2214,6 +2227,7 @@ namespace RT64 {
+ #endif
+ 
+     void FramebufferRenderer::addFramebuffer(const DrawParams &p) {
++        rtFrameSeconds = p.deltaTimeMs;   // patch 0048: the time this displayed frame stands for, in seconds
+         assert(p.fbStorage != nullptr);
+         
+         // Setup framebuffer pair data and descriptor set.
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -196,6 +196,10 @@ namespace RT64 {
+         bool rtShaftKnown = false;
+         // What the window list last logged, so it is logged again when it changes (patch 0044).
+         uint32_t rtWindowLogKey = 0;
++        // The time the displayed frame being drawn stands for, in seconds, and the frame the wind
++        // last stepped on (patch 0048).
++        float rtFrameSeconds = 1.0f / 60.0f;
++        uint32_t rtWindFrame = 0xFFFFFFFFu;
+ 
+         // The game's point lights for the traced scene (patch 0006), set every frame by the
+         // workload queue from what the program published; taken before the projection's own.
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1670,7 +1670,8 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+             moverCount++;
+         }
+     }
+-    const float seconds = float(FrParams.frameCount) * (1.0f / 60.0f);
++    // The dust's clock in displayed time, stepped once a displayed frame on the CPU (patch 0048).
++    const float seconds = RtParams.tuneWindField.w;
+     // Where the field has travelled to, and how fast a mote wanders in it.
+     // How far the wind has carried the air so far, gust by gust, from the CPU (patch 0047).
+     const float3 carried = outdoors ? RtParams.tuneWindField.xyz : float3(0.0f, 0.0f, 0.0f);
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -112,7 +112,7 @@ namespace interop {
+         // (patch 0038: tuneDust.x and z are now motes to a cell, 0 to 8, no longer a share of cells)
+         float4 tuneWindowAim;    // patch 0044, read on the CPU: x degrees steeper, y degrees turned, z the window aimed (0 every one), w 1 to start from the drawn shaft's direction
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+-        float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w how fast the air moves now
++        float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w the dust's clock in displayed seconds (patch 0048)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

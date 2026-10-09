@@ -1,0 +1,192 @@
+/* The launcher as its own window (play milestone): the case IS the window, edge to edge, with
+ * our own chrome in its lid: the mark and the title at the left, minimize and close at the
+ * right. The window itself is borderless (main/launch.cpp shapes it and makes the lid's band
+ * draggable), so everything the user sees is drawn here in the case's own tokens. Tokens only,
+ * as every component sheet.
+ */
+
+.frame
+{
+	width: 100%;
+	height: 100%;
+}
+
+.case.window
+{
+	width: 100%;
+	height: 100%;
+	max-height: 100%;
+	border-radius: 0;
+	border-color: var(--accent);
+}
+
+/* The game window's frame (frame.rml): the same brass edge around the window, and the header
+ * as a bar across the top, the launcher's lid riding over the picture while the pointer is
+ * there. Both are hidden by the shell the rest of the time. */
+.frame-edge
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	border: var(--rule) var(--accent);
+	box-sizing: border-box;
+}
+
+.frame-bar
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: var(--chrome-bar);
+	box-sizing: border-box;
+	padding: 0 var(--pad-row-side);
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	decorator: gradient(vertical var(--case-top) var(--case-bottom));
+	border-bottom: var(--rule) var(--accent);
+}
+
+/* A title bar's proportions: the title in the caption size, the mark smaller than the launcher's
+ * lid. THE BUTTONS ARE NOT LISTED HERE ANY MORE and that is the point: they are one size, defined
+ * once in tokens.rcss, and both bars use it.
+ *
+ * They used to differ, 32dp in the launcher against 22dp here, and the difference outlived the
+ * reason for it. Matching only the GLYPHS (the fix before this one) left a 10dp glyph sitting in
+ * a 32dp button in the launcher and a 22dp one in the game, so the launcher's controls read as
+ * small and widely spaced: "you essentially reversed the issue. the launcher pre-game now has
+ * the problem". The user's instruction settles which one wins: "make them both the same exact
+ * size as the now in-game window bar". */
+.frame-bar .title
+{
+	font-size: var(--size-caption);
+}
+
+.frame-bar .mark
+{
+	width: var(--mark-small-w);
+	height: var(--mark-small-h);
+	margin-right: var(--pad-row);
+}
+
+/* THE GLYPHS ARE THE SAME SIZE IN BOTH BARS. Only the button they sit in is smaller here, so the
+ * bar over the picture stays slim.
+ *
+ * They used to be shrunk too, to --glyph-small (8dp against 10dp), and the close glyph came out
+ * BROKEN rather than small: it is two one-pixel bars rotated forty five degrees about their own
+ * centers, and at eight device pixels the two land on different fractional pixels and stop
+ * meeting, so the cross renders as a slash with a stub beside it. The user saw it straight away
+ * ("this close button in the game window bar doesn't look correct like the launcher") and a
+ * magnified capture of the two bars side by side shows it plainly: clean cross above, broken one
+ * below. The minimize and maximize glyphs survived the shrink because a horizontal rule and a
+ * square border have no diagonal to round.
+ *
+ * So the fix is not to nudge the rotated bars into alignment at one particular size, which would
+ * break again at the next one. Ten device pixels is what the launcher already draws correctly and
+ * it fits comfortably inside the smaller 22dp button. One glyph size, used twice. */
+
+.frame-edge.hidden,
+.frame-bar.hidden
+{
+	display: none;
+}
+
+.chrome
+{
+	display: flex;
+	align-items: center;
+}
+
+.win-btn
+{
+	width: var(--win-btn);
+	height: var(--win-btn);
+	margin-left: var(--gap);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-family: var(--font-display);
+	font-size: var(--size-heading);
+	color: var(--text-dim);
+	border-radius: var(--radius-tight);
+	transition: background-color var(--duration-fast) linear-in-out,
+	            color var(--duration-fast) linear-in-out;
+}
+
+.win-btn:hover
+{
+	color: var(--text);
+	background-color: var(--row-on);
+}
+
+/* The minimize glyph: a short bar, drawn rather than typed. */
+.glyph-min
+{
+	width: var(--glyph-w);
+	height: var(--rule);
+	background-color: var(--text-dim);
+}
+
+.win-btn:hover .glyph-min
+{
+	background-color: var(--text);
+}
+
+/* The maximize glyph: a square, drawn from a border. */
+.glyph-max
+{
+	width: var(--glyph-w);
+	height: var(--glyph-w);
+	border: var(--rule) var(--text-dim);
+	box-sizing: border-box;
+}
+
+.win-btn:hover .glyph-max
+{
+	border-color: var(--text);
+}
+
+/* The close glyph: two bars crossed, drawn rather than typed (a typed character was dropped by
+ * the parser, and an icon is drawn in any case). */
+.glyph-x
+{
+	position: relative;
+	width: var(--glyph-w);
+	height: var(--glyph-w);
+}
+
+.glyph-x .bar
+{
+	position: absolute;
+	left: 0;
+	/* HALF A PIXEL MATTERS HERE. `top: 50%` puts a one pixel bar's TOP at the box's center, so
+	 * its own center, which is what it rotates about, sits half a pixel below the box's. The two
+	 * bars then rasterize differently from each other depending on where the box lands on screen:
+	 * clean in the launcher's bar, lopsided in the game's, with one arm longer than the other and
+	 * the crossing off center. Offsetting by half the bar's thickness puts the rotation center on
+	 * the box's center, where both directions round the same way. The number is (--glyph-w minus
+	 * --rule) / 2, done by hand in tokens.rcss because RCSS has no arithmetic; change either of
+	 * those two and --glyph-bar-top has to be redone with them. */
+	top: var(--glyph-bar-top);
+	width: var(--glyph-w);
+	height: var(--rule);
+	background-color: var(--text-dim);
+}
+
+.glyph-x .bar.a
+{
+	transform: rotate(45deg);
+}
+
+.glyph-x .bar.b
+{
+	transform: rotate(-45deg);
+}
+
+.win-btn:hover .glyph-x .bar
+{
+	background-color: var(--text);
+}

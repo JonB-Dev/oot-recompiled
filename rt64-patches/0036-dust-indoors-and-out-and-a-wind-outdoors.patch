@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:20:36 -0400
+Subject: [PATCH] Dust indoors and out, and a wind outdoors
+
+Patch 0036 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, on the dust of patch 0035: "outside versus inside to have their own dust
+settings. So that way, outside, I may want a light setting with low density, whereas inside of a
+cavern or inside the Temple of Time, I might want some more dust floating around"; "set the density
+levels and visibility levels"; "wind gusts or whatever outside ... interior rooms should not have
+that"; "what direction it's going, if there's wind"; "Full control over exactly how that interacts
+both indoors and outdoors".
+
+Two parameter groups join the block after tuneExperiment, four wide and aligned the same way on
+both sides: tuneDust (the indoor dust's density and visibility, the outdoor dust's density and
+visibility) and tuneWind (the way the wind blows over the ground as world x and z, its speed in
+world units a second, its gusts). The indoor drift's pace takes 0035's spare slot,
+tuneReflection.w, and 0035's one value is gone from the configuration.
+
+The air pass picks the place's dust by the game's own light mode: indoors the motes only wander
+about their places at the drift's pace; outdoors the whole field of motes travels with the wind,
+its speed rising and easing with the gusts (never turning back), each mote wandering a little as it
+goes, and outdoor motes show against the open sky as well as in front of a surface. A density is
+the share of the air's cells that hold a mote; a visibility is a lit mote's brightness as a share
+of the light on it. Either at 0 turns that place's dust off.
+
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -834,10 +834,16 @@ namespace RT64 {
+         // names them.
+         rtParams.tuneOcclusion = hlslpp::float4(rtConfig.occlusionStrength, rtConfig.occlusionRadius, rtConfig.shadowStrength, rtConfig.lightStrength);
+         rtParams.tuneBounce = hlslpp::float4(rtConfig.bounceStrength, rtConfig.bounceRange, std::max(rtConfig.glowSize, 0.0f), 0.0f);   // z the Glow size row (2026-09-24)
+-        // z the Light brightness row (patch 0033) and w the Dust in the light row (patch 0035), in
++        // z the Light brightness row (patch 0033) and w the indoor dust's drift (patch 0036), in
+         // the reflections' spare slots.
+         rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, std::clamp(rtConfig.lightBrightness, 0.0f, 1.0f),
+-                                                 std::clamp(rtConfig.dust, 0.0f, 1.0f));
++                                                 std::max(rtConfig.indoorDustDrift, 0.0f));
++        // The dust indoors and out, and the outdoor wind (patch 0036).
++        rtParams.tuneDust = hlslpp::float4(std::clamp(rtConfig.indoorDustDensity, 0.0f, 1.0f), std::max(rtConfig.indoorDustVisibility, 0.0f),
++                                           std::clamp(rtConfig.outdoorDustDensity, 0.0f, 1.0f), std::max(rtConfig.outdoorDustVisibility, 0.0f));
++        const float windLength = std::sqrt(rtConfig.windX * rtConfig.windX + rtConfig.windZ * rtConfig.windZ);
++        rtParams.tuneWind = hlslpp::float4((windLength > 0.0f) ? (rtConfig.windX / windLength) : 0.0f, (windLength > 0.0f) ? (rtConfig.windZ / windLength) : 0.0f,
++                                           std::max(rtConfig.windSpeed, 0.0f), std::clamp(rtConfig.windGusts, 0.0f, 1.0f));
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -95,7 +95,19 @@ namespace RT64 {
+         int experiment = 0;                  // the lighting menu's Experiment row: 0 off, else a variant of a disputed sum
+         float darkness = 0.0f;               // the Darkness row (2026-09-24): how much of the game's own ambient is taken away where no traced light falls; 0 off
+         float lightBrightness = 0.0f;        // the Light brightness row (patch 0033): how far traced light may lift a surface above the game's own full light; 0 the knee as it was, 1 none
+-        float dust = 0.0f;                   // the Dust in the light row (patch 0035): how bright the motes in lit air are; 0 off
++        // The dust in the light, indoors and out (patch 0036, replacing 0035's one value): each
++        // its density (the share of the air's cells that hold a mote, 0 off) and its visibility (a
++        // mote's brightness as a share of the light on it); indoors a drift speed, outdoors the
++        // wind: its speed in world units a second, its gusts, and the way it blows over the ground.
++        float indoorDustDensity = 0.0f;
++        float indoorDustVisibility = 0.0f;
++        float indoorDustDrift = 1.0f;
++        float outdoorDustDensity = 0.0f;
++        float outdoorDustVisibility = 0.0f;
++        float windSpeed = 0.0f;
++        float windGusts = 0.0f;
++        float windX = 0.0f;
++        float windZ = 1.0f;
+         int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1466,12 +1466,10 @@ static const float LightScatter = 0.002f;      // per world unit at a light's ce
+ // (tuneReflection.w, 0 off). The shadow rays are spent only on a mote the eye's ray actually
+ // passes, which is a few pixels in a hundred.
+ static const float DustCell = 40.0f;          // world units; at most one mote in each
+-static const float DustChance = 0.35f;        // the share of cells that hold one
+ static const float DustRange = 1000.0f;       // world units from the eye
+ static const float DustNear = 20.0f;          // no mote closer to the eye than this
+ static const float DustSize = 0.3f;           // a mote's own radius in world units, held between one and three pixels
+ static const float DustDrift = 0.3f;          // how far a mote wanders from its place, as a share of its cell
+-static const float DustBrightness = 0.6f;     // a fully lit mote at the row's top, as a share of the light on it
+ 
+ uint4 dustHash(uint4 v) {
+     v = v * 1664525u + 1013904223u;
+@@ -1524,16 +1522,36 @@ float3 dustLightAt(float3 p, uint2 launchIndex) {
+     return arrived;
+ }
+ 
+-float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float strength) {
++// INDOORS AND OUT, AND THE WIND (patch 0036, the user, 2026-10-08: "outside versus inside to have
++// their own dust settings ... outside, I may want a light setting with low density, whereas inside
++// of a cavern or inside the Temple of Time, I might want some more dust"; "wind gusts or whatever
++// outside ... interior rooms should not have that"; "Full control over exactly how that interacts
++// both indoors and outdoors"). Each place takes its own density (the share of cells that hold a
++// mote) and visibility (a lit mote's brightness as a share of the light on it), by the game's own
++// answer to whether there is a sky. Indoors the motes only wander about their places, at the drift
++// row's pace. Outdoors the whole field travels with the wind, its speed rising and easing in gusts
++// that never turn it round, each mote wandering a little as it goes, and the motes show against
++// the open sky as well.
++float3 windOffset(float seconds) {
++    const float speed = RtParams.tuneWind.z;
++    const float gusts = RtParams.tuneWind.w;
++    const float travelled = speed * (seconds + gusts * 1.5f * sin(seconds * 0.5f));
++    return float3(RtParams.tuneWind.x, 0.0f, RtParams.tuneWind.y) * travelled;
++}
++
++float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, bool outdoors) {
+     const float range = min(end, DustRange);
+     const float stepLength = DustCell * 0.5f;
+     const uint steps = min(uint(range / stepLength) + 1u, 64u);
+     const float pixelAngle = RtParams.fovRadians / max(RtParams.viewport.w, 1.0f);
+     const float seconds = float(FrParams.frameCount) * (1.0f / 60.0f);
++    // Where the field has travelled to, and how fast a mote wanders in it.
++    const float3 carried = outdoors ? windOffset(seconds) : float3(0.0f, 0.0f, 0.0f);
++    const float wander = outdoors ? (1.0f + RtParams.tuneWind.w) : RtParams.tuneReflection.w;
+     int3 lastCell = int3(2147483647, 2147483647, 2147483647);
+     float3 sum = 0.0f;
+     for (uint s = 0; s < steps; s++) {
+-        const float3 p = origin + direction * (float(s) * stepLength);
++        const float3 p = origin + direction * (float(s) * stepLength) - carried;
+         const int3 cell = int3(floor(p / DustCell));
+         if (all(cell == lastCell)) {
+             continue;
+@@ -1541,13 +1559,13 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+ 
+         lastCell = cell;
+         const float4 h = float4(dustHash(uint4(uint3(cell), 0x2545F491u))) * (1.0f / 4294967295.0f);
+-        if (h.w > DustChance) {
++        if (h.w > density) {
+             continue;
+         }
+ 
+         const float3 phase = h.xyz * 6.28318531f;
+-        const float3 drift = sin(seconds * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
+-        const float3 mote = (float3(cell) + 0.2f + h.xyz * 0.6f) * DustCell + drift;
++        const float3 drift = sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
++        const float3 mote = (float3(cell) + 0.2f + h.xyz * 0.6f) * DustCell + drift + carried;
+         const float along = dot(mote - origin, direction);
+         if ((along <= DustNear) || (along >= range)) {
+             continue;
+@@ -1565,7 +1583,7 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+         sum += dustLightAt(mote, launchIndex) * (cover * distanceFade * twinkle);
+     }
+ 
+-    return sum * (strength * DustBrightness);
++    return sum * visibility;
+ }
+ 
+ [shader("raygeneration")]
+@@ -1583,11 +1601,20 @@ void ScatterRayGen() {
+         return;
+     }
+ 
++    // The dust of this place, indoors or out by the game's own light mode (patch 0036).
++    const bool outdoors = (RtParams.sunShadows == 1u);
++    const float dustDensity = outdoors ? RtParams.tuneDust.z : RtParams.tuneDust.x;
++    const float dustVisibility = outdoors ? RtParams.tuneDust.w : RtParams.tuneDust.y;
++    const bool dust = (dustDensity > 0.0f) && (dustVisibility > 0.0f);
++
+     // Only the air in front of a surface: the sky the game drew has its own haze in it, and a
+-    // march to the range over every sky pixel lightened the whole sky evenly.
++    // march to the range over every sky pixel lightened the whole sky evenly. Outdoor dust is
++    // the exception: a mote against the open sky is still a mote in the light.
+     const int instance = gInstanceId[launchIndex];
+     if (instance < 0) {
+-        gScatter[launchIndex] = 0.0f;
++        gScatter[launchIndex] = (dust && outdoors)
++            ? float4(dustInLight(origin, direction, DustRange, launchIndex, dustDensity, dustVisibility, true), 1.0f)
++            : 0.0f;
+         return;
+     }
+ 
+@@ -1597,8 +1624,7 @@ void ScatterRayGen() {
+     const float sunHaze = RtParams.tuneScatter.y;
+     const float fadeEnd = max(RtParams.tuneScatter.z, 10.0f);
+     const float fadeStart = fadeEnd * 0.35f;
+-    const float dust = saturate(RtParams.tuneReflection.w);   // the Dust in the light row (patch 0035)
+-    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f) && (dust <= 0.0f)) {
++    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f) && !dust) {
+         gScatter[launchIndex] = 0.0f;
+         return;
+     }
+@@ -1653,9 +1679,9 @@ void ScatterRayGen() {
+         }
+     }
+ 
+-    // The dust in the light, along the same ray to the same surface (patch 0035).
+-    if (dust > 0.0f) {
+-        sum += dustInLight(origin, direction, end, launchIndex, dust);
++    // The dust in the light, along the same ray to the same surface (patches 0035 and 0036).
++    if (dust) {
++        sum += dustInLight(origin, direction, end, launchIndex, dustDensity, dustVisibility, outdoors);
+     }
+ 
+     // No history here (patch 0008): the glow is smooth on its own and follows a moving light
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -105,6 +105,8 @@ namespace interop {
+         float4 tuneScatter;      // x the lights' glow density, y the sun's haze density, z the haze's end, w a scale on the lights' reach
+         float4 tuneFade;         // x 1 fades the lighting with the game's fog, y the distance fade as a fraction of the far plane (0 off), z the shadows' softness, w the history blend
+         float4 tuneExperiment;   // x the Experiment row of the lighting menu (0 off): a numbered variant of a disputed sum, for the person to cycle in play
++        float4 tuneDust;         // patch 0036: x the indoor dust's density (0 off), y its visibility, z the outdoor dust's density (0 off), w its visibility
++        float4 tuneWind;         // patch 0036: x and y the way the outdoor wind blows over the ground (world x and z), z its speed in world units a second, w its gusts (0 none)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

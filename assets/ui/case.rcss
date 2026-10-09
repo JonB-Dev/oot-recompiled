@@ -1,0 +1,1067 @@
+/* The case: our chrome, built entirely from tokens.
+ *
+ * Read tokens.rcss first. Nothing below may contain a literal color, size, spacing, radius or
+ * duration, and that is checked rather than trusted: tools/check_tokens.py fails the build if one
+ * appears here.
+ *
+ * The composition is the decision's. A dark translucent case lit from the top left, regions
+ * divided by hardware rather than by flat edges, and one moment: the focused row's brass edge
+ * sitting proud of the panel face, catching the lamplight.
+ */
+
+body
+{
+	font-family: var(--font-body);
+	font-weight: var(--weight-body);
+	font-size: var(--size-row);
+	color: var(--text);
+	width: 100%;
+	height: 100%;
+}
+
+/* The scrim is what makes the case readable over a bright scene without hiding it. Deliberately
+ * not opaque: the decision is explicitly about the backdrop reading THROUGH the case. */
+.scrim
+{
+	width: 100%;
+	height: 100%;
+	background-color: var(--scrim);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+/* THE PANEL ON THE RIGHT (2026-09-24, the user: "the panel option to affix to the right side of
+ * the screen like planned before"). The same case, stood against the window's right edge for the
+ * window's full height with no scrim over the picture, so a lighting control can be changed while
+ * watching what it does. The shell puts the class on the scrim when the Menu placement row says
+ * so; everything inside the case is unchanged. */
+.scrim.side
+{
+	background-color: transparent;
+	justify-content: flex-end;
+	align-items: stretch;
+}
+
+.scrim.side .case
+{
+	max-height: 100%;
+	height: 100%;
+	border-radius: 0;
+	border-top-width: 0;
+	border-bottom-width: 0;
+	border-right-width: 0;
+}
+
+/* The same panel against the LEFT edge (the user, 2026-09-24): the edge on the window has no
+ * rule, the edge on the picture keeps it. */
+.scrim.side.left
+{
+	justify-content: flex-start;
+}
+
+.scrim.side.left .case
+{
+	border-left-width: 0;
+	border-right-width: var(--rule);
+}
+
+.case
+{
+	width: var(--case-width);
+	max-height: var(--case-max-height);
+	padding: var(--pad);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius);
+	decorator: gradient(vertical var(--case-top) var(--case-bottom));
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+}
+
+/* The lid seam. One line, sitting under the title, which is what separates the head of the case
+ * from its contents without a second panel. */
+.lid
+{
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding-bottom: var(--pad-row);
+	border-bottom: var(--rule) var(--line);
+	margin-bottom: var(--pad-row);
+}
+
+/* The head of the lid: the mark, then the title, on one line. */
+.head
+{
+	display: flex;
+	align-items: center;
+}
+
+.head .mark
+{
+	margin-right: var(--pad-row-side);
+}
+
+.title
+{
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-title);
+	color: var(--text);
+}
+
+.hint
+{
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+
+/* The frame rate counter (the user's ask of 2026-09-19): a small branded plate at the top right
+ * of the picture, beside the game's own interface, below the band the title bar rides in. */
+.counter
+{
+	position: absolute;
+	/* The side gap from the window's top edge while the title bar is hidden; under the bar,
+	 * by the same gap, while it shows (the shell sets the class from the bar's state). */
+	top: var(--pad-row-side);
+	right: var(--pad-row-side);
+	transition: top var(--duration-fast) linear-in-out;
+	padding: var(--pad-row) var(--pad-row-side);
+	border: var(--rule) var(--line);
+	border-left: var(--edge) var(--accent);
+	border-radius: var(--radius-tight);
+	decorator: gradient(vertical var(--case-top) var(--case-bottom));
+	display: flex;
+	align-items: center;
+	font-family: var(--font-mono);
+	font-size: var(--size-caption);
+	color: var(--text);
+}
+
+.counter.under-bar
+{
+	top: var(--plate-top-under-bar);
+}
+
+.counter .mark
+{
+	width: var(--mark-small-w);
+	height: var(--mark-small-h);
+	margin-right: var(--pad-row);
+}
+
+.counter .counter-unit
+{
+	color: var(--text-faint);
+	margin-left: var(--gap);
+}
+
+/* The ROM browser (the user's notes of 2026-09-19): the folder line above the list, and the
+ * path line below it, a field where a path is typed or pasted (Enter takes it) beside the
+ * button that opens the file picker. */
+.path-line
+{
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: var(--pad-row) 0;
+	font-size: var(--size-caption);
+	color: var(--text-dim);
+}
+
+.path-line .datum
+{
+	font-family: var(--font-mono);
+	color: var(--text);
+}
+
+.entry-line
+{
+	display: flex;
+	align-items: center;
+	margin-top: var(--pad-row);
+}
+
+.entry-line .name
+{
+	font-size: var(--size-caption);
+	color: var(--text-dim);
+	margin-right: var(--pad-row-side);
+}
+
+input.path-input
+{
+	flex: 1;
+	padding: var(--pad-row) var(--pad-row-side);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius-tight);
+	background-color: var(--track);
+	font-family: var(--font-mono);
+	font-size: var(--size-caption);
+	color: var(--text);
+	caret-color: var(--accent);
+}
+
+input.path-input:focus
+{
+	border-color: var(--accent);
+}
+
+.btn
+{
+	margin-left: var(--pad-row-side);
+	padding: var(--pad-row) var(--pad-row-side);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius-tight);
+	color: var(--text-dim);
+	cursor: pointer;
+}
+
+.btn:hover
+{
+	color: var(--text);
+	border-color: var(--accent);
+	background-color: var(--row-on);
+}
+
+/* A modal's lid stacks (the user's asks of 2026-09-19): the mark, the title and the close
+ * button on the first line (the launcher's own X, from window.rcss), the hint on its own line
+ * beneath them, so a long hint never runs into the title. The launcher's lid keeps one line. */
+.lid.stacked
+{
+	flex-direction: column;
+	align-items: stretch;
+}
+
+.lid-top
+{
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.lid.stacked .hint
+{
+	display: block;
+	margin-top: var(--gap);
+}
+
+/* The rows. A track behind them so the case reads as a compartment with things set into it,
+ * which is the whole conceit of the direction. */
+.rows
+{
+	background-color: var(--track);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius-tight);
+	padding: var(--gap);
+	display: flex;
+	flex-direction: column;
+}
+
+.row
+{
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: var(--pad-row) var(--pad-row-side);
+	border-left: var(--edge) transparent;
+	transition: background-color var(--duration-fast) linear-in-out,
+	            border-left-color var(--duration-fast) linear-in-out;
+}
+
+/* The pointer over a row, now that the mouse reaches the documents: the track's lift without
+ * the edge, so the focused row stays the one moment. */
+.row:hover
+{
+	background-color: var(--row-on);
+}
+
+/* THE ONE MOMENT. The focused row lifts out of the track and its left edge takes the light. It
+ * is the only place the accent appears, which is what keeps it meaning something. */
+.row.on
+{
+	background-color: var(--row-on);
+	border-left: var(--edge) var(--accent);
+}
+
+.row .label
+{
+	color: var(--text-dim);
+	/* A LABEL IS NEVER SQUEEZED (the user, 2026-10-09, of the HUD row in the panel: "description
+	 * crushes it"): a long value or action text folds onto more lines rather than pressing the
+	 * label narrower, and keeps a gap from it. */
+	flex-shrink: 0;
+	margin-right: var(--pad-row-side);
+}
+
+.row.on .label
+{
+	color: var(--text);
+}
+
+.row .value
+{
+	font-family: var(--font-mono);
+	color: var(--text-dim);
+}
+
+.row.on .value
+{
+	color: var(--accent);
+}
+
+/* An action row's value (Controls, Play, Quit) says nothing at rest; the text shows while
+ * the row is focused or under the pointer (the user's note of 2026-09-19). */
+.row .value .act
+{
+	display: none;
+}
+
+/* A DIVIDER INSIDE A LIST: a rule and a small name, where one part of the list ends and the next
+ * begins, never a row (nothing focuses it). The Moments list's "Your slots", and the controls
+ * screen's Photo mode section (the user, 2026-10-09: "a dedicated section within the controls
+ * panel, like after a divider"), which can carry a badge beside its name. */
+.divider
+{
+	display: flex;
+	align-items: center;
+	margin-top: var(--pad-row);
+	padding: var(--pad-row) var(--pad-row-side) var(--pad-row-side);
+	border-top: var(--rule) var(--line);
+}
+
+.divider-label
+{
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+	text-transform: uppercase;
+	letter-spacing: var(--divider-tracking);
+}
+
+/* WHAT THE CHOICE MEANS, under the row (the user, 2026-10-09: "a description underneath them when
+ * they're toggled that says what they do"). The row wraps so the note takes a line of its own
+ * under the label and the value, the full width of the row, in the caption's size and the quiet
+ * color; it is rebuilt with the row, so it changes as the choice does. */
+.row.noted
+{
+	flex-wrap: wrap;
+}
+
+.row .row-note
+{
+	flex: 0 0 100%;
+	margin-top: var(--pad-row);
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+
+.row.on .row-note
+{
+	color: var(--text-dim);
+}
+
+.row.on .value .act,
+.row:hover .value .act
+{
+	display: inline;
+}
+
+/* The foot of the case. Provenance lives here on the about screen, and the controls hint on the
+ * settings screen. */
+.foot
+{
+	margin-top: var(--pad-row);
+	padding-top: var(--pad-row);
+	border-top: var(--rule) var(--line);
+	display: flex;
+	justify-content: space-between;
+	column-gap: var(--pad);
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+
+/* A FOOT OF TWO IN THE PANEL IS STACKED (the user, 2026-10-09, of the lighting menu in the panel:
+ * "this text ... needs to be stacked as well ... it's crushing them together"). The panel is too
+ * narrow for the two side by side, so the second ran into the first with no space between; one
+ * above the other, each has the panel's width. Over the picture they stay side by side, held
+ * apart by the column gap above. */
+.scrim.side .foot
+{
+	flex-direction: column;
+	justify-content: flex-start;
+	row-gap: var(--pad-row);
+}
+
+/* About, which is a reading surface rather than a control surface, so it gets prose spacing and
+ * no focus treatment at all. */
+.prose
+{
+	display: block;
+	color: var(--text-dim);
+	font-size: var(--size-note);
+	margin-bottom: var(--pad-row);
+}
+
+.field
+{
+	display: flex;
+	justify-content: space-between;
+	padding: var(--pad-row) 0;
+	border-bottom: var(--rule) var(--line);
+}
+
+.field .name
+{
+	color: var(--text-dim);
+}
+
+.field .datum
+{
+	font-family: var(--font-mono);
+	font-size: var(--size-caption);
+	color: var(--text);
+}
+
+.heading
+{
+	display: block;
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-heading);
+	color: var(--text);
+	margin-top: var(--pad-row);
+	margin-bottom: var(--pad-row);
+}
+
+/* A scrolling region: About's body (the signature and the changelog made it longer than any
+ * window), the controls list, the browser. Its height is set by the shell from the window's,
+ * because a percentage of a case that is itself sized by its contents resolves to nothing. The
+ * scrollbar rules serve every document that scrolls. */
+.body
+{
+	overflow-y: auto;
+	/* Room between the text and the bar at the right, and the same at the left, so the
+	 * scrolling region reads as a compartment rather than text pressed against a rail. */
+	padding-left: var(--pad-row-side);
+	padding-right: var(--pad);
+	box-sizing: border-box;
+}
+
+scrollbarvertical
+{
+	width: var(--scroll);
+	background-color: var(--track);
+}
+
+scrollbarvertical sliderarrowdec,
+scrollbarvertical sliderarrowinc
+{
+	height: 0;
+}
+
+scrollbarvertical slidertrack
+{
+	background-color: var(--track);
+}
+
+scrollbarvertical sliderbar
+{
+	background-color: var(--line);
+	border-radius: var(--radius-tight);
+}
+
+/* A second line under the foot: the launcher's signature line, a click target that opens
+ * About (the user's ask of 2026-09-19). */
+.foot-more
+{
+	padding-top: var(--pad-row);
+	display: flex;
+	justify-content: space-between;
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+
+.link
+{
+	color: var(--text-dim);
+	cursor: pointer;
+}
+
+.link:hover
+{
+	color: var(--accent);
+}
+
+/* The changelog, newest version first: a version and its date on one line, the title, the
+ * summary, then each section's label and its one-line changes. */
+.entry
+{
+	display: block;
+	padding: var(--pad-row) 0;
+	border-bottom: var(--rule) var(--line);
+}
+
+.entry-head
+{
+	display: flex;
+	justify-content: space-between;
+}
+
+.entry-version
+{
+	font-family: var(--font-mono);
+	color: var(--accent);
+}
+
+.entry-date
+{
+	font-family: var(--font-mono);
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+
+.entry-title
+{
+	display: block;
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	color: var(--text);
+}
+
+.entry-summary
+{
+	display: block;
+	color: var(--text-dim);
+	font-size: var(--size-note);
+}
+
+.entry-section
+{
+	display: block;
+	color: var(--text);
+	font-size: var(--size-caption);
+	margin-top: var(--pad-row);
+}
+
+.entry-item
+{
+	display: block;
+	color: var(--text-dim);
+	font-size: var(--size-note);
+	padding-left: var(--pad-row-side);
+}
+
+/* THE ACTIONS. Play and Quit are not settings and the user asked twice for them to stop looking
+ * like settings: out of the list, under their own divider, Quit on the left as a secondary and
+ * Play on the right as the primary. A row of the list says "here is a value you can change"; a
+ * button says "this will happen", and the two should never wear the same clothes.
+ *
+ * They keep their place in the keyboard and pad order, so .on still marks the focused one. The
+ * focus treatment is the list's own, which is what keeps one vocabulary across the screen. */
+.actions
+{
+	margin-top: var(--pad-row);
+	padding-top: var(--pad-row);
+	border-top: var(--rule) var(--line);
+	display: flex;
+	align-items: center;
+}
+
+/* Half each, side by side. They were space-between, which threw them to opposite edges of a
+ * 660 wide case with a third of the width of nothing between two controls that belong together
+ * (the user, 2026-09-20: "we don't want them to be spaced between like this, it looks really
+ * odd"). The gap is the only thing separating them now, which is what pairs them.
+ *
+ * THE SPACE BETWEEN THEM IS THE SPACE ABOVE THEM, which is `--pad-row`: the bar's own padding-top,
+ * the distance from the rule to the top of the buttons (the user, 2026-09-20: "they should have
+ * the same amount of gap between the buttons themselves and the border above them"). One token in
+ * both places, so they cannot drift apart.
+ *
+ * This read `var(--gap)` and looked correct, which is why it survived a review: `--gap` is a ONE
+ * dp hairline for a divider, not a step on the spacing scale, so the two buttons were a pixel
+ * apart and touching to the eye. */
+.actions .act-btn
+{
+	flex: 1 1 0;
+	margin-right: var(--pad-row);
+}
+
+.actions .act-btn:last-child
+{
+	margin-right: 0;
+}
+
+/* TWO TO A ROW (the user, 2026-10-09, of the Moments buttons in the panel: "These buttons are being
+ * crushed. Maybe we should do 50-50 and then do two rows of buttons"). Four buttons side by side
+ * left each a quarter of the case and folded a label onto three lines. Each now takes half, and
+ * the third and fourth go to a second row; one left alone in a row takes the row. The space
+ * between them, either way, is the space above them, as for the pair above. */
+.actions.pairs
+{
+	flex-wrap: wrap;
+	gap: var(--pad-row);
+}
+
+.actions.pairs .act-btn
+{
+	flex: 1 1 40%;
+	margin-right: 0;
+}
+
+.act-btn
+{
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-height: var(--act-height);
+	padding: 0 var(--pad-act-side);
+	border-radius: var(--radius-tight);
+	border: var(--rule) var(--line);
+	transition: background-color var(--duration-fast) linear-in-out,
+	            border-color var(--duration-fast) linear-in-out;
+}
+
+/* Quit is the quiet one: it is always available and almost never what you came for. */
+.act-quit
+{
+	background-color: transparent;
+	color: var(--text-dim);
+}
+
+.act-quit:hover
+{
+	color: var(--text);
+	border-color: var(--line-bright);
+}
+
+/* Play is the one moment on this screen, which is why it carries the brass. */
+.act-play
+{
+	background-color: var(--accent);
+	border-color: var(--accent);
+	color: var(--on-accent);
+}
+
+.act-play:hover
+{
+	background-color: var(--brass-light);
+	border-color: var(--brass-light);
+}
+
+/* Focused, by keyboard or pad. The same lift the list uses, so the screen reads as one thing. */
+.act-btn.on
+{
+	border-color: var(--accent);
+	background-color: var(--row-on);
+	color: var(--text);
+}
+
+.act-play.on
+{
+	background-color: var(--brass-light);
+	border-color: var(--brass-peak);
+	color: var(--on-accent);
+}
+
+.act-label
+{
+	font-size: var(--size-row);
+	font-weight: 600;
+}
+
+/* THE TWO STEPS EITHER SIDE OF A SETTING'S VALUE.
+ * A click used to move a setting one way only, and a choice stops at its ends on purpose, so the
+ * last option was a dead end for anyone using the mouse. The keys had always worked, and that was
+ * the other half of it: nothing on screen said a setting had a back. These do what Left and Right
+ * do, and they say so by being there.
+ *
+ * Quiet until the row is the one you are on, so twelve rows do not turn into twenty four arrows. */
+.row .value .step
+{
+	display: inline-block;
+	color: var(--text-faint);
+	min-width: var(--step-width);
+	text-align: center;
+	padding: var(--pad-row) 0;
+	transition: color var(--duration-fast) linear-in-out;
+}
+
+.row.on .value .step,
+.row:hover .value .step
+{
+	color: var(--accent);
+}
+
+/* A step that cannot go anywhere is drawn spent rather than removed, so the row keeps its shape
+ * as it is walked and the eye is not asked to re-find the value. */
+.row .value .step.spent
+{
+	color: var(--line);
+}
+
+.row.on .value .step.spent,
+.row:hover .value .step.spent
+{
+	color: var(--line-bright);
+}
+
+/* The value keeps one width whatever it reads, so the two chevrons hold still while a row is
+ * stepped rather than sliding in and out under the pointer. Inline-block because a bare inline
+ * box ignores a width. */
+.row .value .shown
+{
+	display: inline-block;
+	min-width: var(--value-width);
+	text-align: right;
+}
+
+/* A ROW TO TICK (the user, 2026-10-09, of what brings the HUD back: "all separate options as just
+ * checkbox toggles"). A box where a stepper's value sits, its right edge where the values' is (the
+ * gap after it is a chevron's width), and a filled square inside it while the row is on. Quiet at
+ * rest like the chevrons; the accent only on the row you are on. */
+.row .value .check
+{
+	display: inline-block;
+	width: var(--check);
+	height: var(--check);
+	border: var(--rule) var(--text-faint);
+	border-radius: var(--radius-tight);
+	vertical-align: middle;
+}
+
+.row .value .check .tick
+{
+	display: none;
+	margin: var(--check-inset);
+	height: var(--check-tick);
+	background-color: var(--text-dim);
+	border-radius: var(--radius-tight);
+}
+
+.row .value .check.ticked .tick
+{
+	display: block;
+}
+
+.row.on .value .check,
+.row:hover .value .check
+{
+	border-color: var(--accent);
+}
+
+.row.on .value .check .tick,
+.row:hover .value .check .tick
+{
+	background-color: var(--accent);
+}
+
+.row .value .step-gap
+{
+	display: inline-block;
+	width: var(--step-width);
+}
+
+/* A destructive action, on the surface that can remove everything this program installed. It takes
+ * the judgment color rather than the accent, because the accent means "this is the thing to do"
+ * and removing your own install is emphatically not that. Outlined at rest and only filled once it
+ * is the confirmation, so the first press of it never looks like the last one. */
+.act-danger
+{
+	background-color: transparent;
+	border-color: var(--bad);
+	color: var(--bad);
+}
+
+.act-danger:hover
+{
+	background-color: var(--bad);
+	color: var(--on-accent);
+}
+
+.act-danger.armed
+{
+	background-color: var(--bad);
+	border-color: var(--bad);
+	color: var(--on-accent);
+}
+
+/* The path rows on the files surface. A path is long and a label is short, so the value takes the
+ * room and truncates from the left, where the interesting end of a path is not. */
+#files-rows .row .value
+{
+	font-size: var(--size-caption);
+	color: var(--text-dim);
+}
+
+#files-rows .row.on .value
+{
+	color: var(--accent);
+}
+
+/* A path is long and a label is short, so the label keeps its own column and the path takes the
+ * rest of the line. The path is shortened from the FRONT in code before it gets here, so it is
+ * always one line: wrapped, it pushed the label out of line with it and the two collided. */
+#files-rows .row .label
+{
+	width: var(--files-label-width);
+	flex: 0 0 auto;
+}
+
+#files-rows .row .value
+{
+	white-space: nowrap;
+	flex: 1 1 auto;
+}
+
+/* Open, at the end of every files row: written on the row rather than guessed, shown while the
+ * row is under the pointer or has the focus, in the brass because it is the thing to do there. */
+#files-rows .row .open
+{
+	display: none;
+	flex: 0 0 auto;
+	margin-left: var(--pad-row-side);
+	font-size: var(--size-caption);
+	font-weight: 600;
+	color: var(--accent);
+}
+
+#files-rows .row.on .open,
+#files-rows .row:hover .open
+{
+	display: inline;
+}
+
+/* The two buttons under the files rows show the pointer and the focus alike (the user,
+ * 2026-09-24: "the buttons for delete and back need focus and hover styles"): the quiet one
+ * lifts to the lit row's ground with the brass edge, the destructive one fills with its own
+ * judgment color. The focus arrives by the pad or the keyboard (the `on` class the shell sets)
+ * or by the tab key (the `:focus` state), and both read the same. */
+.act-quit:hover,
+.act-quit:focus,
+.act-quit.on
+{
+	color: var(--text);
+	border-color: var(--accent);
+	background-color: var(--row-on);
+}
+
+.act-danger:focus,
+.act-danger.on
+{
+	background-color: var(--bad);
+	border-color: var(--bad);
+	color: var(--on-accent);
+}
+
+/* Armed, the destructive button is the question itself: filled, and its edge lit in the brass so
+ * it cannot be mistaken for the first press. */
+.act-danger.armed,
+.act-danger.armed:hover,
+.act-danger.armed.on
+{
+	background-color: var(--bad);
+	border-color: var(--brass-light);
+	color: var(--on-accent);
+}
+
+/* The first run questions. A reading surface with two answers, so it gets prose spacing rather
+ * than the rows' density, and the question itself carries the weight the rows' labels do not. */
+.ask-body
+{
+	background-color: var(--track);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius-tight);
+	padding: var(--pad);
+	display: block;
+}
+
+.ask-q
+{
+	display: block;
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-title);
+	color: var(--text);
+	margin-bottom: var(--pad-row);
+}
+
+/* The frame recorder's plate (the user's ask of 2026-09-22): the counter's plate in the opposite
+ * corner. It takes .counter for the whole look and changes only the side it sits on and the
+ * things the counter has no use for: a state dot, and a cursor, because unlike the counter this
+ * one is a button. */
+.counter.recorder
+{
+	left: var(--pad-row-side);
+	right: auto;
+	/* NO `top` HERE ON PURPOSE. It takes the counter's, and the `under-bar` class moves both of
+	 * them together when the title bar appears (the user's ask of 2026-09-23, so the two sit
+	 * level).
+	 *
+	 * This rule DID pin the plate low for a day, and the pin outlived the C++ that was supposed to
+	 * put the movement back: the class was being set and unset correctly while this line quietly
+	 * won, so the plate never moved and only its low position could ever be clicked. The user
+	 * spotted it from the behavior ("the low position is the only one working... because the
+	 * plate never slides up") while the tests here were reporting the high position as a focus
+	 * problem. A stylesheet that overrides the thing the code is toggling is invisible from the
+	 * code's side.
+	 *
+	 * What makes a MOVING plate safe to click is not CSS but note_pointer in ui_shell.cpp: the
+	 * bar's state is frozen while the pointer is on the plate, so it cannot slide away from a
+	 * click on its way to it. */
+	/* The lit edge goes on the outside edge of the plate, which is the left for the counter and
+	 * the right for this one, so the two read as a mirrored pair rather than as two of the same
+	 * thing that happen to be in different corners. */
+	border-left: var(--rule) var(--line);
+	border-right: var(--edge) var(--accent);
+	cursor: pointer;
+}
+
+/* While a recording runs the whole plate takes the record color on its outside edge, so the fact
+ * that frames are being written is visible without reading anything. */
+.counter.recorder.on
+{
+	border-right-color: var(--record);
+}
+
+/* Between the word and the time, so it divides them as well as saying what state the recorder is
+ * in. A margin on BOTH sides now: with it only on the right, `Record` and `0:05` sat against each
+ * other with nothing between them. */
+.counter.recorder .dot
+{
+	width: var(--dot);
+	height: var(--dot);
+	border-radius: var(--dot);
+	background-color: var(--record-idle);
+	margin-left: var(--pad-row);
+	margin-right: var(--pad-row);
+	transition: background-color var(--duration-fast) linear-in-out;
+}
+
+/* The dot already provides the gap on this side. */
+.counter.recorder .counter-unit
+{
+	margin-left: 0;
+}
+
+.counter.recorder.on .dot
+{
+	background-color: var(--record);
+}
+
+/* Draining: the frames are taken and the encoders are catching up. The dot goes to the accent
+ * rather than staying red, because nothing is being captured any more and a red dot would say
+ * otherwise. */
+.counter.recorder.saving .dot
+{
+	background-color: var(--accent);
+}
+
+/* A write failed. The one place the plate uses the fault color, and it stays until the next
+ * recording starts. */
+.counter.recorder.failed .dot
+{
+	background-color: var(--bad);
+}
+
+/* THE ALWAYS ON OVERLAYS MUST NOT SWALLOW CLICKS, and until 2026-09-22 they did.
+ *
+ * Every document's body fills the whole context, so a document that is merely SHOWN covers the
+ * picture for the purposes of hit testing even when the only thing it draws is a small plate in a
+ * corner. Documents are stacked in the order they were last shown, so whichever overlay came up
+ * last quietly took every click on the screen. The frame recorder's plate was drawn, lit, and
+ * completely dead: the click was landing on the frame document's body, one layer above it.
+ *
+ * So the four overlays that are up while the game runs let clicks through by default, and the
+ * parts of them that ARE buttons ask for them back. The modal documents are deliberately not in
+ * this set: their scrim is supposed to take the click, which is what makes them modal. */
+body.overlay
+{
+	pointer-events: none;
+}
+
+.counter.recorder,
+.frame-bar
+{
+	pointer-events: auto;
+}
+
+/* ANY ROW LIST THAT CAN OUTGROW ITS CASE. Four documents use this: the controls, the debug menu,
+ * the settings and the launcher. The shell caps the height from the window's own height, because
+ * a percentage of a case that is itself sized by its contents resolves to nothing, and a fixed
+ * height would be wrong for every window but one.
+ *
+ * It is a CAP rather than a height, so a short list is its own height and only a list that would
+ * overflow the case scrolls. A fixed height leaves a tall empty box under a list of two. */
+/* AS A SIDE PANEL THE LIST FILLS THE WINDOW (2026-09-24, the user: "fixed left or right menu
+ * should expand scrollable area to allow fixed footer and fixed header to both be at top and
+ * bottom of the windows height"). The case is already the window's full height there, so the
+ * list takes every pixel between the lid and the actions instead of a share of the window, and
+ * the head and the foot sit at the top and the bottom with the rows scrolling between them.
+ * The shell stops setting its own cap in this placement, or the cap would win over this. */
+.scrim.side .case .rows.long,
+.scrim.side .case .body
+{
+	flex: 1 1 auto;
+	min-height: 0;
+	max-height: none;
+}
+
+.rows.long
+{
+	overflow-y: auto;
+}
+
+/* The update plate (the user's ask of 2026-09-23): the counter's plate at the BOTTOM left, where
+ * it is under neither corner plate and never under the title bar, so it takes no `under-bar`
+ * class. It shows only while there is news: the newer version being fetched, the fetched file
+ * waiting for the next start, or a refused download. Like the recorder it is a button: a click
+ * while the file is ready installs it now and closes this copy. */
+.counter.update
+{
+	top: auto;
+	bottom: var(--pad-row-side);
+	left: var(--pad-row-side);
+	right: auto;
+	border-left: var(--rule) var(--line);
+	border-right: var(--edge) var(--accent);
+	cursor: pointer;
+}
+
+/* The Moments list (phase 77): a row carries a thumbnail before its words. The picture is the
+ * recorder's 320 by 240 frame drawn at a quarter, in the same tight corner the plates use; an
+ * empty slot shows the track's own color in the same box so the rows stay level. The label holds
+ * two lines, the slot's name under the moment's. */
+.row.mrow
+{
+	justify-content: flex-start;
+}
+.row.mrow .thumb
+{
+	width: 80dp;
+	height: 60dp;
+	margin-right: var(--pad-row-side);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius-tight);
+	decorator: none;
+}
+.row.mrow .thumb.empty
+{
+	background-color: var(--track);
+}
+.row.mrow .label
+{
+	display: block;
+	flex: 1 1 auto;
+}
+.row.mrow .label .slot
+{
+	display: block;
+	font-family: var(--font-mono);
+	font-size: var(--size-caption);
+	color: var(--text-faint);
+}
+.row.mrow .value
+{
+	font-size: var(--size-caption);
+}

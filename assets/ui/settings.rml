@@ -1,0 +1,53 @@
+<rml>
+<head>
+    <title>Settings</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim" id="settings-scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">Settings</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">Up and down to move, left and right to change, Escape or the pad's B closes</div>
+            </div>
+
+            <!-- THE ROWS ARE BUILT FROM THE MODEL, NOT LISTED HERE, exactly as the controls
+                 document and the debug menu build theirs. This used to be a fixed run of row
+                 elements, and on 2026-09-22 adding two settings pushed three rows off the end of
+                 it: a row with no element simply does not appear, so Controls, Your files and
+                 Debug vanished while the menu looked perfectly normal. Slots were added, and then
+                 the user asked the better question ("but can we not just add scrollable areas?"),
+                 which is this. There is now no number here to get wrong, and a list longer than
+                 the case scrolls instead of being cut off. -->
+            <div class="rows long" id="settings-rows"></div>
+
+            <!-- Quit is an ACTION, drawn in the same bar the launcher uses, alone: there is
+                 nothing to Play from inside the game. It was missing here altogether once the two
+                 buttons left the list (the user, 2026-09-23), and with the title bar off this
+                 menu is the only way out of the program. It keeps its place at the end of the
+                 keyboard and pad order. -->
+            <div class="actions">
+                <div class="act-btn act-quit" id="act-quit"><span class="act-label" id="act-quit-label">Quit</span></div>
+            </div>
+
+            <div class="foot">
+                <span>Saved as you change it</span>
+                <span id="settings-foot">F1 closes this, F2 is about, F3 is controls</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

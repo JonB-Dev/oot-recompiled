@@ -1,0 +1,49 @@
+# aspMain: the audio microcode. Without this, there is no sound.
+#
+# THIS IS THE ONE THAT CANNOT BE COPIED. The reference project's aspMain is 0x1000 bytes; ours is
+# 0xFB0. Different length means a different build of the microcode, so its jump tables sit at
+# different offsets and hold different values. Its extra_indirect_branch_targets list is 24 numbers
+# that are all wrong here, and wrong in the worst way: they are valid-looking offsets that would
+# make the recompiler emit branches into the middle of unrelated instructions.
+#
+# text_offset:  0x800E2FC0 lies in ..code, rom 0x00A87000 / vram 0x800110A0.
+#               0x800E2FC0 - 0x800110A0 + 0x00A87000 = 0xB58F20.
+#               First four words there: 340A0FC0 8D420018 8D43001C 40803800.
+# text_size:    aspMainTextEnd 0x800E3F70 minus aspMainTextStart 0x800E2FC0 = 0xFB0.
+# text_address: RSP IMEM address the microcode runs at, from app-type.md.
+
+text_offset = 0xB58F20
+text_size = 0xFB0
+text_address = 0x04001000
+rom_file_path = "../build/oot.ntsc-1.0.rom_uncompressed.z64"
+output_file_path = "../src/rsp/aspMain.cpp"
+output_function_name = "aspMain"
+
+# The command dispatch table, read out of this microcode's OWN data blob by
+# tools/extract_ucode_jumptable.py. The dispatch in the text is:
+#
+#     srl  $1, $26, 23      take the command byte from the top of the command word
+#     andi $1, $1, 0xFE     mask to an even halfword index
+#     add  $2, $zero, $1
+#     lh   $2, 0x10($2)     load a halfword from DMEM at 0x10 + index
+#     jr   $2
+#
+# so the table is halfwords at DMEM 0x10. The data blob is aspMainDataStart 0x801142E0, which
+# resolves to rom 0xB8A240, putting the table at 0xB8A250.
+#
+# 24 consecutive entries decode as valid IMEM addresses in 0x1000 to 0x1FB0 and are word aligned.
+# The 25th reads 0xF000, which is neither, so the table ends at 24. The reference project's list is
+# also exactly 24 entries, which is good corroboration that this is the right table.
+#
+# AND EVERY VALUE DIFFERS. Exactly one of the 24, 0x11E8, coincides with the reference's list; the
+# other 23 do not. Copying its list would have produced 23 branches into the middle of unrelated
+# instructions, none of which would have failed the build.
+#
+# Without these the recompiler emits a switch over the 17 targets it can find statically, plus a
+# default that prints "Unhandled jump target" at RUNTIME. A missing entry is not a build error, it
+# is silence until the game plays a sound that uses that command.
+extra_indirect_branch_targets = [
+    0x114C, 0x117C, 0x1190, 0x11E8, 0x1220, 0x1230, 0x14F4, 0x1784,
+    0x17CC, 0x1830, 0x1884, 0x1A20, 0x1A48, 0x1A84, 0x1A94, 0x1AA4,
+    0x1B34, 0x1BA0, 0x1C5C, 0x1CB0, 0x1E2C, 0x1E9C, 0x1F18, 0x1F68,
+]

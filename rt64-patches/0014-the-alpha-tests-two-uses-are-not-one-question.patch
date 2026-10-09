@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 18:40:00 +0100
+Subject: [PATCH] The alpha test's two uses are not one question
+
+Patch 0014 of the renderer series (OoT: Recompiled).
+
+Patch 0013's rungs produced a clean result and a clean regression at once. The user, 2026-09-30:
+the alpha tested rung "seems to fix tree issue but regress on shadows from sun covering navi",
+while the rung without it "fixes the navi sun shadow conflict but shows the tringles".
+
+The two rungs differ in one thing, so the cause is that one thing, and the answer is that the
+coverage this test returns is used for two different questions.
+
+The any hit uses it as a yes or no: nothing of the surface falls in this pixel, so the ray passes
+through. That is what removes the triangles and it is wanted. The closest hit writes the same
+number into the payload as a WEIGHT, and the direct pass does lerp(1, factor, coverage), so a
+partial answer pulls the factor toward one, which is no shadow and no light together. On a leafy
+cliff, whose texture alpha is a gradient rather than a clean cut, the five tap estimate lands
+between zero and one across much of the surface: harmless as a yes or no, ruinous as a weight.
+That is a fairy's glow going missing on a sun shadowed wall.
+
+On these rungs the two uses are separated. The any hit keeps its rejection, and a surface that
+survives it reports itself whole and takes its full share of light. Rung 20 keeps the shadow off;
+rung 21 puts it back, which with the rejection in place is a leaf casting a leaf.
+
+Only draws in the translucent z mode that never write depth are affected, which is the class the
+cut-out rules reclassify. Everything else keeps the coverage it had, including every cut-out the
+game declares properly, so the 2026-09-28 coverage work is untouched.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1270,6 +1270,29 @@ void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersect
+     // here, on the hit that won, rather than kept from an any hit that may have run for another
+     // candidate last.
+     payload.coverage = alphaCoverage(InstanceID(), PrimitiveIndex(), attributes.barycentrics, true);
++
++    // THE TEST'S TWO USES ARE NOT THE SAME QUESTION (patch 0014, the user 2026-09-30: alpha tested
++    // "seems to fix tree issue but regress on shadows from sun covering navi", while the rung
++    // without it "fixes the navi sun shadow conflict but shows the tringles").
++    //
++    // The any hit uses this as a YES or NO: nothing of the surface here, so the ray goes on. That
++    // is what kills the triangles and it is wanted. The line above uses the SAME number as a
++    // WEIGHT, and the direct pass does lerp(1, factor, coverage), so a partial answer pulls the
++    // factor toward one, which is no shadow and no light at once. On a leafy cliff, whose alpha is
++    // a gradient rather than a clean cut, the five tap estimate lands between zero and one over
++    // much of the surface: harmless as a yes or no, ruinous as a weight, and that is the fairy's
++    // glow going missing on a sun shadowed wall.
++    //
++    // So on this rung the two uses are separated. The any hit keeps its rejection; the surface
++    // that survives it reports itself whole and takes its full share of light.
++    if (RtParams.tuneExperiment.x >= 20.0f) {
++        const RenderIndices ri = instanceRenderIndices[InstanceID()];
++        const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
++        const OtherMode om = { rp.omL, rp.omH };
++        if ((om.zMode() == ZMODE_XLU) && !om.zUpd() && (payload.coverage > 0.0f)) {
++            payload.coverage = 1.0f;
++        }
++    }
+ }
+ 
+ // THE ALPHA TEST AT THE HIT (patch 0008). The game draws its tree lines, cliff tops, vines,
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1879,6 +1879,13 @@ namespace RT64 {
+                             case 17: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
+                             case 18: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             case 19: solidDraw = otherMode.zCmp() && manyTriangles; break;
++                            // 20 and 21 are rung 17 and rung 18 with the alpha test's two uses
++                            // separated (patch 0014): the any hit still rejects a see-through
++                            // texel, but a surface that survives the rejection reports itself
++                            // whole, so it takes its full share of light instead of being faded
++                            // out by a partial coverage. 20 keeps the shadow off, 21 puts it back.
++                            case 20: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
++                            case 21: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
+                         }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).

@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:57:13 -0400
+Subject: [PATCH] A varied wind, a distance for each place, and motes in their
+ light's color
+
+Patch 0041 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, on the dust: a Varied choice for the wind that "naturally ... have wind from
+various directions on its own ... randomly choose a direction and randomly choose the strength of
+the gust"; "indoor ambience distance and outdoor ambience distance settings so that they can
+control independently"; and "if Navi's light hits it, it'll be more of a white ... if the sunlight
+hits it, or a torchlight hits it, it'll be more of like an orange color".
+
+A wind direction of nothing now asks for the varied wind: its motion over the ground is two slow
+waves in each axis at unrelated paces, so it wanders round the compass, rises to gusts (the gusts
+value strengthens the faster waves) and falls to lulls; the distance it carries the dust is those
+waves' sum over the time, so nothing jumps.
+
+tuneAmbience.x is now the indoor fade's end and w the outdoor one.
+
+A mote already takes each light's own color, but a bright one went past full in some channel and
+the composite cut it to white. Each mote is now held to full brightness in its brightest channel
+with its hue kept, the place's visibility applied before.
+
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -846,8 +846,8 @@ namespace RT64 {
+         rtParams.tuneWind = hlslpp::float4((windLength > 0.0f) ? (rtConfig.windX / windLength) : 0.0f, (windLength > 0.0f) ? (rtConfig.windZ / windLength) : 0.0f,
+                                            std::max(rtConfig.windSpeed, 0.0f), std::clamp(rtConfig.windGusts, 0.0f, 1.0f));
+         // Where the ambience's fade with distance ends (patch 0037).
+-        rtParams.tuneAmbience = hlslpp::float4(std::clamp(rtConfig.ambienceDistance, 100.0f, 8000.0f), std::clamp(rtConfig.indoorDustSize, 0.05f, 4.0f),
+-                                               std::clamp(rtConfig.outdoorDustSize, 0.05f, 4.0f), 0.0f);
++        rtParams.tuneAmbience = hlslpp::float4(std::clamp(rtConfig.indoorAmbienceDistance, 100.0f, 8000.0f), std::clamp(rtConfig.indoorDustSize, 0.05f, 4.0f),
++                                               std::clamp(rtConfig.outdoorDustSize, 0.05f, 4.0f), std::clamp(rtConfig.outdoorAmbienceDistance, 100.0f, 8000.0f));
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -108,8 +108,10 @@ namespace RT64 {
+         float windGusts = 0.0f;
+         float windX = 0.0f;
+         float windZ = 1.0f;
+-        // The Ambience distance row (patch 0037): where the dust's long fade with distance ends.
+-        float ambienceDistance = 1200.0f;
++        // The ambience distance rows (patch 0037, indoors and out since 0041): where the dust's
++        // long fade with distance ends.
++        float indoorAmbienceDistance = 1200.0f;
++        float outdoorAmbienceDistance = 1200.0f;
+         // The dust size rows (patch 0038): the median mote's radius in world units, indoors and
+         // out; each mote is half to twice it. The densities are motes to a cell since 0038.
+         float indoorDustSize = 0.3f;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1601,6 +1601,19 @@ float3 dustLightAt(float3 p, uint2 launchIndex) {
+ float3 windOffset(float seconds) {
+     const float speed = RtParams.tuneWind.z;
+     const float gusts = RtParams.tuneWind.w;
++    // A VARIED WIND (patch 0041, the user, 2026-10-08: "naturally have wind from various
++    // directions on its own. It'll just ... randomly choose a direction and randomly choose the
++    // strength of the gust"), asked for by a direction of nothing. Its motion over the ground is
++    // two slow waves in each axis at unrelated paces, so it wanders round the compass, rises to
++    // gusts and falls to lulls and never repeats in any time a person would notice; the distance
++    // it has carried the dust is those waves' sum taken over the time, so the dust never jumps.
++    if ((RtParams.tuneWind.x == 0.0f) && (RtParams.tuneWind.y == 0.0f)) {
++        const float gustScale = 1.0f + gusts;
++        const float x = -(0.7f / 0.031f) * cos(seconds * 0.031f + 1.3f) - (0.5f * gustScale / 0.083f) * cos(seconds * 0.083f + 4.1f);
++        const float z = (0.7f / 0.027f) * sin(seconds * 0.027f + 0.4f) - (0.5f * gustScale / 0.071f) * cos(seconds * 0.071f + 2.2f);
++        return float3(x, 0.0f, z) * speed;
++    }
++
+     const float travelled = speed * (seconds + gusts * 1.5f * sin(seconds * 0.5f));
+     return float3(RtParams.tuneWind.x, 0.0f, RtParams.tuneWind.y) * travelled;
+ }
+@@ -1630,7 +1643,8 @@ float3 airPush(float3 x, uint movers[DustMaxMovers], uint moverCount) {
+ }
+ 
+ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, float medianSize, bool outdoors) {
+-    const float fadeEnd = RtParams.tuneAmbience.x;
++    // Indoors and outdoors each their own distance (patch 0041).
++    const float fadeEnd = outdoors ? RtParams.tuneAmbience.w : RtParams.tuneAmbience.x;
+     const float range = min(end, fadeEnd);
+     const float stepLength = max(DustCell * 0.5f, range / float(DustMaxSteps));
+     const uint steps = min(uint(range / stepLength) + 1u, DustMaxSteps);
+@@ -1713,11 +1727,19 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+             const float opacity = lerp(DustFaintest, 1.0f, own.y * own.y);
+             const float brightness = lerp(1.0f - DustBrightnessSpread, 1.0f + DustBrightnessSpread, own.z);
+             const float distanceFade = 1.0f - smoothstep(fadeEnd * AmbienceFadeStart, fadeEnd, along);
+-            sum += dustLightAt(mote, launchIndex) * (cover * distanceFade * opacity * brightness);
++
++            // IN THE COLOR OF ITS LIGHT (patch 0041, the user, 2026-10-08: "if Navi's light hits it,
++            // it'll be more of a white ... if the sunlight hits it, or a torchlight hits it, it'll be
++            // more of like an orange color"). A mote already takes each light's own color; a bright
++            // one went past full in some channel and the composite cut it to white. So a mote is
++            // held to full brightness in its brightest channel, its hue kept.
++            const float3 moteLight = dustLightAt(mote, launchIndex) * (cover * distanceFade * opacity * brightness * visibility);
++            const float peak = max(max(moteLight.r, moteLight.g), moteLight.b);
++            sum += (peak > 1.0f) ? (moteLight / peak) : moteLight;
+         }
+     }
+ 
+-    return sum * visibility;
++    return sum;
+ }
+ 
+ [shader("raygeneration")]
+@@ -1748,7 +1770,7 @@ void ScatterRayGen() {
+     const int instance = gInstanceId[launchIndex];
+     if (instance < 0) {
+         gScatter[launchIndex] = (dust && outdoors)
+-            ? float4(dustInLight(origin, direction, RtParams.tuneAmbience.x, launchIndex, dustDensity, dustVisibility, dustSize, true), 1.0f)
++            ? float4(dustInLight(origin, direction, RtParams.tuneAmbience.w, launchIndex, dustDensity, dustVisibility, dustSize, true), 1.0f)
+             : 0.0f;
+         return;
+     }
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -107,7 +107,8 @@ namespace interop {
+         float4 tuneExperiment;   // x the Experiment row of the lighting menu (0 off): a numbered variant of a disputed sum, for the person to cycle in play
+         float4 tuneDust;         // patch 0036: x the indoor dust's density (0 off), y its visibility, z the outdoor dust's density (0 off), w its visibility
+         float4 tuneWind;         // patch 0036: x and y the way the outdoor wind blows over the ground (world x and z), z its speed in world units a second, w its gusts (0 none)
+-        float4 tuneAmbience;     // patch 0037: x where the ambience's long fade with distance ends, in world units; patch 0038: y and z the indoor and the outdoor median mote radius in world units; w spare
++        float4 tuneAmbience;     // patch 0037: x where the ambience's long fade with distance ends, in world units (indoors since 0041); patch 0038: y and z the indoor and the outdoor median mote radius in world units; patch 0041: w the outdoor fade's end
++        // (patch 0041: a tuneWind direction of nothing asks for the varied wind)
+         // (patch 0038: tuneDust.x and z are now motes to a cell, 0 to 8, no longer a share of cells)
+ 
+ #   ifdef HLSL_CPU

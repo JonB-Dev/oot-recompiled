@@ -1,0 +1,54 @@
+<rml>
+<head>
+    <title>Controls</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="controls.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">Controls</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">Up and down to move, left and right to pick a slot, Enter binds, Delete clears, Escape closes</div>
+            </div>
+
+            <!-- The rows are built at runtime from the device list and the live bindings
+                 (src/ui/ui_controls.cpp): the device row, one row per game input with its two
+                 slots, then the deadzone, rumble and reset rows. The document holds no names
+                 of its own, so the order on screen is the order in the bindings file. -->
+            <div class="rows long" id="controls-rows"></div>
+
+            <!-- Why a binding on screen is not doing anything at the moment. Written at runtime
+                 and empty the rest of the time, which the stylesheet takes as hidden. -->
+            <div class="notice" id="controls-notice"></div>
+
+            <div class="foot">
+                <span id="controls-note">Keyboard</span>
+                <span id="controls-foot">Saved as you change it. F3 closes this</span>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- The capture: shown while a binding is being listened for, and for a moment after. -->
+    <div class="capture" id="capture">
+        <div class="capture-case">
+            <div class="ctitle" id="capture-title">Rebind</div>
+            <div class="big">Press any control</div>
+            <div class="line" id="capture-line">Listening</div>
+        </div>
+    </div>
+</body>
+</rml>

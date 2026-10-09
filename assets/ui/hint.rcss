@@ -1,0 +1,75 @@
+/* The startup hint: the decision's toast, the one surface allowed over play. It sits in the
+ * bottom left corner, takes no input, and goes on the first press or after five seconds (the
+ * shell's clock; the fade is the slow duration). Tokens only, like every component sheet.
+ */
+
+body
+{
+	position: absolute;
+	left: var(--pad);
+	bottom: var(--pad);
+	font-family: var(--font-body);
+	font-weight: var(--weight-body);
+	font-size: var(--size-note);
+	color: var(--text);
+}
+
+.toast
+{
+	display: flex;
+	align-items: center;
+	padding: var(--pad-toast);
+	max-width: var(--toast-width);
+	border: var(--rule) var(--line);
+	border-radius: var(--radius);
+	decorator: gradient(vertical var(--case-top) var(--case-bottom));
+	opacity: 1;
+	transition: opacity var(--duration-slow) linear-in-out;
+}
+
+.toast.gone
+{
+	opacity: 0;
+}
+
+/* The mark beside the text (mark.rcss). It centers on the whole toast rather than on the first
+ * line, as the decision's does. */
+.toast .mark
+{
+	margin-right: var(--pad-toast);
+}
+
+.tx
+{
+	border-left: var(--rule) var(--line);
+	padding-left: var(--pad-toast);
+}
+
+/* Two lines, one above the other. RmlUi lays a div out inline unless told otherwise, and the
+ * first capture had both lines running on as one. */
+.lead,
+.note
+{
+	display: block;
+}
+
+.lead
+{
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-heading);
+	color: var(--text);
+}
+
+.note
+{
+	font-size: var(--size-caption);
+	color: var(--text-dim);
+}
+
+/* A toast with nothing to add on a second line (a state was saved, a state was restored) is one
+ * line, not one line and a gap where the second would have been. */
+.note.gone
+{
+	display: none;
+}

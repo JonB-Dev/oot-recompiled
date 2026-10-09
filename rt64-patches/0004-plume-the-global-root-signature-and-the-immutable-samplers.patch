@@ -1,0 +1,181 @@
+From d7ddbd796fd2610a58490d6afe3434a8cccaecbf Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 24 Sep 2026 11:23:36 -0400
+Subject: [PATCH] The ray tracing layout as the global root signature, and
+ immutable samplers out of the heap
+
+Patch 0004 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md), the
+one to plume rather than to rt64. Two faults, both in the D3D12 backend, both in code the
+pinned tree never runs because its ray tracing files are absent.
+
+THE STATE OBJECT made the pipeline layout the LOCAL root signature of every export, with an
+empty dummy as the global one, while the command list (setRaytracingPipelineLayout, which is
+SetComputeRootSignature) and rt64's framebuffer renderer bind that layout and its descriptor
+sets the way every compute pass does. D3D12 refuses a local root signature on that path, and
+without the debug layer the refusal is a hung GPU. The layout is the GLOBAL root signature
+instead, with no association so it is the default for every export, and the records of the
+binding table carry shader identifiers only. The empty dummy stays as the default local root
+signature.
+
+THE DESCRIPTOR SET counted every immutable sampler as a slot of the view heap, while the
+pipeline layout turns immutable samplers into static samplers and leaves them out of the
+descriptor table. Every descriptor after a run of immutable samplers was therefore written that
+many slots further along than the table says. The renderer's common set has eighteen of them,
+and everything the ray tracing shaders read (the parameter block, the scene structure, the
+positions, the indices, every output) comes after them; the raster shaders read only what comes
+before, which is why nothing showed until now. Reading the parameter block through the table
+fetched an unwritten descriptor and faulted at address zero on the first dispatch. An immutable
+sampler now takes no slot in either heap.
+
+diff --git a/src/contrib/plume/plume_d3d12.cpp b/src/contrib/plume/plume_d3d12.cpp
+index 2cdcf18..1d605cf 100644
+--- a/src/contrib/plume/plume_d3d12.cpp
++++ b/src/contrib/plume/plume_d3d12.cpp
+@@ -902,8 +902,17 @@ namespace plume {
+         auto addDescriptor = [&](const RenderDescriptorRange &range, uint32_t descriptorCount) {
+             descriptorTypes.emplace_back(range.type);
+ 
+-            bool isDynamicSampler = (range.type == RenderDescriptorRangeType::SAMPLER) && (range.immutableSampler == nullptr);
+-            if (isDynamicSampler) {
++            bool isSampler = (range.type == RenderDescriptorRangeType::SAMPLER);
++            bool isDynamicSampler = isSampler && (range.immutableSampler == nullptr);
++            if (isSampler && !isDynamicSampler) {
++                // An immutable sampler is a static sampler of the pipeline layout and has no
++                // descriptor in either heap: the layout leaves it out of the table, so the set
++                // must too, or every descriptor after it sits one slot further along than the
++                // table says (OoT: Recompiled, patch 0004; the renderer's common set has
++                // eighteen of these ahead of everything the ray tracing shaders read).
++                descriptorHeapIndices.emplace_back(0);
++            }
++            else if (isDynamicSampler) {
+                 descriptorHeapIndices.emplace_back(samplerDescriptorCount);
+                 samplerDescriptorCount += descriptorCount;
+             }
+@@ -1948,6 +1957,22 @@ namespace plume {
+         for (uint32_t i = 0; i < textureBarriersCount; i++) {
+             const RenderTextureBarrier &textureBarrier = textureBarriers[i];
+             D3D12Texture *interfaceTexture = static_cast<D3D12Texture *>(textureBarrier.texture);
++
++            // A texture with no resource behind it is a creation that failed or an object on its
++            // way out; the driver reads through the null and faults inside itself, which names
++            // nothing. Named here and skipped instead (OoT: Recompiled, patch 0004).
++            if ((interfaceTexture == nullptr) || (interfaceTexture->d3d == nullptr)) {
++                if (interfaceTexture != nullptr) {
++                    fprintf(stderr, "[plume] texture barrier on a texture without a resource: %u by %u, format %d, flags 0x%X, skipped\n",
++                        unsigned(interfaceTexture->desc.width), unsigned(interfaceTexture->desc.height), int(interfaceTexture->desc.format), unsigned(interfaceTexture->desc.flags));
++                }
++                else {
++                    fprintf(stderr, "[plume] texture barrier on a null texture, skipped\n");
++                }
++
++                continue;
++            }
++
+             D3D12_RESOURCE_STATES stateBefore = interfaceTexture->resourceStates;
+             D3D12_RESOURCE_STATES stateAfter = toTextureState(stages, textureBarrier.layout, interfaceTexture->desc.flags);
+             bool madeBarrier = makeBarrier(interfaceTexture->d3d, stateBefore, stateAfter, interfaceTexture->desc.flags & RenderTextureFlag::UNORDERED_ACCESS, resourceBarrier);
+@@ -3223,7 +3248,9 @@ namespace plume {
+         assert(desc.librariesCount > 0);
+         assert(desc.pipelineLayout != nullptr);
+ 
+-        uint32_t subobjectCount = desc.librariesCount + desc.hitGroupsCount + 8;
++        // Shader config and its association, the global root signature, the dummy local root
++        // signature, the state object config and the pipeline config (OoT: Recompiled, 0004).
++        uint32_t subobjectCount = desc.librariesCount + desc.hitGroupsCount + 6;
+         uint32_t exportSymbolsCount = 0;
+         for (uint32_t i = 0; i < desc.librariesCount; i++) {
+             exportSymbolsCount += desc.libraries[i].symbolsCount;
+@@ -3345,22 +3372,18 @@ namespace plume {
+ 
+         pipelineLayout = static_cast<const D3D12PipelineLayout *>(desc.pipelineLayout);
+ 
++        // The pipeline layout is the GLOBAL root signature (OoT: Recompiled, patch 0004). The
++        // command list binds it with setRaytracingPipelineLayout, which is SetComputeRootSignature,
++        // and its descriptor sets with setRaytracingDescriptorSet, exactly as a compute pass does;
++        // D3D12 refuses a local root signature on that path, and without the debug layer the
++        // refusal is a hung GPU. With no association it is the default for every export, so the
++        // records of the binding table carry shader identifiers only.
+         D3D12_STATE_SUBOBJECT &rootSignatureSubobject = subobjects[subobjectIndex++];
+-        rootSignatureSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE;
++        rootSignatureSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+         rootSignatureSubobject.pDesc = &pipelineLayout->rootSignature;
+-
+-        subobjectToExportsAssociation.pExports = associatedSymbolsNamesPointers.data();
+-        subobjectToExportsAssociation.NumExports = associatedSymbolCount;
+-        subobjectToExportsAssociation.pSubobjectToAssociate = &rootSignatureSubobject;
+-
+-        D3D12_STATE_SUBOBJECT &rootSignatureAssocationSubobject = subobjects[subobjectIndex++];
+-        rootSignatureAssocationSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION;
+-        rootSignatureAssocationSubobject.pDesc = &subobjectToExportsAssociation;
+-
+-        const D3D12PipelineLayout *interfaceGlobalPipelineLayout = static_cast<const D3D12PipelineLayout *>(device->rtDummyGlobalPipelineLayout.get());
+-        D3D12_STATE_SUBOBJECT &globalRootSignatureSubobject = subobjects[subobjectIndex++];
+-        globalRootSignatureSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+-        globalRootSignatureSubobject.pDesc = &interfaceGlobalPipelineLayout->rootSignature;
++        (void)subobjectToExportsAssociation;
++        (void)associatedSymbolsNamesPointers;
++        (void)associatedSymbolCount;
+ 
+         const D3D12PipelineLayout *interfaceLocalPipelineLayout = static_cast<const D3D12PipelineLayout *>(device->rtDummyLocalPipelineLayout.get());
+         D3D12_STATE_SUBOBJECT &localRootSignatureSubobject = subobjects[subobjectIndex++];
+@@ -3442,6 +3465,10 @@ namespace plume {
+         return it->second;
+     }
+ 
++    bool D3D12RaytracingPipeline::isValid() const {
++        return stateObjectProperties != nullptr;
++    }
++
+     // D3D12PipelineLayout
+ 
+     D3D12PipelineLayout::D3D12PipelineLayout(D3D12Device *device, const RenderPipelineLayoutDesc &desc) {
+@@ -4063,7 +4090,9 @@ namespace plume {
+                 groupInfo.size = 0;
+             }
+             else {
+-                groupInfo.stride = roundUp(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT + uint32_t(sizeof(UINT64)) * raytracingPipeline->pipelineLayout->rootCount, D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
++                // Shader identifiers only: the descriptor sets ride on the global root signature,
++                // not in the records (OoT: Recompiled, patch 0004).
++                groupInfo.stride = roundUp(uint32_t(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT), uint32_t(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT));
+                 groupInfo.offset = tableSize;
+                 groupInfo.size = groupInfo.stride * renderGroup.pipelineProgramsCount;
+                 tableSize += groupInfo.size;
+@@ -4104,11 +4133,7 @@ namespace plume {
+                 void *shaderId = raytracingPipeline->programShaderIdentifiers[renderGroup.pipelinePrograms[i].programIndex];
+                 uint64_t tableOffset = groupInfo.offset + i * groupInfo.stride;
+                 memcpy(&tableInfo.tableBufferData[tableOffset], shaderId, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
+-
+-                if (raytracingPipeline->pipelineLayout->rootCount > 0) {
+-                    UINT64 *tableDescriptorHandles = reinterpret_cast<UINT64 *>(&tableInfo.tableBufferData[tableOffset + D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT]);
+-                    memcpy(tableDescriptorHandles, descriptorHandles.data(), sizeof(UINT64) * raytracingPipeline->pipelineLayout->rootCount);
+-                }
++                // No local root arguments follow the identifier (OoT: Recompiled, patch 0004).
+             }
+         };
+ 
+diff --git a/src/contrib/plume/plume_d3d12.h b/src/contrib/plume/plume_d3d12.h
+index 4827452..b5f9917 100644
+--- a/src/contrib/plume/plume_d3d12.h
++++ b/src/contrib/plume/plume_d3d12.h
+@@ -415,6 +415,7 @@ namespace plume {
+         ~D3D12RaytracingPipeline() override;
+         virtual void setName(const std::string &name) override;
+         virtual RenderPipelineProgram getProgram(const std::string &name) const override;
++        bool isValid() const override;
+     };
+ 
+     struct D3D12PipelineLayout : RenderPipelineLayout {
+diff --git a/src/contrib/plume/plume_render_interface.h b/src/contrib/plume/plume_render_interface.h
+index 2048557..76c1db2 100644
+--- a/src/contrib/plume/plume_render_interface.h
++++ b/src/contrib/plume/plume_render_interface.h
+@@ -59,6 +59,9 @@ namespace plume {
+         virtual ~RenderPipeline() { }
+         virtual void setName(const std::string &name) = 0;
+         virtual RenderPipelineProgram getProgram(const std::string &name) const = 0;
++        // False when the backend refused the pipeline (a ray tracing state object the device
++        // would not create); getProgram on such a pipeline is undefined.
++        virtual bool isValid() const { return true; }
+     };
+ 
+     struct RenderPipelineLayout {

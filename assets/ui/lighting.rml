@@ -1,0 +1,39 @@
+<rml>
+<head>
+    <title>Lighting</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim" id="lighting-scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">Lighting</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">Every change shows at once. Up and down to move, left and right to change, Escape or the pad's B goes back</div>
+            </div>
+
+            <!-- Built from the lighting model (ui_lighting.cpp), the way the settings rows are: one
+                 row per control, each with an Off where off makes sense and a scale of levels, and
+                 a Reset row at the end that puts the design's values back. -->
+            <div class="rows long" id="lighting-rows"></div>
+
+            <div class="foot">
+                <span>Saved as you change it</span>
+                <span id="lighting-foot">Each part switches on its own; Inspect shows one pass instead of the picture</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

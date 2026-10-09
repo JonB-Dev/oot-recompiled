@@ -1,0 +1,4 @@
+// The executable's own icon: the mark, cut by tools/make_icon.py from our own geometry. Resource 1
+// is the one Explorer, the taskbar and the shell use for the file, and main.cpp sets it on the
+// window as well.
+1 ICON "../../assets/icon/mark.ico"

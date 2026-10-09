@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 17:00:08 -0400
+Subject: [PATCH] The dust collides with a body instead of being blown by it
+
+Patch 0042 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, the first time a figure's push actually reached the dust: "The interaction
+with link is not smooth and it feels very choppy and it also feels like it's pushing way past where
+his body is ... rotating them around his body almost ... Can we just have normal collision? It
+doesn't have to cause wind gusts or anything like that. Maybe just have it cause collision and then
+it'll just roll off".
+
+A mover in the light list is now a body where it stands this frame: the game's own collision
+cylinder, its foot at the position, its radius in the attenuation radius and its height in the point
+radius (the program carries it forward between the game's updates). A mote that would be inside the
+body, taken as a capsule so it has no corner, sits on its skin instead, the nearest way out, and
+slides round it as the body passes. 0037's carry, spill, lift and widening wake and 0039's sweep are
+gone, and a body reaches no further than its skin plus BodySkin, so the movers near a ray are found
+by that reach too.
+
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1477,60 +1477,42 @@ static const float DustFaintest = 0.12f;      // patch 0038: the faintest mote's
+ static const float DustBrightnessSpread = 0.35f;   // patch 0038: how far a mote's brightness lies from the row's, either way
+ static const float DustDrift = 0.3f;          // how far a mote wanders from its place, as a share of its cell
+ 
+-// THE THINGS THAT MOVE THROUGH THE DUST (patch 0037, the user, 2026-10-08: "as Link runs through
+-// it ... the dust would be moving along with Link in that direction, like it would be pushed, and
+-// then air would kind of flow out behind Link and ... bellow out"; "all things that can receive a
+-// shadow or cast a shadow should also interact with the dust"). The program hands over a trail of
+-// samples of every actor that moved, in the light list with this group bit (no light, only a
+-// position, the motion in world units a second, a reach, and the age in seconds), and every light
+-// loop passes them over. A mote near a young sample is carried along with the motion; as the
+-// sample ages its wake widens, and the air spills outward from the path and lifts a little, then
+-// settles as the sample dies, so a figure running through dust pushes it ahead and leaves it
+-// billowing behind. (AirMoverBit itself is declared beside the beams' bit, before the passes
+-// that pass over it.)
+-static const float MoverLife = 1.0f;          // seconds a trail sample pushes for
+-static const float MoverSpreadRate = 1.5f;    // how much wider a wake grows each second, as a share of the reach
+-// A REAL PUSH (patch 0039, the user, 2026-10-08: "link is passing right through the particles
+-// rather than him interacting with them"). 0037's push was a gentle carry held under half a cell,
+-// so a figure thirty units across walked straight through. Now the newest samples' bodies sweep the
+-// air clear: a mote inside MoverBody of a fresh sample is pushed out to its edge. The carry, the
+-// spill and the lift are stronger, and the march finds a pushed mote by looking it up through the
+-// push (dustInLight), so a push may reach well past the mote's own cell.
+-static const float MoverBody = 32.0f;         // world units round a mover's middle that its body sweeps clear
+-static const float MoverFresh = 0.2f;         // seconds a sample counts as where the body still is
+-static const float MoverCarry = 0.18f;        // seconds of the motion a mote at the heart of the push is carried
+-static const float MoverSpill = 0.1f;         // how far out the air spills behind, per unit a second of the motion
+-static const float MoverLift = 0.05f;         // how far up it billows, the same way
+-static const float MoverTopSpeed = 400.0f;    // world units a second; anything faster pushes as hard as this
+-
+-float moverSpread(PointLight light) {
+-    return light.attenuationRadius * (1.0f + light.flickerIntensity * MoverSpreadRate);
++// THE THINGS THAT MOVE THROUGH THE DUST COLLIDE WITH IT (patch 0042). Patches 0037 and 0039 made
++// a moving actor an air current: a trail of samples a tenth of a second apart, each carrying the
++// motes along, spilling them outward and lifting them as it aged. It never reached the dust until a
++// reader fix in the program, and when it did the user found it wrong: "not smooth and it feels very
++// choppy and it also feels like it's pushing way past where his body is ... rotating them around his
++// body almost ... Can we just have normal collision? It doesn't have to cause wind gusts or anything
++// like that. Maybe just have it cause collision and then it'll just roll off" (2026-10-08).
++//
++// So each sample is now a BODY where it stands this frame: the game's own collision cylinder, its
++// foot at the position, its radius in the attenuation radius and its height in the point radius,
++// carried forward by the program between the game's twenty updates a second so it moves smoothly.
++// A mote that would be inside a body sits on its skin instead, the nearest way out, and slides
++// round it as the body passes; once the body has gone by the mote is where it always was. Nothing
++// is carried, spun or lifted, and nothing past the skin moves. The body is a capsule, the cylinder
++// with its ends rounded, so a mote meets no corner to jump across.
++// (AirMoverBit itself is declared beside the beams' bit, before the passes that pass over it.)
++static const float BodySkin = 3.0f;           // world units outside the cylinder that still count as touching
++
++float bodyReach(PointLight body) {
++    return body.attenuationRadius + BodySkin;
+ }
+ 
+-float3 moverPush(float3 mote, PointLight light) {
+-    const float age = light.flickerIntensity;
+-    const float life = saturate(1.0f - age / MoverLife);
+-    if (life <= 0.0f) {
++float3 moverPush(float3 mote, PointLight body) {
++    const float radius = bodyReach(body);
++    const float bottom = body.position.y;
++    const float low = bottom + radius;
++    const float high = max(bottom + body.pointRadius - radius, low);
++    const float3 nearest = float3(body.position.x, clamp(mote.y, low, high), body.position.z);
++    const float3 r = mote - nearest;
++    const float distance = length(r);
++    if (distance >= radius) {
+         return float3(0.0f, 0.0f, 0.0f);
+     }
+ 
+-    const float3 r = mote - light.position;
+-    const float distance = length(r);
+-    const float3 away = (distance > 1.0e-3f) ? (r / distance) : float3(0.0f, 1.0f, 0.0f);
+-    const float fresh = saturate(1.0f - age / MoverFresh);
+-    const float clear = max(MoverBody - distance, 0.0f) * fresh;
+-
+-    const float spread = moverSpread(light);
+-    const float weight = exp(-(distance * distance) / (spread * spread)) * life * life;
+-    const float3 velocity = light.direction;
+-    const float rawSpeed = length(velocity);
+-    const float speed = min(rawSpeed, MoverTopSpeed);
+-    const float3 carried = (rawSpeed > 1.0e-3f) ? (velocity * (speed / rawSpeed)) : float3(0.0f, 0.0f, 0.0f);
+-    const float3 side = float3(r.x, 0.0f, r.z);
+-    const float sideLength = length(side);
+-    const float3 outward = (sideLength > 1.0e-3f) ? (side / sideLength) : float3(0.0f, 0.0f, 0.0f);
+-    const float passed = saturate(age * 4.0f);   // the spill and the lift come once the mover has gone by
+-    return away * clear + weight * (carried * MoverCarry + outward * (speed * MoverSpill * passed) + float3(0.0f, speed * MoverLift * passed, 0.0f));
++    const float3 skinward = (distance > 1.0e-3f) ? (r / distance) : float3(1.0f, 0.0f, 0.0f);
++    return skinward * (radius - distance);
+ }
+ 
+ uint4 dustHash(uint4 v) {
+@@ -1650,7 +1632,7 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+     const uint steps = min(uint(range / stepLength) + 1u, DustMaxSteps);
+     const float pixelAngle = RtParams.fovRadians / max(RtParams.viewport.w, 1.0f);
+ 
+-    // The movers whose wake reaches this ray at all (patch 0037).
++    // The bodies that could reach this ray's motes at all (patch 0037; 0042: a body's whole capsule).
+     uint movers[DustMaxMovers];
+     uint moverCount = 0;
+     const uint lightCount = min(RtParams.lightsCount, RtParams.maxLights);
+@@ -1660,9 +1642,13 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+             continue;
+         }
+ 
+-        const float reach = moverSpread(mover) * 2.5f;
+-        const float closest = clamp(dot(mover.position - origin, direction), 0.0f, range);
+-        if (length(mover.position - (origin + direction * closest)) < reach) {
++        // Measured from the capsule's middle, not its foot (the position): a ray past a figure's
++        // chest is further from its feet than its radius, and the first build of 0042 picked
++        // nobody that way. The reach is the whole capsule and a cell, for a mote pushed in.
++        const float3 middle = mover.position + float3(0.0f, mover.pointRadius * 0.5f, 0.0f);
++        const float reach = bodyReach(mover) + mover.pointRadius * 0.5f + DustCell;
++        const float closest = clamp(dot(middle - origin, direction), 0.0f, range);
++        if (length(middle - (origin + direction * closest)) < reach) {
+             movers[moverCount] = m;
+             moverCount++;
+         }

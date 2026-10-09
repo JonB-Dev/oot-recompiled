@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Fri, 9 Oct 2026 12:25:00 -0400
+Subject: [PATCH] A window's shaft fades over its own fall to the floor
+
+Patch 0052 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-09, of the Master Sword room's tall window: the shaft should start "at window
+and fade closer to the floor". 0051 faded every shaft over a fixed distance in world units from the
+glass, which suited the hall's windows and left the tall window's shaft, whose glass stands about
+twice as high, faded to almost nothing where it can be seen.
+
+Each window's light is now followed from its glass to the first surface it falls on
+(shaftLanding: a shadow ray answers whether anything stands in a stretch and where one thing does,
+not the nearest, so the stretch is halved six times, each answer a nearer bound). Every pixel asks
+about the same ray, so the answer is the same everywhere; only a pixel whose own ray crosses the
+beam asks. The Shaft length (tuneShafts.y) is now the share of that fall over which the shaft fades
+to a third, clamped to 0.05 to 4, and the march ends where the light lands. The program's default
+moves from 600 units to 0.45 of the fall.
+
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1862,10 +1862,9 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+ // through the air below it. The light is the window's own color and strength.
+ //
+ // The Window shafts row (tuneShafts.x, 0 off) scales the air's brightness per world unit of beam
+-// crossed, and the Shaft length row (tuneShafts.y) is the distance from the glass over which the
+-// shaft fades to about a third. Nothing here touches the light on surfaces.
++// crossed, and the Shaft length row (tuneShafts.y) is the share of the window's own fall over
++// which the shaft fades to about a third (patch 0052). Nothing here touches the light on surfaces.
+ static const uint ShaftSteps = 12;
+-static const float ShaftFadeReach = 5.0f;   // past this many fade lengths a shaft is not marched at all
+ 
+ // Narrows [t0, t1] to where a + b t lies within [lo, hi].
+ void clipShaftSlab(float a, float b, float lo, float hi, inout float t0, inout float t1) {
+@@ -1882,13 +1881,50 @@ void clipShaftSlab(float a, float b, float lo, float hi, inout float t0, inout f
+     t1 = min(t1, max(ta, tb));
+ }
+ 
++// THE SHAFT FADES OVER ITS OWN FALL (patch 0052, the user, 2026-10-09, of the Master Sword room's
++// tall window: the shaft "starts at window and fades closer to the floor"). A fade measured in
++// world units from the glass suited the hall's windows and left the tall window's shaft, whose
++// glass stands twice as high, faded to almost nothing where it can be seen. So each window's
++// light is followed from its glass to the first thing it falls on, and the Shaft length row is a
++// share of that fall: the shaft is at full strength at the glass and fades on the way down,
++// whatever the height of the window.
++//
++// The first surface is found by halving, because a shadow ray answers whether anything stands in a
++// stretch and where ONE thing does, not the nearest: each answer is a nearer bound. Every pixel asks
++// about the same ray from the same glass, so the answer is the same everywhere and the rays travel
++// together; it is asked only by a pixel whose own ray crosses the beam.
++static const uint ShaftLandingHalvings = 6;
++
++float shaftLanding(PointLight light, float3 falls, float reach) {
++    const float3 start = light.position + falls * WindowClearance;
++    float hitDistance;
++    if (traceVisibilityRange(start, falls, 0.0f, reach, hitDistance) > 0.5f) {
++        return reach;
++    }
++
++    float near = 0.0f;
++    float far = max(hitDistance, 1.0f);
++    for (uint h = 0; h < ShaftLandingHalvings; h++) {
++        const float middle = 0.5f * (near + far);
++        if (traceVisibilityRange(start, falls, 0.0f, middle, hitDistance) > 0.5f) {
++            near = middle;
++        }
++        else {
++            far = max(hitDistance, 1.0f);
++        }
++    }
++
++    return WindowClearance + far;
++}
++
+ float3 windowShafts(float3 origin, float3 direction, float end, float jitter) {
+     const float strength = RtParams.tuneShafts.x;
+     if (strength <= 0.0f) {
+         return float3(0.0f, 0.0f, 0.0f);
+     }
+ 
+-    const float shaftLength = max(RtParams.tuneShafts.y, 50.0f);
++    // The Shaft length row as a share of each window's own fall (patch 0052).
++    const float shaftShare = clamp(RtParams.tuneShafts.y, 0.05f, 4.0f);
+     const uint count = min(RtParams.lightsCount, RtParams.maxLights);
+     float3 sum = 0.0f;
+     for (uint i = 0; i < count; i++) {
+@@ -1912,7 +1948,9 @@ float3 windowShafts(float3 origin, float3 direction, float end, float jitter) {
+         const float i1 = dot(direction, inward);
+         const float3 onGlassA = rel - falls * (i0 / approach);
+         const float3 onGlassB = direction - falls * (i1 / approach);
+-        const float reach = ShaftFadeReach * shaftLength;
++        // As far as the window's light reaches at all, first; then, for a pixel whose ray crosses
++        // that, as far as it falls to the first surface (patch 0052).
++        const float reach = max(light.attenuationExponent, 100.0f);
+         const float margin = 2.0f + WindowEdge * reach;
+         float t0 = 0.0f;
+         float t1 = end;
+@@ -1923,6 +1961,13 @@ float3 windowShafts(float3 origin, float3 direction, float end, float jitter) {
+             continue;
+         }
+ 
++        const float landing = shaftLanding(light, falls, reach);
++        clipShaftSlab(i0, i1, WindowGlassDepth, (landing + WindowEdge * landing + 2.0f) * approach, t0, t1);
++        if (t1 <= t0) {
++            continue;
++        }
++
++        const float shaftLength = max(shaftShare * landing, 20.0f);
+         const float stepLength = (t1 - t0) / float(ShaftSteps);
+         float lit = 0.0f;
+         for (uint s = 0; s < ShaftSteps; s++) {
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -856,7 +856,7 @@ namespace RT64 {
+         // The candidates the Debugging menu cycles (patch 0049).
+         rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), float(std::clamp(rtConfig.glowTest, 0, 3)), 0.0f, 0.0f);
+         // The windows' shafts (patch 0051).
+-        rtParams.tuneShafts = hlslpp::float4(std::clamp(rtConfig.shaftStrength, 0.0f, 1.0f), std::clamp(rtConfig.shaftLength, 50.0f, 10000.0f),
++        rtParams.tuneShafts = hlslpp::float4(std::clamp(rtConfig.shaftStrength, 0.0f, 1.0f), std::clamp(rtConfig.shaftLength, 0.05f, 4.0f),
+                                              (rtConfig.drawnBeam != 0) ? 1.0f : 0.0f, 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -137,7 +137,7 @@ namespace RT64 {
+         // (0 off), the distance from the glass over which a shaft fades to a third, and whether
+         // the game's own drawn beam is shown again where the windows give light.
+         float shaftStrength = 0.0f;
+-        float shaftLength = 600.0f;
++        float shaftLength = 0.45f;        // patch 0052: a share of each window's own fall, no longer world units
+         int drawnBeam = 0;
+         int shadowRays = 4;               // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -114,7 +114,7 @@ namespace interop {
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+         float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w the dust's clock in displayed seconds (patch 0048)
+         float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0); patch 0050, read on the CPU: y the Glow test row (see overlayDepthTest)
+-        float4 tuneShafts;       // patch 0051: x the Window shafts row (the air's brightness per world unit of beam, 0 off), y the Shaft length row (world units from the glass to a third), z 1 to draw the game's own beam again (the Debugging menu's Drawn beam row, read on the CPU)
++        float4 tuneShafts;       // patch 0051: x the Window shafts row (the air's brightness per world unit of beam, 0 off), y the Shaft length row (patch 0052: the share of each window's own fall, from its glass to the first surface, over which the shaft fades to a third), z 1 to draw the game's own beam again (the Debugging menu's Drawn beam row, read on the CPU)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:13:12 -0400
+Subject: [PATCH] A window lights in its own shape and its drawn shaft goes
+
+Patch 0034 of the renderer series (OoT: Recompiled).
+
+The user's test of 0032 in the Temple of Time, 2026-10-08. The windows lit the hall, but "they
+don't include their top points at the very top of the window ... They're just a flat rectangular
+object that hits the floor"; and looking up at the tall window over the pedestal, where the
+game's own drawn shaft leaves the glass in the glass's shape: "that's exactly kind of what I want.
+The main lights in the main room to do as well". And in the Master Sword room the drawn shaft
+lies on the floor as a hard bright patch that never matches where the traced light lands: "only
+hide that beam and its floor brightness element when ray tracing is enabled and we're using
+proper ray tracing".
+
+This temple's windows are pointed: straight sides up to a shoulder, then two edges meeting at a
+point at the top. The window finder now takes the shoulder, the highest corner at the full width,
+and the light and the glass test use the open half width at each height, narrowing above the
+shoulder to nothing at the top. A rectangular window keeps its shoulder at the top.
+
+A drawn shaft falling the way the shaft traced to a window fell is drawn as nothing while the
+local lights are traced (level 2 and above, Light strength above nothing, rung 37 not chosen).
+The window's traced light stands in for it. A shaft falling any other way, a song's upright
+cylinder, is drawn as before.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -536,6 +536,23 @@ namespace RT64 {
+         }
+ 
+         const hlslpp::float3 center = mean + across * (0.5f * (acrossMin + acrossMax)) + up * (0.5f * (upMin + upMax));
++
++        // THE WINDOW'S OWN OUTLINE (patch 0034, the user, 2026-10-08: the light "don't include
++        // their top points at the very top of the window ... They're just a flat rectangular object
++        // that hits the floor"). This temple's windows are pointed: straight sides up to a shoulder,
++        // then two edges meeting at a point in the middle of the top. The shoulder is the highest
++        // corner at the full width; above it the window narrows to nothing at the top. A window
++        // whose corners all reach the top is a rectangle and keeps its shoulder at the top.
++        const float acrossMid = 0.5f * (acrossMin + acrossMax);
++        const float halfWidth = 0.5f * (acrossMax - acrossMin);
++        float shoulder = upMin;
++        for (uint32_t i = 0; i < count; i++) {
++            const hlslpp::float3 d = points[i] - mean;
++            if (std::abs(float(hlslpp::dot(d, across)) - acrossMid) >= (0.9f * halfWidth)) {
++                shoulder = std::max(shoulder, float(d.y));
++            }
++        }
++
+         const float level = std::sqrt(1.0f - WindowLightDrop * WindowLightDrop);
+         const hlslpp::float3 falls = hlslpp::normalize(normal * level - up * WindowLightDrop);
+ 
+@@ -553,7 +570,8 @@ namespace RT64 {
+         window.spotFalloffCosine = 0.0f;
+         window.attenuationExponent = WindowReach;
+         window.attenuationRadius = WindowReach;
+-        window.shadowOffset = 0.0f;
++        // The shoulder's height above the window's middle, in the shadow offset (patch 0034).
++        window.shadowOffset = shoulder - 0.5f * (upMin + upMax);
+         window.flickerIntensity = 0.0f;
+         window.groupBits = WindowLightBit | 4u;
+         return true;
+@@ -2266,6 +2284,7 @@ namespace RT64 {
+                 renderIndicesVector.push_back(renderIndices);
+ #           if RT_ENABLED
+                 tracedCall.type = InstanceDrawCall::Type::Unknown;   // set again only by a traced call (patch 0005)
++                bool hideShaft = false;   // patch 0034: a drawn shaft the windows' light stands in for
+ #           endif
+ 
+                 uint32_t cycleType = call.callDesc.otherMode.cycleType();
+@@ -2616,6 +2635,22 @@ namespace RT64 {
+                             if (beamTile.valid && !beamTile.tileCopyUsed && (textureAlphaKind(beamTile.tmemHashOrID) == TextureAlphaKind::Fade) &&
+                                 beamFromDraw(drawData, call, beam)) {
+                                 addBeam(beamLights, beam);
++
++                                // THE SHAFT GOES WHERE ITS WINDOW'S LIGHT STANDS IN FOR IT (patch
++                                // 0034, the user, 2026-10-08, in the Master Sword room: "only hide
++                                // that beam and its floor brightness element when ray tracing is
++                                // enabled and we're using proper ray tracing"). The drawn shaft lies
++                                // on the floor as a hard bright patch that never matches where the
++                                // traced light lands, so a shaft falling the way the shaft traced to
++                                // a window fell is not drawn while that light is traced (the local
++                                // lights running, Light strength above nothing, rung 37 not chosen).
++                                // A shaft falling any other way (a song's upright cylinder) is.
++                                const hlslpp::float3 falls = beam.direction;
++                                const bool lightsTraced = (rtResources->rtParams.level >= 2) && (rtResources->rtParams.tuneOcclusion.w > 0.0f);
++                                if (rtExternalEnvironment.windowLights && rtWindowSunKnown && lightsTraced &&
++                                    (float(hlslpp::dot(falls, rtWindowSunDirection)) > 0.995f)) {
++                                    hideShaft = true;
++                                }
+                             }
+                         }
+ 
+@@ -2675,6 +2710,11 @@ namespace RT64 {
+                         }
+                         
+                         triangles.faceCount = call.callDesc.triangleCount;
++#                   if RT_ENABLED
++                        if (hideShaft) {
++                            triangles.faceCount = 0;   // patch 0034: drawn as nothing
++                        }
++#                   endif
+                         triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
+                         triangles.postBlendDitherNoise = false;
+ 
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -632,6 +632,19 @@ static const float WindowSpread = 0.015f;     // how far its shadow rays lean, s
+ static const float WindowShadeShare = 0.8f;   // the share of a window's light that every surface of the place would have without its walls
+ static const float WindowGlassDepth = 4.0f;   // world units either side of the glass's plane that still count as the glass
+ 
++// THE WINDOW'S OWN OUTLINE (patch 0034): the half width open at a height above the window's
++// middle. Straight sides up to the shoulder (the shadow offset, set on the CPU), then narrowing to
++// the point at the top, so the light leaving a pointed window is pointed too.
++float windowOpenWidth(PointLight light, float up) {
++    const float shoulder = light.shadowOffset;
++    const float top = light.spotMaxCosine;
++    if ((up <= shoulder) || ((top - shoulder) < 1.0f)) {
++        return light.pointRadius;
++    }
++
++    return light.pointRadius * saturate((top - up) / (top - shoulder));
++}
++
+ void windowLight(PointLight light, float3 position, float3 normal, float biasBase, uint2 launchIndex, uint lightIndex, uint lightSamples,
+                  inout float3 sum, inout float3 sumUnblocked) {
+     const float3 falls = light.direction;
+@@ -641,7 +654,7 @@ void windowLight(PointLight light, float3 position, float3 normal, float biasBas
+     if (abs(inside) < WindowGlassDepth) {
+         const float3 glassOffset = position - light.position;
+         const float3 glassAcross = normalize(cross(float3(0.0f, 1.0f, 0.0f), inward));
+-        if ((abs(dot(glassOffset, glassAcross)) <= light.pointRadius) && (abs(glassOffset.y) <= light.spotMaxCosine)) {
++        if ((abs(dot(glassOffset, glassAcross)) <= windowOpenWidth(light, glassOffset.y)) && (abs(glassOffset.y) <= light.spotMaxCosine)) {
+             sum += light.diffuseColor * WindowShadeShare;
+             if (light.flickerIntensity > 0.5f) {
+                 sumUnblocked += light.diffuseColor * WindowShadeShare;
+@@ -674,7 +687,8 @@ void windowLight(PointLight light, float3 position, float3 normal, float biasBas
+     const float3 across = normalize(cross(float3(0.0f, 1.0f, 0.0f), inward));
+     const float3 offset = onGlass - light.position;
+     const float edge = WindowEdge * travel + 2.0f;
+-    const float acrossShare = 1.0f - smoothstep(light.pointRadius - edge, light.pointRadius + edge, abs(dot(offset, across)));
++    const float openWidth = windowOpenWidth(light, offset.y);
++    const float acrossShare = 1.0f - smoothstep(openWidth - edge, openWidth + edge, abs(dot(offset, across)));
+     const float upShare = 1.0f - smoothstep(light.spotMaxCosine - edge, light.spotMaxCosine + edge, abs(offset.y));
+     const float weight = acrossShare * upShare * ndl;
+     if (weight <= 0.0f) {

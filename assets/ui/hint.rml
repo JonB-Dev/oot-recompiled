@@ -1,0 +1,20 @@
+<rml>
+<head>
+    <title>Hint</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="hint.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+</head>
+<body class="overlay">
+    <!-- Both lines are filled at runtime from the live bindings (the keyboard's menu key, and
+         the first pad's menu button when a pad is connected), so the text here is only what
+         shows if the shell never gets to write it. -->
+    <div class="toast" id="toast">
+        <div class="mark"></div>
+        <div class="tx">
+            <div class="lead" id="hint-lead">F1 opens the menu</div>
+            <div class="note" id="hint-note">Any time in play</div>
+        </div>
+    </div>
+</body>
+</rml>

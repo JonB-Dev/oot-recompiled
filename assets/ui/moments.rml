@@ -1,0 +1,51 @@
+<rml>
+<head>
+    <title>Moments</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">Moments</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">Up and down to choose, Enter takes you to the buttons, left and right between them, Escape or the pad's B goes back</div>
+            </div>
+
+            <!-- Nine slots: the autosave's, then eight of the player's. Built by the shell from the
+                 slot files at the moment the screen opens (phase 77, .scaffold/states/): a thumbnail
+                 where one exists, the name, the scene and the time. An empty slot says so and offers
+                 itself. -->
+            <div class="rows long" id="moment-rows"></div>
+
+            <!-- Save here writes the focused slot (in play only; the launcher offers Resume alone),
+                 Resume loads it, Delete removes it. Nothing here is one click from losing progress:
+                 Delete asks twice, the same way Remove everything does. Two to a row (case.rcss,
+                 .pairs), so none of the four is crushed in the panel. -->
+            <div class="actions pairs">
+                <div class="act-btn act-quit" id="moments-delete"><span class="act-label" id="moments-delete-label">Delete</span></div>
+                <div class="act-btn act-quit" id="moments-save"><span class="act-label" id="moments-save-label">Save here</span></div>
+                <div class="act-btn act-play" id="moments-load"><span class="act-label" id="moments-load-label">Load</span></div>
+                <div class="act-btn" id="moments-cancel"><span class="act-label">Cancel</span></div>
+            </div>
+
+            <!-- THE ONE LINE OF HONESTY, always shown (states-design.md section 8). -->
+            <div class="foot">
+                <span id="moments-note">A moment keeps your progress and where you stand. Enemies, platforms and effects start over, as when the game loads a file. Rewind is not offered: the program cannot freeze the game mid frame.</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

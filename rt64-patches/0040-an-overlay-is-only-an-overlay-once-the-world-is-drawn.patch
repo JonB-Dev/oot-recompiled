@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:55:58 -0400
+Subject: [PATCH] An overlay is only an overlay once the world is drawn
+
+Patch 0040 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, in Hyrule Field at sunset: "the sun is now just literally not sitting behind
+any object. It was just floating mid-screen ... Major regression".
+
+Patch 0028 made a blended draw with no depth test and no depth write an overlay, drawn after the
+composite in its own color, which is right for Navi's core: the game draws it with the actors, over
+the world. The game draws the sun the same way, but right after the sky and before the rooms
+(Environment_DrawSunAndMoon in z_play.c), so the world drawn after it covers it wherever a hill
+stands. Moved after the composite, the sun was drawn over the hills.
+
+So a depthless draw is an overlay only after a traced draw has written depth in the same frame.
+Navi's core, drawn after the world, still is; the sun, drawn before anything writes depth, keeps
+its place under the world.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2130,6 +2130,7 @@ namespace RT64 {
+         RasterScene tracedRasterScene;   // the traced calls, rasterized too (patch 0005)
+         RasterScene tracedTranslucentScene;   // the translucent ones, rasterized AFTER the traced pass (patch 0008)
+         std::vector<interop::PointLight> beamLights;   // the shafts of light among this pair's draws (patch 0029)
++        bool worldDepthWritten = false;   // a traced draw has written depth: the world is being drawn (patch 0040)
+         auto checkRtScene = [&](RaytracingScene &rtScene) {
+             if (!rtScene.instanceIndices.empty()) {
+                 // The traced calls' own raster scene goes first, so the color target holds
+@@ -2582,8 +2583,22 @@ namespace RT64 {
+                         // body"). As an overlay it takes the translucent mask: after the
+                         // composite, in its own color and alpha, traced by nothing. No room
+                         // draw in the game is depthless. Rung 36 puts the old sorting back.
++                        //
++                        // ONLY ONCE THE WORLD IS DRAWN (patch 0040, the user, 2026-10-08, Hyrule
++                        // Field at sunset: "the sun is now just literally not sitting behind any
++                        // object. It was just floating mid-screen ... Major regression"). The game
++                        // draws the sun the same way, blended with no depth at all, but right after
++                        // the sky and BEFORE the rooms (z_play.c), so the world drawn over it hides
++                        // it where a hill stands. Moved after the composite, it was drawn over the
++                        // hills. So a depthless draw is an overlay only after a traced draw has
++                        // written depth this frame: Navi's core, drawn with the actors, still is;
++                        // the sun, drawn before anything writes depth, keeps its place under the
++                        // world.
+                         const bool depthlessOverlay = !otherMode.zCmp() && !otherMode.zUpd() && ((otherMode.L & IM_RD) != 0) &&
+-                                                      otherMode.forceBlend() && (cutoutRule != 36);
++                                                      otherMode.forceBlend() && (cutoutRule != 36) && worldDepthWritten;
++                        if (otherMode.zUpd()) {
++                            worldDepthWritten = true;
++                        }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+                         const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);
+                         if ((wasTranslucent && !solidDraw) || depthlessOverlay) {

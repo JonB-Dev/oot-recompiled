@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 7 Oct 2026 16:01:16 -0400
+Subject: [PATCH] The alpha test reads the texel the raster reads
+
+Patch 0024 of the renderer series (OoT: Recompiled).
+
+With a texture pack on, the top of a cliff in Hyrule Field was drawn well above the line where its
+shadow, Navi's light and the fog stopped, and that line was jagged. The user, 2026-10-07: "a big
+portion, a top portion of the texture on the top there of the walls that isn't being utilized or
+considered part of the object".
+
+The raster does not read a texture at a vertex's raw coordinate. sampleTexture first scales it by
+the tile's shift, moves it half a texel where the tile asks, multiplies it by tcScale and takes off
+the tile's origin. The traced alpha test (alphaCoverage, patch 0008) went straight to
+sampleTextureLevel with the raw coordinate and skipped all four. With the game's own textures
+tcScale is one and the origin is usually zero, so the gap hid. With a replacement, tcScale is the
+replacement's size over the original's, four for this pack, so the traced passes were reading the
+replacement's alpha at a quarter of the right place, and the edge they saw had nothing to do with
+the edge that was drawn.
+
+The fix is not a copy of those four steps. They move out of sampleTexture into two functions in
+TextureSampler.hlsli, the raster calls them with its own two raster only steps between them so its
+arithmetic is unchanged, and the alpha test calls them back to back. The two paths cannot drift
+because there is one path. The steps are a scale and an offset, so each corner of the triangle is
+taken through them and the hit interpolated after, which puts the footprint and the coverage taps
+in the bound texture's own texels too.
+
+The Experiment row's 34 puts the raw coordinate back, for the side by side the user's standing
+instruction for this area asks for ("dont guess, add rungs to test"). It is free since patch
+0023, so it differs from Off in nothing else.
+
+With the ray tracing row Off the raster runs the same arithmetic in the same order.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1491,10 +1491,40 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+         return 1.0f;
+     }
+ 
++    RDPTile rdpTile = RDPTiles[ri.rdpTileIndex];
++    if (!renderFlagDynamicTiles(rp.flags)) {
++        rdpTile.cms = renderCMS0(rp.flags);
++        rdpTile.cmt = renderCMT0(rp.flags);
++        rdpTile.nativeSampler = renderFlagNativeSampler0(rp.flags);
++    }
++    const GPUTile gpuTile = GPUTiles[ri.rdpTileIndex];
++
++    // THE TEXEL THE RASTER READS, NOT THE ONE NEXT TO IT (patch 0024). The vertex's coordinate is
++    // what the raster's vertex shader hands its pixel shader untouched, and sampleTexture then
++    // shifts it by the tile, moves it half a texel, scales it by tcScale and takes off the tile's
++    // origin before reading anything. This test used to read with the raw coordinate. With the
++    // game's own textures tcScale is one and the gap hid; with a texture pack it is the
++    // replacement's size over the original's, four for a 4K pack, so the traced passes read the
++    // replacement's alpha at a quarter of the right place. The user saw it on 2026-10-07 as the
++    // top of a cliff drawn well above where its shadow, Navi's light and the fog stopped, along a
++    // jagged line: "a big portion, a top portion of the texture on the top there of the walls
++    // that isn't being utilized or considered part of the object".
++    //
++    // The steps are the raster's own functions (TextureSampler.hlsli), not a copy of them, so the
++    // two cannot drift. They are a scale and an offset, so each corner is taken through them and
++    // the hit interpolated after, and the footprint and the taps below are then in the bound
++    // texture's own texels as well. The Experiment row's 34 puts the raw coordinate back, for
++    // the side by side.
++    const bool rawCoordinate = (RtParams.tuneExperiment.x == 34.0f);
+     const uint3 indices = indexBuffer.Load3((ri.faceIndicesStart + primitiveIndex * 3) * 4);
+-    const float2 uv0 = asfloat(genTexCoordBuffer.Load2(indices.x * 8));
+-    const float2 uv1 = asfloat(genTexCoordBuffer.Load2(indices.y * 8));
+-    const float2 uv2 = asfloat(genTexCoordBuffer.Load2(indices.z * 8));
++    float2 uv0 = asfloat(genTexCoordBuffer.Load2(indices.x * 8));
++    float2 uv1 = asfloat(genTexCoordBuffer.Load2(indices.y * 8));
++    float2 uv2 = asfloat(genTexCoordBuffer.Load2(indices.z * 8));
++    if (!rawCoordinate) {
++        uv0 = tileCoordinateFinish(tileCoordinateStart(otherMode, rp.flags, uv0, rdpTile), rdpTile, gpuTile);
++        uv1 = tileCoordinateFinish(tileCoordinateStart(otherMode, rp.flags, uv1, rdpTile), rdpTile, gpuTile);
++        uv2 = tileCoordinateFinish(tileCoordinateStart(otherMode, rp.flags, uv2, rdpTile), rdpTile, gpuTile);
++    }
+     const float2 uv = uv0 * (1.0f - barycentrics.x - barycentrics.y) + uv1 * barycentrics.x + uv2 * barycentrics.y;
+ 
+     // FAR AWAY THE RASTER SHOWS A BLEND, NOT HOLES. Its mip chain and coverage average a fence's
+@@ -1519,13 +1549,6 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+         footprint = RayTCurrent() * pixelAngle * texelsPerUnit;
+     }
+ 
+-    RDPTile rdpTile = RDPTiles[ri.rdpTileIndex];
+-    if (!renderFlagDynamicTiles(rp.flags)) {
+-        rdpTile.cms = renderCMS0(rp.flags);
+-        rdpTile.cmt = renderCMT0(rp.flags);
+-        rdpTile.nativeSampler = renderFlagNativeSampler0(rp.flags);
+-    }
+-    const GPUTile gpuTile = GPUTiles[ri.rdpTileIndex];
+     const float4 texel = sampleTextureLevel(rdpTile, gpuTile, false, false, false, uv, otherMode.textLUT(),
+                                             renderFlagCanDecodeTMEM(rp.flags), 0, renderFlagUsesHDR(rp.flags));
+     // The threshold is the blend color's alpha for the compare, the middle for the dithered
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -214,13 +214,38 @@ float4 sampleTextureLevel(const RDPTile rdpTile, const GPUTile gpuTile, bool fil
+     }
+ }
+ 
+-float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
++// WHERE A DRAW'S TEXTURE COORDINATE LANDS IN THE TEXTURE (patch 0024). The two halves of what
++// sampleTexture does to a vertex's coordinate before it reads a texel, split out so the traced
++// passes' alpha test can run exactly the same steps instead of a copy of them. The raster calls
++// both with its own two steps (the low precision rounding and the next pixel bug) between them,
++// so its arithmetic is unchanged; the traced test calls them back to back.
++//
++// The second half is the one that matters for a texture pack: tcScale is how many texels of the
++// texture actually bound stand for one texel of the original, which is one for the game's own
++// texture and four for a replacement four times its size. A coordinate that skips it reads the
++// replacement at a quarter of the right place.
++float2 tileCoordinateStart(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, const RDPTile rdpTile) {
+     const bool texturePerspective = (otherMode.textPersp() == G_TP_PERSP);
+     const bool applyCorrection = (!texturePerspective && !renderFlagRect(renderFlags));
+ 
+     // Compensates the lack of perspective division for the UVs based on observed hardware behavior.
+     const float perspCorrectionMod = applyCorrection ? 0.5f : 1.0f;
+-    float2 uvCoord = inputUV * perspCorrectionMod * float2(rdpTile.shifts, rdpTile.shiftt);
++    return inputUV * perspCorrectionMod * float2(rdpTile.shifts, rdpTile.shiftt);
++}
++
++float2 tileCoordinateFinish(float2 uvCoord, const RDPTile rdpTile, const GPUTile gpuTile) {
++    const bool flagShiftedByHalf = gpuTileFlagShiftedByHalf(gpuTile.flags);
++    if (flagShiftedByHalf) {
++        uvCoord += float2(0.5f, 0.5f);
++    }
++
++    uvCoord *= gpuTile.tcScale;
++    uvCoord -= (float2(rdpTile.uls, rdpTile.ult) * gpuTile.ulScale) / 4.0f;
++    return uvCoord;
++}
++
++float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
++    float2 uvCoord = tileCoordinateStart(otherMode, renderFlags, inputUV, rdpTile);
+ 
+ #if SIMULATE_LOW_PRECISION
+     if (!gpuTileFlagHighRes(gpuTile.flags)) {
+@@ -235,15 +260,9 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
+     if (nextPixelBug && renderFlagRect(renderFlags)) {
+         uvCoord.x += 1.0f;
+     }
+-    
+-    const bool flagShiftedByHalf = gpuTileFlagShiftedByHalf(gpuTile.flags);
+-    if (flagShiftedByHalf) {
+-        uvCoord += float2(0.5f, 0.5f);
+-    }
+-    
+-    uvCoord *= gpuTile.tcScale;
+-    uvCoord -= (float2(rdpTile.uls, rdpTile.ult) * gpuTile.ulScale) / 4.0f;
+-    
++
++    uvCoord = tileCoordinateFinish(uvCoord, rdpTile, gpuTile);
++
+     const uint filter = otherMode.textFilt();
+     const uint cycleType = otherMode.cycleType();
+     const bool filterBilerp = (filter != G_TF_POINT) && (cycleType != G_CYC_COPY);

@@ -1,0 +1,41 @@
+<rml>
+<head>
+    <title>Debugging</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim" id="debug-scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">Debugging</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">For development, not for playing. Up and down to move, left and right to change, Escape or the pad's B goes back</div>
+            </div>
+
+            <!-- EVERYTHING MEANT FOR DEVELOPMENT RATHER THAN FOR PLAYING, in one place (the user,
+                 2026-09-26). The rows are built by the shell from the same two models the other
+                 menus use, picked out by key (is_debug_setting, is_debug_lighting in
+                 ui_shell.cpp), so a row can never appear in both menus or in neither. The way in
+                 is a confirmation, never this document directly. -->
+            <div class="rows long" id="debug-rows"></div>
+
+            <div class="foot">
+                <span>Saved as you change it</span>
+                <span id="debug-foot">Put anything you change back when you are done; none of this is needed to play</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

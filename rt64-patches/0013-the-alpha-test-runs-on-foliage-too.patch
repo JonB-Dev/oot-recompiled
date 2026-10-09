@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 18:20:00 +0100
+Subject: [PATCH] The alpha test runs on foliage too
+
+Patch 0013 of the renderer series (OoT: Recompiled).
+
+Patch 0012 left this game's foliage lit correctly and casting nothing, with one artifact: where a
+quad crossed something lit differently, its rectangle showed. The cause is one early return.
+
+alphaCoverage answers "fully covered" for any draw that declares neither an alpha compare nor the
+coverage cut, and this game's foliage in the translucent z mode declares neither. So its
+transparent texels have always counted as surface to every ray. That is the quad shaped shadow,
+the transparent outline that casts it, and the cut-outs, from one cause.
+
+An earlier attempt at this problem removed the cut-out depth compare instead, on the reading that
+this alpha test already covered these draws. It does not, and taking the compare away left
+nothing dropping them at all, which was worse. Reverted, and the reasoning kept here so the same
+reading is not made a third time.
+
+A threshold has to be chosen, which is why this arrives on the Experiment row rather than simply
+on. With no compare declared the threshold lands at zero, and a test against zero passes every
+texel, so turning the test on without choosing one would change nothing. An eighth is the cut the
+coverage rule already uses for this game's own edge textures; a half is offered beside it.
+
+Rung 17 is rung 16 with the test on and the shadow still off, so the test can be judged alone.
+Rung 18 puts the shadow back, which is the point: a leaf tested at the hit casts a leaf rather
+than the quad it is drawn on. Rung 19 is rung 18 at the stricter cut.
+
+A draw that declares its own compare is untouched: the chosen cut is taken as a maximum beside it.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1298,7 +1298,27 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+     // only and so never ran on them ("fences ladders, vines etc still not working", the user,
+     // 2026-09-24).
+     const bool coverageCut = otherMode.cvgXAlpha();
+-    if ((alphaCompare != G_AC_THRESHOLD) && (alphaCompare != G_AC_DITHER) && !coverageCut) {
++    // THE FOLIAGE THIS GAME DECLARES NOTHING ABOUT (patch 0013). The draws the cut-out rules
++    // reclassify as solid, which is this game's trees and leaf clumps, sit in the translucent z
++    // mode and never write depth, and they use NEITHER alpha compare NOR the coverage cut. So
++    // every test above passes them straight through as "fully covered", their transparent texels
++    // included, and every ray treats the whole quad as surface. That is the quad shaped shadow,
++    // the transparent outline that casts it, and the cut-outs where a quad crosses something lit
++    // differently: one cause, three symptoms, reported on 2026-09-30 as all three.
++    //
++    // WHY THE EARLIER ATTEMPT AT THIS WAS WRONG, since the reverted patch is worth learning from:
++    // it assumed this test already ran on these draws and removed the depth compare that was the
++    // only thing dropping them. Reading the any-hit shader showed an alpha test; what it did not
++    // show was the early return above, which excludes the very class being reasoned about.
++    //
++    // A THRESHOLD HAS TO BE CHOSEN, and that is why this is on a rung rather than simply on. With
++    // no compare declared the threshold below lands at zero, and a test against zero passes every
++    // texel, so turning the test on alone would change nothing at all. An eighth is the same cut
++    // the coverage rule uses for the game's own edge textures; a half is offered beside it for a
++    // texture whose transparent regions are not fully transparent.
++    const bool reclassifiedFoliage = (RtParams.tuneExperiment.x >= 17.0f) &&
++                                     (otherMode.zMode() == ZMODE_XLU) && !otherMode.zUpd();
++    if ((alphaCompare != G_AC_THRESHOLD) && (alphaCompare != G_AC_DITHER) && !coverageCut && !reclassifiedFoliage) {
+         return 1.0f;
+     }
+     if (!renderFlagUsesTexture0(rp.flags)) {
+@@ -1346,6 +1366,12 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+     // compare (random per pixel on the console), and an eighth for the coverage cut; a draw
+     // with both takes the higher.
+     float threshold = coverageCut ? 0.125f : 0.0f;
++    // The chosen cut for a draw that declares none (patch 0013): an eighth, or a half on the rung
++    // that asks for it. Taken as a maximum like every other, so a draw that DOES declare a compare
++    // keeps its own and is unaffected by any of this.
++    if (reclassifiedFoliage) {
++        threshold = max(threshold, (RtParams.tuneExperiment.x >= 19.0f) ? 0.5f : 0.125f);
++    }
+     if (alphaCompare == G_AC_THRESHOLD) {
+         threshold = max(threshold, instanceRDPParams[ri.instanceIndex].blendColor.a);
+     }
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1869,6 +1869,16 @@ namespace RT64 {
+                             case 14: solidDraw = otherMode.zCmp(); castsNothing = true; break;
+                             case 15: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             case 16: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
++                            // 17 to 19 are rung 16 with the alpha test at the hit turned on for
++                            // these draws (patch 0013, in alphaCoverage). 17 keeps the shadow off
++                            // so the test can be judged on its own; 18 puts the shadow BACK, which
++                            // is the point of the whole exercise, because a leaf that is tested at
++                            // the hit casts a leaf rather than the quad it is drawn on; 19 is 18
++                            // with a stricter cut for a texture whose transparent parts are not
++                            // quite transparent.
++                            case 17: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
++                            case 18: solidDraw = otherMode.zCmp() && manyTriangles; break;
++                            case 19: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
+                         }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).

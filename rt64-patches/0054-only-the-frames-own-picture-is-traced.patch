@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Fri, 9 Oct 2026 17:35:00 -0400
+Subject: [PATCH] Only the frame's own picture is traced
+
+Patch 0054 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-09, of the pause menu's equipment page: "link has artifacting. maybe its using
+link with ray tracing and its breaking", and only on that page.
+
+The game draws the player's preview on that page into a picture of its own: a 64 by 112 color
+image with a depth image of its own and a perspective view (Player_DrawPauseImpl), run from the
+work list before the menu. Every test of a pair for tracing took it for the world: a perspective
+projection, depth written. So the preview player was traced, lit by the frame's lights in a
+picture a fifth of the frame's width.
+
+A pair is now traced only when its color image is as wide as the widest of the workload's pairs,
+which is the picture the frame is built in. Every pair the world is drawn in is that wide, so
+nothing traced before is lost; a small picture the game renders for its own use is drawn as the
+game drew it.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2400,6 +2400,20 @@ namespace RT64 {
+         int32_t rtMainTransforms = -1;
+         int32_t rtMainProj = -1;   // patch 0008: the projection itself, for its scissor and viewport
+         uint32_t rtMainCalls = 0;
++
++        // ONLY THE FRAME'S OWN PICTURE IS TRACED (patch 0054). The game also draws into small
++        // pictures of its own, the player's preview on the pause menu's equipment page above all:
++        // a 64 by 112 color image with a depth image of its own and a perspective view, which every
++        // other test here takes for the world. Traced, the preview player was lit by the frame's
++        // lights in a picture a fifth of the frame's width ("link has artifacting", the user,
++        // 2026-10-09). A pair is traced only when its color image is as wide as the widest of the
++        // workload's pairs, which is the picture the frame is built in.
++        uint16_t widestColorImage = 0;
++        for (uint32_t fp = 0; fp < p.curWorkload->fbPairCount; fp++) {
++            widestColorImage = std::max(widestColorImage, p.curWorkload->fbPairs[fp].colorImage.width);
++        }
++        const bool framePicture = (fbPair.colorImage.width >= widestColorImage);
++
+         if (p.rtEnabled) {
+             for (uint32_t pr = 0; pr < fbPair.projectionCount; pr++) {
+                 const Projection &candidate = fbPair.projections[pr];
+@@ -2423,6 +2437,7 @@ namespace RT64 {
+             // TODO: Use detected scenes logic instead.
+             const bool perspProj = (proj.type == Projection::Type::Perspective);
+             bool rtProj = p.rtEnabled && perspProj && fbPair.depthWrite && targetDrawCall.rtScenes.empty(); // TODO: Remove the last condition once multiple heaps per RT scene are supported.
++            rtProj = rtProj && framePicture;   // patch 0054
+ 
+             // Only a projection that shares the main one's matrices starts or joins the traced
+             // scene (patch 0003, see the choice above the loop).

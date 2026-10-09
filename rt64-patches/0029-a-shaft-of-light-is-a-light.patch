@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 12:49:44 -0400
+Subject: [PATCH] A shaft of light is a light
+
+Patch 0029 of the renderer series (OoT: Recompiled).
+
+This game draws every beam of light the same way: a see-through shape with a soft fading
+texture, long against its width and round across it, standing up or leaning in from above. The
+pedestal beam in the Temple of Time, the shaft in every grotto and grave, the sprout's shaft in
+the Deku Tree's meadow, the Forest and Spirit Temples' slanted beams, a warp's column. The
+console lit nothing with them; the shaft only glowed, and in the Temple of Time a zone on the
+floor switched the whole scene brighter, so a figure half inside the beam lit up whole (the
+user, 2026-10-08: "he's partially inside of it, but his whole body is lit up, even the parts
+that are outside of it").
+
+Each traced scene's see-through draws are now measured as they are classified. A draw that
+tests depth, samples a fading texture and has the shape of a shaft becomes a light: a cylinder
+of light falling down its own axis, from the top of the shaft, as wide as the shaft is drawn at
+each end, in the color the draw's own combiner gives it at its brightest. The local lights pass
+lights only what stands inside the cylinder, from the direction it falls, with shadow rays back
+up the shaft, and the edge of the shaft fades over its outer third. The air's glow leaves beams
+out, because the shaft the game draws is the glow. Beams follow the game's lights in the list,
+up to eight per scene, and a shaft drawn in layers is one beam.
+
+The shape test comes from an inventory of every room in the game: long against its width (the
+variance along the main axis at least four times what is left across it), round across it (the
+smaller cross variance at least a quarter of the larger; the Temple of Time's is a third, the
+grottos' whole, and every flat strip in the game, a waterfall, a band of light on a wall, under
+a fifth), at least 150 units long, and upright or leaning from above. Shape rather than a list
+of places, so an actor's beam is found the same way at any scale.
+
+Rung 37 leaves every shaft as the game drew it, and takes the cut-out quads of patch 0027 like
+the default, so it differs from Off only in this. The program reads the same rung to put back
+the Temple of Time's floor switch.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "rt64_framebuffer_renderer.h"
+ 
++#include <algorithm>
++#include <cstring>
++
+ #include "../include/rt64_extended_gbi.h"
+ 
+ #include "common/rt64_elapsed_timer.h"
+@@ -137,6 +140,346 @@ namespace RT64 {
+         };
+     }
+ 
++#   if RT_ENABLED
++    // A DRAWN SHAFT OF LIGHT IS A LIGHT (patch 0029). This game draws every beam the same way: a
++    // see-through shape with a soft fading texture, long against its width and round across it,
++    // standing up or leaning in from above. The pedestal beam in the Temple of Time, the shaft in
++    // every grotto and grave, the sprout's shaft in the Deku Tree's meadow, the Forest and Spirit
++    // Temples' slanted beams, a warp's column. The console lit nothing with them: the shaft glowed,
++    // and in the Temple of Time a zone on the floor switched the whole scene brighter (the user,
++    // 2026-10-08: "he's partially inside of it, but his whole body is lit up, even the parts that
++    // are outside of it"). Here each one becomes a light that reaches only what stands inside it,
++    // from the direction it falls, shadowed along it, in its own color.
++    //
++    // THE SHAPE TEST comes from an inventory of every room in the game (the principal axes of each
++    // see-through draw's vertices). A shaft is long against its width (the variance along the main
++    // axis at least four times what is left across it), ROUND across (the smaller cross variance at
++    // least a quarter of the larger: the Temple of Time's is a third, the grottos' are whole, and
++    // every flat strip in the game, a waterfall, a wall's band of light, a curtain, is under a
++    // fifth), at least 150 units long, and upright or leaning from above (its axis at least 0.4 up).
++    // The texture must be a fade, which a cut-out never is, and the draw must be one the traced
++    // scene leaves out as see-through. Shape, not position, so a beam no list names (an actor's,
++    // a warp's) is found the same way, at any scale.
++    static const uint32_t MaxBeamLights = 8;            // per traced scene, after the game's own lights
++    static const uint32_t MaxBeamTriangles = 128;       // a shaft is a few dozen at most; anything larger is a surface
++    static const float BeamMinElongation = 4.0f;
++    static const float BeamMinRoundness = 0.25f;
++    static const float BeamMinLength = 150.0f;          // world units; Link is about 60
++    static const float BeamMinUpright = 0.4f;
++    static const float BeamEdgeSoftness = 0.35f;        // the outer share of the shaft's radius its light fades across
++    static const uint32_t BeamLightBit = 8u;            // the group bit the shaders read as a beam (Raytracing.hlsl)
++
++    // The symmetric 3x3 eigen problem by Jacobi rotations: values descending, vectors as columns.
++    static void symmetricEigen3(float a[3][3], float values[3], float vectors[3][3]) {
++        for (int i = 0; i < 3; i++) {
++            for (int j = 0; j < 3; j++) {
++                vectors[i][j] = (i == j) ? 1.0f : 0.0f;
++            }
++        }
++
++        for (int sweep = 0; sweep < 16; sweep++) {
++            const float off = std::abs(a[0][1]) + std::abs(a[0][2]) + std::abs(a[1][2]);
++            if (off < 1e-6f) {
++                break;
++            }
++
++            for (int p = 0; p < 2; p++) {
++                for (int q = p + 1; q < 3; q++) {
++                    if (std::abs(a[p][q]) < 1e-9f) {
++                        continue;
++                    }
++
++                    const float theta = (a[q][q] - a[p][p]) / (2.0f * a[p][q]);
++                    const float t = ((theta >= 0.0f) ? 1.0f : -1.0f) / (std::abs(theta) + std::sqrt(theta * theta + 1.0f));
++                    const float c = 1.0f / std::sqrt(t * t + 1.0f);
++                    const float s = t * c;
++                    for (int k = 0; k < 3; k++) {
++                        const float akp = a[k][p];
++                        const float akq = a[k][q];
++                        a[k][p] = c * akp - s * akq;
++                        a[k][q] = s * akp + c * akq;
++                    }
++                    for (int k = 0; k < 3; k++) {
++                        const float apk = a[p][k];
++                        const float aqk = a[q][k];
++                        a[p][k] = c * apk - s * aqk;
++                        a[q][k] = s * apk + c * aqk;
++                    }
++                    for (int k = 0; k < 3; k++) {
++                        const float vkp = vectors[k][p];
++                        const float vkq = vectors[k][q];
++                        vectors[k][p] = c * vkp - s * vkq;
++                        vectors[k][q] = s * vkp + c * vkq;
++                    }
++                }
++            }
++        }
++
++        int order[3] = { 0, 1, 2 };
++        std::sort(order, order + 3, [&](int x, int y) { return a[x][x] > a[y][y]; });
++        float sorted[3][3];
++        for (int c = 0; c < 3; c++) {
++            values[c] = a[order[c]][order[c]];
++            for (int r = 0; r < 3; r++) {
++                sorted[r][c] = vectors[r][order[c]];
++            }
++        }
++        std::memcpy(vectors, sorted, sizeof(sorted));
++    }
++
++    // The color the shaft is drawn in where its texture is at its brightest: the draw's own color
++    // combiner run once on the CPU with a white, solid texel, the draw's primitive and environment
++    // colors, and the average of its vertex colors as the shade. The same arithmetic as the raster
++    // (shared/rt64_color_combiner.h, run) without the wrap a real texel can trigger, which a white
++    // one cannot.
++    static hlslpp::float4 beamCombinerColor(const GameCall &call, const hlslpp::float4 &shade) {
++        const interop::ColorCombiner &cc = call.callDesc.colorCombiner;
++        const interop::RDPParams &rdp = call.callDesc.rdpParams;
++        const hlslpp::float3 prim(rdp.primColor.x, rdp.primColor.y, rdp.primColor.z);
++        const hlslpp::float3 env(rdp.envColor.x, rdp.envColor.y, rdp.envColor.z);
++        const hlslpp::float3 shadeColor = shade.xyz;
++        const float shadeAlpha = shade.w;
++        const float primLodFrac = rdp.primLOD.x;
++        auto colorInput = [&](interop::ColorCombiner::ColorInput input, const hlslpp::float3 &combinedColor, float combinedAlpha) -> hlslpp::float3 {
++            switch (input) {
++            case interop::ColorCombiner::C_COMBINED: return combinedColor;
++            case interop::ColorCombiner::C_TEXEL0:
++            case interop::ColorCombiner::C_TEXEL1: return hlslpp::float3(1.0f, 1.0f, 1.0f);
++            case interop::ColorCombiner::C_PRIMITIVE: return prim;
++            case interop::ColorCombiner::C_SHADE: return shadeColor;
++            case interop::ColorCombiner::C_ENVIRONMENT: return env;
++            case interop::ColorCombiner::C_COMBINED_ALPHA: return hlslpp::float3(combinedAlpha, combinedAlpha, combinedAlpha);
++            case interop::ColorCombiner::C_TEXEL0_ALPHA:
++            case interop::ColorCombiner::C_TEXEL1_ALPHA: return hlslpp::float3(1.0f, 1.0f, 1.0f);
++            case interop::ColorCombiner::C_PRIMITIVE_ALPHA: return hlslpp::float3(rdp.primColor.w, rdp.primColor.w, rdp.primColor.w);
++            case interop::ColorCombiner::C_SHADE_ALPHA: return hlslpp::float3(shadeAlpha, shadeAlpha, shadeAlpha);
++            case interop::ColorCombiner::C_ENV_ALPHA: return hlslpp::float3(rdp.envColor.w, rdp.envColor.w, rdp.envColor.w);
++            case interop::ColorCombiner::C_PRIM_LOD_FRAC: return hlslpp::float3(primLodFrac, primLodFrac, primLodFrac);
++            case interop::ColorCombiner::C_ONE: return hlslpp::float3(1.0f, 1.0f, 1.0f);
++            default: return hlslpp::float3(0.0f, 0.0f, 0.0f);
++            }
++        };
++        auto alphaInput = [&](interop::ColorCombiner::AlphaInput input, float combinedAlpha) -> float {
++            switch (input) {
++            case interop::ColorCombiner::A_COMBINED: return combinedAlpha;
++            case interop::ColorCombiner::A_TEXEL0:
++            case interop::ColorCombiner::A_TEXEL1: return 1.0f;
++            case interop::ColorCombiner::A_PRIMITIVE: return rdp.primColor.w;
++            case interop::ColorCombiner::A_SHADE: return shadeAlpha;
++            case interop::ColorCombiner::A_ENVIRONMENT: return rdp.envColor.w;
++            case interop::ColorCombiner::A_PRIM_LOD_FRAC: return primLodFrac;
++            case interop::ColorCombiner::A_ONE: return 1.0f;
++            default: return 0.0f;
++            }
++        };
++
++        hlslpp::float3 color(0.0f, 0.0f, 0.0f);
++        float alpha = 0.0f;
++        const bool twoCycle = (call.callDesc.otherMode.cycleType() == G_CYC_2CYCLE);
++        const uint32_t firstCycle = twoCycle ? 0 : 1;
++        for (uint32_t cycle = firstCycle; cycle < 2; cycle++) {
++            const bool second = (cycle == 1);
++            const hlslpp::float3 rgb = (colorInput(cc.decodeColorInput(0, second), color, alpha) - colorInput(cc.decodeColorInput(1, second), color, alpha)) *
++                colorInput(cc.decodeColorInput(2, second), color, alpha) + colorInput(cc.decodeColorInput(3, second), color, alpha);
++            const float a = (alphaInput(cc.decodeAlphaInput(0, second), alpha) - alphaInput(cc.decodeAlphaInput(1, second), alpha)) *
++                alphaInput(cc.decodeAlphaInput(2, second), alpha) + alphaInput(cc.decodeAlphaInput(3, second), alpha);
++            color = hlslpp::saturate(rgb);
++            alpha = std::clamp(a, 0.0f, 1.0f);
++        }
++
++        return hlslpp::float4(color, alpha);
++    }
++
++    // The beam a draw is, or false when it is not one. Reads the CPU copy of the draw's vertices,
++    // which the traced scene's own world positions are made from (RSPWorldCS: the vertex times its
++    // world matrix, the matrix written for a row vector).
++    static bool beamFromDraw(const DrawData &drawData, const GameCall &call, interop::PointLight &beam) {
++        const uint32_t triangleCount = call.callDesc.triangleCount;
++        if ((triangleCount < 2) || (triangleCount > MaxBeamTriangles)) {
++            return false;
++        }
++
++        uint32_t indices[MaxBeamTriangles * 3];
++        uint32_t count = 0;
++        const uint32_t start = call.meshDesc.faceIndicesStart;
++        if ((start + triangleCount * 3) > drawData.faceIndices.size()) {
++            return false;
++        }
++
++        for (uint32_t i = 0; i < (triangleCount * 3); i++) {
++            const uint32_t v = drawData.faceIndices[start + i];
++            if (std::find(indices, indices + count, v) == (indices + count)) {
++                indices[count++] = v;
++            }
++        }
++
++        if (count < 5) {
++            return false;
++        }
++
++        hlslpp::float3 points[MaxBeamTriangles * 3];
++        hlslpp::float3 mean(0.0f, 0.0f, 0.0f);
++        hlslpp::float4 shade(0.0f, 0.0f, 0.0f, 0.0f);
++        bool shadeIsColor = true;
++        for (uint32_t i = 0; i < count; i++) {
++            const uint32_t v = indices[i];
++            if ((v >= drawData.worldIndices.size()) || (((v + 1) * 3) > drawData.posFloats.size()) || (((v + 1) * 4) > drawData.normColBytes.size())) {
++                return false;
++            }
++
++            const uint16_t transformIndex = drawData.worldIndices[v];
++            if (transformIndex >= drawData.worldTransforms.size()) {
++                return false;
++            }
++
++            const hlslpp::float4 local(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++            const hlslpp::float4x4 worldMatrix = drawData.worldTransforms[transformIndex];
++            const hlslpp::float4 world = hlslpp::mul(local, worldMatrix);
++            points[i] = world.xyz;
++            mean += points[i];
++            // A lit vertex carries its normal where an unlit one carries its color.
++            if ((v < drawData.lightCounts.size()) && (drawData.lightCounts[v] > 0)) {
++                shadeIsColor = false;
++            }
++            shade += hlslpp::float4(float(drawData.normColBytes[v * 4 + 0]), float(drawData.normColBytes[v * 4 + 1]),
++                                    float(drawData.normColBytes[v * 4 + 2]), float(drawData.normColBytes[v * 4 + 3])) / 255.0f;
++        }
++
++        mean /= float(count);
++        shade /= float(count);
++        if (!shadeIsColor) {
++            shade = hlslpp::float4(1.0f, 1.0f, 1.0f, shade.w);
++        }
++
++        float covariance[3][3] = {};
++        for (uint32_t i = 0; i < count; i++) {
++            const hlslpp::float3 d = points[i] - mean;
++            const float dx = float(d.x);
++            const float dy = float(d.y);
++            const float dz = float(d.z);
++            covariance[0][0] += dx * dx; covariance[0][1] += dx * dy; covariance[0][2] += dx * dz;
++            covariance[1][1] += dy * dy; covariance[1][2] += dy * dz; covariance[2][2] += dz * dz;
++        }
++        covariance[1][0] = covariance[0][1];
++        covariance[2][0] = covariance[0][2];
++        covariance[2][1] = covariance[1][2];
++        for (int i = 0; i < 3; i++) {
++            for (int j = 0; j < 3; j++) {
++                covariance[i][j] /= float(count);
++            }
++        }
++
++        float values[3];
++        float vectors[3][3];
++        symmetricEigen3(covariance, values, vectors);
++        const float across = values[1] + values[2];
++        if ((values[0] <= 0.0f) || (values[1] <= 0.0f) || (values[0] < (BeamMinElongation * across)) || (values[2] < (BeamMinRoundness * values[1]))) {
++            return false;
++        }
++
++        // The axis points DOWN the shaft: the light falls from its upper end.
++        hlslpp::float3 axis(vectors[0][0], vectors[1][0], vectors[2][0]);
++        axis = hlslpp::normalize(axis);
++        if (float(axis.y) > 0.0f) {
++            axis = -axis;
++        }
++
++        if (-float(axis.y) < BeamMinUpright) {
++            return false;
++        }
++
++        float alongMin = 1e30f;
++        float alongMax = -1e30f;
++        for (uint32_t i = 0; i < count; i++) {
++            const float along = float(hlslpp::dot(points[i] - mean, axis));
++            alongMin = std::min(alongMin, along);
++            alongMax = std::max(alongMax, along);
++        }
++
++        const float length = alongMax - alongMin;
++        if (length < BeamMinLength) {
++            return false;
++        }
++
++        // The shaft's radius at each end, from the vertices in its upper and lower halves, so a
++        // shaft that widens as it falls (most of this game's do) is lit as wide as it is drawn.
++        float radiusTop = 0.0f;
++        float radiusBottom = 0.0f;
++        for (uint32_t i = 0; i < count; i++) {
++            const hlslpp::float3 d = points[i] - mean;
++            const float along = float(hlslpp::dot(d, axis));
++            const float radial = float(hlslpp::length(d - axis * along));
++            if ((along - alongMin) < (length * 0.5f)) {
++                radiusTop = std::max(radiusTop, radial);
++            }
++            else {
++                radiusBottom = std::max(radiusBottom, radial);
++            }
++        }
++
++        if (radiusTop <= 0.0f) {
++            radiusTop = radiusBottom;
++        }
++
++        if (radiusBottom <= 0.0f) {
++            radiusBottom = radiusTop;
++        }
++
++        // Its color, at the strength it is drawn with: the hue kept whole, the brightness from how
++        // solid the shaft is at its brightest, so a faint shaft is a faint light.
++        const hlslpp::float4 drawn = beamCombinerColor(call, shade);
++        const float peak = std::max(std::max(float(drawn.x), float(drawn.y)), float(drawn.z));
++        const hlslpp::float3 drawnColor = drawn.xyz;
++        const hlslpp::float3 hue = (peak > 0.02f) ? (drawnColor / peak) : hlslpp::float3(1.0f, 1.0f, 1.0f);
++        const float strength = std::clamp(0.35f + float(drawn.w), 0.35f, 1.0f);
++
++        beam = {};
++        beam.position = interop::float3(mean + axis * alongMin);
++        beam.direction = interop::float3(axis);
++        beam.diffuseColor = interop::float3(hue * strength);
++        beam.specularColor = interop::float3(0.0f, 0.0f, 0.0f);
++        // The fields a beam uses, named for a point light's: the length down the shaft in the
++        // exponent, the radius at the top in the point radius and at the bottom in the spot's
++        // maximum, and the share of the radius its edge fades across in the spot's falloff. The
++        // radius is only a bound, the whole shaft and its landing inside it.
++        beam.attenuationExponent = length;
++        beam.pointRadius = radiusTop;
++        beam.spotMaxCosine = radiusBottom;
++        beam.spotFalloffCosine = BeamEdgeSoftness;
++        beam.attenuationRadius = std::sqrt((length * 1.3f) * (length * 1.3f) + std::max(radiusTop, radiusBottom) * std::max(radiusTop, radiusBottom));
++        beam.shadowOffset = 0.0f;
++        beam.flickerIntensity = 0.0f;
++        beam.groupBits = BeamLightBit | 4u;
++        return true;
++    }
++
++    // One light per shaft: a shaft drawn in layers (an inner and an outer cylinder) is one beam.
++    static void addBeam(std::vector<interop::PointLight> &beams, const interop::PointLight &beam) {
++        for (interop::PointLight &existing : beams) {
++            const float reach = std::max(std::max(existing.pointRadius, existing.spotMaxCosine), std::max(beam.pointRadius, beam.spotMaxCosine));
++            const hlslpp::float3 existingPosition = existing.position;
++            const hlslpp::float3 beamPosition = beam.position;
++            const hlslpp::float3 existingDirection = existing.direction;
++            const hlslpp::float3 beamDirection = beam.direction;
++            if ((float(hlslpp::length(existingPosition - beamPosition)) < reach) && (float(hlslpp::dot(existingDirection, beamDirection)) > 0.95f)) {
++                const hlslpp::float3 existingColor = existing.diffuseColor;
++                const hlslpp::float3 beamColor = beam.diffuseColor;
++                const interop::float3 color(hlslpp::max(existingColor, beamColor));
++                if ((beam.pointRadius + beam.spotMaxCosine) > (existing.pointRadius + existing.spotMaxCosine)) {
++                    existing = beam;
++                }
++
++                existing.diffuseColor = color;
++                return;
++            }
++        }
++
++        if (beams.size() < MaxBeamLights) {
++            beams.push_back(beam);
++        }
++    }
++#   endif
++
+     // RasterScene
+ 
+     RasterScene::RasterScene() { }
+@@ -175,6 +518,9 @@ namespace RT64 {
+         hitGroupVector.clear();
+         renderIndicesVector.clear();
+         rspSmoothNormalVector.clear();
++#   if RT_ENABLED
++        rtSceneLights.clear();   // patch 0029
++#   endif
+         frameParams.viewUbershaders = ubershadersVisible;
+         frameParams.ditherNoiseStrength = ditherNoiseStrength;
+         framebufferCount = 0;
+@@ -1549,6 +1895,7 @@ namespace RT64 {
+         RaytracingScene rtScene;
+         RasterScene tracedRasterScene;   // the traced calls, rasterized too (patch 0005)
+         RasterScene tracedTranslucentScene;   // the translucent ones, rasterized AFTER the traced pass (patch 0008)
++        std::vector<interop::PointLight> beamLights;   // the shafts of light among this pair's draws (patch 0029)
+         auto checkRtScene = [&](RaytracingScene &rtScene) {
+             if (!rtScene.instanceIndices.empty()) {
+                 // The traced calls' own raster scene goes first, so the color target holds
+@@ -1981,8 +2328,9 @@ namespace RT64 {
+                         // 0027): Off, the unrelated shader experiments 1 to 7, 25 (the rule that
+                         // won, which IS the default) and 30 to 34. The ladder's own historical
+                         // rules (8 to 24, 26 to 29) and 35 keep exactly what they did.
++                        // 37 (patch 0029) differs from Off in the beams alone.
+                         const bool defaultFamily = (cutoutRule < 8) || (cutoutRule == 25) || ((cutoutRule >= 30) && (cutoutRule <= 34)) ||
+-                                                   (cutoutRule == 36);
++                                                   (cutoutRule == 36) || (cutoutRule == 37);
+                         if (defaultFamily && cutoutQuad) {
+                             solidDraw = true;
+                         }
+@@ -2041,6 +2389,20 @@ namespace RT64 {
+                             raytracing.queryMask |= ShadowCatcherRayQueryMask;
+                         }
+ 
++                        // A SHAFT OF LIGHT BECOMES A LIGHT (patch 0029, the shape test above
++                        // beamFromDraw). Only a draw this scene leaves out as see-through, that
++                        // tests depth, with a fading texture: a shaft is never solid and never a
++                        // cut-out. Rung 37 leaves every shaft as the game drew it.
++                        if (wasTranslucent && !solidDraw && !depthlessOverlay && otherMode.zCmp() && (cutoutRule != 37) &&
++                            (call.callDesc.tileCount > 0) && (beamLights.size() < MaxBeamLights)) {
++                            const DrawCallTile &beamTile = drawData.callTiles[call.callDesc.tileIndex];
++                            interop::PointLight beam;
++                            if (beamTile.valid && !beamTile.tileCopyUsed && (textureAlphaKind(beamTile.tmemHashOrID) == TextureAlphaKind::Fade) &&
++                                beamFromDraw(drawData, call, beam)) {
++                                addBeam(beamLights, beam);
++                            }
++                        }
++
+                         const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart *IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, false);
+                         rtResources->addBottomLevelASMesh(asMesh);
+ 
+@@ -2328,6 +2690,22 @@ namespace RT64 {
+ 
+ #   if RT_ENABLED
+         checkRtScene(rtScene);
++
++        // The beams join the scene's lights after the game's own (patch 0029). The traced scene
++        // took the game's list at its first call, before any shaft was drawn, so its list is
++        // copied with the beams after it into storage that lives until the frame's lights are
++        // uploaded (rtSceneLights, emptied in resetFramebuffers).
++        if (!beamLights.empty() && !targetDrawCall.rtScenes.empty()) {
++            RaytracingScene &tracedScene = targetDrawCall.rtScenes.front();
++            std::vector<interop::PointLight> &sceneLights = rtSceneLights.emplace_back();
++            if (tracedScene.pointLights != nullptr) {
++                sceneLights.assign(tracedScene.pointLights, tracedScene.pointLights + tracedScene.lightCount);
++            }
++
++            sceneLights.insert(sceneLights.end(), beamLights.begin(), beamLights.end());
++            tracedScene.pointLights = sceneLights.data();
++            tracedScene.lightCount = uint32_t(sceneLights.size());
++        }
+ #   endif
+         checkRasterScene(rasterScene);
+     }
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <stdint.h>
++#include <deque>
+ 
+ #include "common/rt64_emulator_configuration.h"
+ #include "common/rt64_user_configuration.h"
+@@ -184,6 +185,11 @@ namespace RT64 {
+         // The game's point lights for the traced scene (patch 0006), set every frame by the
+         // workload queue from what the program published; taken before the projection's own.
+         std::vector<interop::PointLight> rtExternalLights;
++
++        // A traced scene's lights with the beams found among its draws after them (patch 0029),
++        // one list per scene that has any, kept until the frame's lights are uploaded. A deque,
++        // so a list a scene already points at never moves when the next one is added.
++        std::deque<std::vector<interop::PointLight>> rtSceneLights;
+ #   endif
+     };
+ };
+\ No newline at end of file
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -535,6 +535,73 @@ static const float LightClearance = 48.0f;   // world units around a light its h
+ // grazing angle to a torch a few steps away (2026-09-24, the bands across the Deku Tree floor).
+ static const float LocalBlockerSkip = 10.0f;   // world units; Link is about 60
+ 
++// A BEAM (patch 0029): a shaft of light the game draws, found by its shape on the CPU
++// (rt64_framebuffer_renderer.cpp, beamFromDraw) and handed over in the light list with this group
++// bit. It is not a point: it is a cylinder of light falling down its own axis, so it lights what
++// stands INSIDE the shaft, from the direction the shaft falls, and nothing outside it. Its fields,
++// named for a point light's: position the top of the shaft, direction down it, the length in the
++// exponent, the radius at the top in the point radius and at the bottom in the spot's maximum,
++// and the share of the radius its edge fades across in the spot's falloff.
++static const uint BeamLightBit = 8u;
++static const float BeamLandingReach = 1.3f;     // past its drawn end a shaft still lands, fading out by this share of its length
++static const float BeamClearanceShare = 0.15f;  // the top of a shaft sits in the hole or the window it comes through; its last share is not traced
++static const float BeamSpread = 0.04f;          // how far a beam's shadow rays lean from the shaft's axis, so its shadows soften
++
++// The light a beam gives a surface, shadowed back up the shaft, and the same unblocked.
++void beamLight(PointLight light, float3 position, float3 normal, float biasBase, uint2 launchIndex, uint lightIndex, uint lightSamples,
++               inout float3 sum, inout float3 sumUnblocked) {
++    const float3 axis = light.direction;
++    const float3 fromTop = position - light.position;
++    const float along = dot(fromTop, axis);
++    const float beamLength = light.attenuationExponent;
++    if ((along <= 0.0f) || (along >= beamLength * BeamLandingReach)) {
++        return;
++    }
++
++    const float radialDistance = length(fromTop - axis * along);
++    const float beamRadius = lerp(light.pointRadius, light.spotMaxCosine, saturate(along / beamLength));
++    if (radialDistance >= beamRadius) {
++        return;
++    }
++
++    const float3 toLight = -axis;
++    const float ndl = saturate(dot(normal, toLight));
++    if (ndl <= 0.0f) {
++        return;
++    }
++
++    const float edge = 1.0f - smoothstep(beamRadius * (1.0f - light.spotFalloffCosine), beamRadius, radialDistance);
++    const float landing = 1.0f - smoothstep(beamLength, beamLength * BeamLandingReach, along);
++    const float weight = edge * landing * ndl;
++    if (weight <= 0.0f) {
++        return;
++    }
++
++    // Straight back up the shaft, each ray leaning a little from its axis, to the last stretch
++    // before the shaft's top: what stands in the shaft above a surface shadows it.
++    float3 tangent;
++    float3 bitangent;
++    tangentFrame(toLight, tangent, bitangent);
++    const float3 shadowOrigin = position + normal * (biasBase * (1.0f + 2.0f / max(ndl, 0.25f)));
++    const float tMax = max(along * (1.0f - BeamClearanceShare), 0.0f);
++    float hitDistance;
++    float blocked = 0.0f;
++    for (uint ls = 0; ls < lightSamples; ls++) {
++        const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 17u + ls * 31u + lightIndex * 7u);
++        const float angle = 6.28318531f * noise.x;
++        const float spread = sqrt(noise.y) * BeamSpread;
++        const float3 rayDirection = normalize(toLight + tangent * (spread * cos(angle)) + bitangent * (spread * sin(angle)));
++        const float sample = (tMax > LocalBlockerSkip)
++            ? traceVisibilityRange(shadowOrigin, rayDirection, LocalBlockerSkip, tMax, hitDistance)
++            : 1.0f;
++        blocked += 1.0f - sample;
++    }
++
++    const float visibility = 1.0f - (blocked / float(lightSamples));
++    sum += light.diffuseColor * (weight * visibility);
++    sumUnblocked += light.diffuseColor * weight;
++}
++
+ [shader("raygeneration")]
+ void LightsRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+@@ -577,6 +644,11 @@ void LightsRayGen() {
+     float3 sumUnblocked = 0.0f;
+     for (uint i = 0; i < count; i++) {
+         const PointLight light = SceneLights[i];
++        if ((light.groupBits & BeamLightBit) != 0u) {   // a shaft of light, not a point (patch 0029)
++            beamLight(light, position, normal, biasBase, launchIndex, i, lightSamples, sum, sumUnblocked);
++            continue;
++        }
++
+         const float3 toLight = light.position - position;
+         const float distance2 = dot(toLight, toLight);
+         // The reach control (patch 0008) scales the game's own radius.
+@@ -1281,6 +1353,10 @@ void ScatterRayGen() {
+         if ((lightGlow > 0.0f) && (RtParams.tuneExperiment.x != 4.0f)) {   // the Experiment row: 4 is the glow off
+             for (uint i = 0; i < lights; i++) {
+                 const PointLight light = SceneLights[i];
++                if ((light.groupBits & BeamLightBit) != 0u) {   // a beam's glow is the shaft the game draws (patch 0029)
++                    continue;
++                }
++
+                 const float3 toLight = light.position - p;
+                 const float distance2 = dot(toLight, toLight);
+                 // THE GLOW'S OWN SIZE (2026-09-24, the user: "control the reach and the actual

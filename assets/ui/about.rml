@@ -1,0 +1,127 @@
+<rml>
+<head>
+    <title>About</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">OoT: Recompiled</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <div class="hint">Up and down scroll, Escape or the pad's B closes</div>
+            </div>
+
+            <!-- Everything between the lid and the foot scrolls as one region (the signature and
+                 the changelog made this longer than any window). Its height is set by the shell
+                 from the window's. -->
+            <div class="body" id="about-body">
+
+                <div class="prose">
+                    A static recompilation. The machine code in your own copy of the game was
+                    translated to C, compiled for this machine, and is running natively. No emulator
+                    is involved, and nothing of the game ships with this program.
+                </div>
+
+                <div class="field">
+                    <span class="name">Version</span>
+                    <span class="datum" id="about-version">unknown</span>
+                </div>
+
+                <div class="field">
+                    <span class="name">By</span>
+                    <span class="datum" id="about-author">Jonathan Barnes</span>
+                </div>
+
+                <div class="field">
+                    <span class="name">License</span>
+                    <span class="datum">GPL-3.0</span>
+                </div>
+
+                <div class="heading">Signature</div>
+
+                <div class="prose">
+                    What Windows says of this program's own file, checked on this machine and without
+                    the network.
+                </div>
+
+                <div class="field">
+                    <span class="name">Status</span>
+                    <span class="datum" id="about-sign-status">unknown</span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Signed by</span>
+                    <span class="datum" id="about-signer"></span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Issued by</span>
+                    <span class="datum" id="about-issuer"></span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Signed on</span>
+                    <span class="datum" id="about-signed-on"></span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Certificate valid</span>
+                    <span class="datum" id="about-valid"></span>
+                </div>
+
+                <div class="heading">Changes</div>
+
+                <!-- Every version, newest first, from assets/changelog.json; filled by the shell. -->
+                <div id="about-changes"></div>
+
+                <div class="heading">What it was built from</div>
+
+                <div class="prose">
+                    These are the exact commits this binary was built against. A recompilation is only
+                    reproducible if they are written down, so they are read from the checkouts at build
+                    time rather than typed here.
+                </div>
+
+                <div class="field">
+                    <span class="name">Recompiler</span>
+                    <span class="datum" id="about-recompiler">unknown</span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Runtime</span>
+                    <span class="datum" id="about-runtime">unknown</span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Renderer</span>
+                    <span class="datum" id="about-renderer">unknown</span>
+                </div>
+
+                <div class="field">
+                    <span class="name">Symbols</span>
+                    <span class="datum" id="about-decomp">unknown</span>
+                </div>
+
+            </div>
+
+            <div class="foot">
+                <span>Your ROM stays yours. It is read from where you put it and never copied.</span>
+                <span id="about-built">built</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

@@ -1,0 +1,52 @@
+<rml>
+<head>
+    <title>Browse</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="controls.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="frame">
+        <div class="case window">
+
+            <div class="lid">
+                <div class="head">
+                    <div class="mark"></div>
+                    <div class="title">Choose your ROM</div>
+                </div>
+                <div class="chrome">
+                    <div class="win-btn" id="win-min"><div class="glyph-min"></div></div>
+                    <div class="win-btn" id="win-max"><div class="glyph-max"></div></div>
+                    <div class="win-btn" id="win-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                </div>
+            </div>
+
+            <!-- The folder being shown, above the list (the user's note of 2026-09-19: it sat
+                 in the foot and ran into the foot's text). -->
+            <div class="path-line">
+                <span class="name">Folder</span>
+                <span class="datum" id="browse-path">Drives</span>
+            </div>
+
+            <!-- The rows are built at runtime from the drives, then a folder's folders and ROM
+                 files (main/launch.cpp lists them; the shell fills the rows). -->
+            <div class="rows long" id="browse-rows"></div>
+
+            <!-- A path typed or pasted (a file:// URL will do), Enter taking it as the ROM; or
+                 Browse, which opens the file picker and puts the chosen file here. -->
+            <div class="entry-line">
+                <span class="name">Path</span>
+                <input type="text" id="browse-input" class="path-input"/>
+                <div class="btn" id="browse-pick">Browse</div>
+            </div>
+
+            <div class="foot">
+                <span id="browse-foot">Enter opens a folder or takes a ROM, B goes up, or drop the file here</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

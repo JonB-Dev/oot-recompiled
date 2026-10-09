@@ -1,0 +1,66 @@
+From 05819489033eafd752741f4e0b71e20f0f9e786e Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 23 Sep 2026 22:56:34 -0400
+Subject: [PATCH] Build the ray tracing path behind RT64_RAYTRACING
+
+Patch 0001 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md).
+
+The pinned renderer carries its ray tracing path under RT_ENABLED and nothing in its build
+defines that name, so the path is compiled out and two headers it includes are not in the tree.
+This patch adds the CMake option that defines RT_ENABLED, PUBLIC so the program linking the
+library sees the same struct layouts, and swaps the missing blue noise header for a source the
+next patch adds, which generates the table at startup instead of shipping a megabyte of bytes in
+a patch file. Nothing else in the pinned sources changes: every other name the path uses is
+supplied by patch 0002 with the type the path expects. Off is unchanged: with the option off
+the library builds exactly as before, and with it on the raster path does not read a single
+value from the ray tracing structures until a level above Off asks for it (that arrives with
+patch 0008).
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 79dfc38..c43ac8f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,7 @@ option(RT64_STATIC "Build RT64 as a static library" OFF)
+ 
+ 
+ option(RT64_SDL_WINDOW_VULKAN "Build RT64 to expect an SDL Window outside of Windows" OFF)
++option(RT64_RAYTRACING "Build the ray tracing path (defines RT_ENABLED for the library and everything that links it)" OFF)
+ 
+ if (NOT ${RT64_STATIC})
+     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+@@ -439,6 +440,13 @@ endif()
+ set_target_properties(rt64 PROPERTIES OUTPUT_NAME "rt64")
+ set_target_properties(rt64 PROPERTIES PREFIX "")
+ 
++# The ray tracing path. The sources already guard it with RT_ENABLED; nothing defined it, so the
++# path was compiled out. PUBLIC so a program linking the library sees the same layout of every
++# struct the guard changes (Application, WorkloadQueue::External, FramebufferRenderer).
++if (${RT64_RAYTRACING})
++    target_compile_definitions(rt64 PUBLIC RT_ENABLED=1)
++endif()
++
+ # Add common libraries.
+ target_link_libraries(rt64 re-spirv)
+ target_link_libraries(rt64 nfd)
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index ee8bc1f..b420a87 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -13,7 +13,7 @@
+ #include "common/rt64_math.h"
+ 
+ #if RT_ENABLED
+-#   include "res/bluenoise/LDR_64_64_64_RGB1.h"
++#   include "render/rt64_raytracing_bluenoise.h"
+ #endif
+ 
+ //#define LOG_DISPLAY_LISTS
+@@ -384,7 +384,7 @@ namespace RT64 {
+         std::unique_ptr<RenderBuffer> blueNoiseUploadBuffer;
+         {
+             RenderWorkerExecution execution(workloadGraphicsWorker.get());
+-            TextureCache::setRGBA32(&blueNoiseTexture, workloadGraphicsWorker->device, workloadGraphicsWorker->commandList.get(), LDR_64_64_64_RGB1_BGRA8, int(sizeof(LDR_64_64_64_RGB1_BGRA8)), 512, 512, 512 * 4, blueNoiseUploadBuffer);
++            TextureCache::setRGBA32(&blueNoiseTexture, workloadGraphicsWorker->device, workloadGraphicsWorker->commandList.get(), RaytracingBlueNoise::atlasBGRA8().data(), int(RaytracingBlueNoise::atlasBGRA8().size()), RaytracingBlueNoise::AtlasWidth, RaytracingBlueNoise::AtlasHeight, RaytracingBlueNoise::AtlasWidth * 4, blueNoiseUploadBuffer);
+         }
+ 
+         blueNoiseUploadBuffer.reset();

@@ -1,0 +1,22 @@
+<rml>
+<head>
+    <title>Update</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+</head>
+<body class="overlay">
+    <!-- The update plate (the user's ask of 2026-09-23: "it must show an overlay that an update
+         is available, it can download in bg and say to the user the new update will install next
+         restart"). The counter's plate, at the BOTTOM left so it sits under neither corner plate
+         and never under the title bar. It appears only while there is something to say: the newer
+         version being fetched, the fetched file verified and waiting for the next start, or a
+         download that failed verification and was deleted. A click while the file is ready
+         installs it now and closes this copy, which is what F5 does. -->
+    <div class="counter update" id="update">
+        <div class="mark"></div>
+        <span class="counter-value" id="update-value">Update</span>
+        <span class="counter-unit" id="update-note"></span>
+    </div>
+</body>
+</rml>

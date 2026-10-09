@@ -1,0 +1,353 @@
+[
+  {
+    "version": "0.5.0",
+    "date": "2026-10-09",
+    "title": "Photo mode, video recording and a HUD of your own",
+    "summary": "Record your play to an MP4 with your voice in it, freeze the game to frame a picture with a camera of its own, and choose how the HUD fades, how large each part of it is and where it sits.",
+    "sections": {
+      "added": [
+        "Added video recording to an MP4 file, started and stopped with F7 and paused with F8 (or the keys and buttons you bind), one file however often it is paused. Video size, quality and sound are settings, and the size can be larger than your screen.",
+        "Added a Video mode row: Reliable saves the video as it records, so a crash or a forced close keeps it up to its last moments, and Compatible writes an ordinary MP4 from the first second. Each is described under the row.",
+        "Added a Video shows row, to record the game alone or the whole window with this program's menus.",
+        "Added a microphone for videos: your voice, from a device you choose and at a level you set, mixed with the game's sound. It is listened to only while a video records.",
+        "Added photo mode: its control (F10 by default) freezes the game and its sound where it stands, every setting you change shows on the same frame, and a camera of its own moves, turns, rises and closes in around the frozen scene. Another control hides the HUD and the text box for the shot.",
+        "Added a Photo mode section to the Controls screen, with the photo camera's own keys and buttons, bound for each keyboard and controller.",
+        "Added screenshots on a control you can bind, and a Screenshots show row for the game alone or the whole window.",
+        "Added a HUD screen. The HUD can fade when idle, always, or at the press of a button, to a dimmer, grayer HUD or out of sight, at a speed and after a delay you choose. What brings it back (Z targeting, the C buttons, talking, health, items, the pause menu, any button) and which parts fade are each your own choice.",
+        "Added HUD sizes: one size for the whole HUD or each part its own, from half to twice the original, each part growing from the corner it sits in.",
+        "Added a Custom choice to HUD sits: distances you choose from each edge of the picture, as a share of it, so the HUD follows the window as it changes size and never leaves it.",
+        "Added a Text speed row, skipping text with A or B, and a switch for the low health beep.",
+        "Added shafts of daylight in the air below windows, lit by each window's own traced light. The Temple of Time's painted rays give way to them, as a child and as an adult.",
+        "Added a badge beside each control on the Controls screen that does nothing until its setting is turned on.",
+        "Added a before and after pair of screenshots to the Debugging menu."
+      ],
+      "changed": [
+        "Changed the Interface ratio row into HUD sits, now on the HUD screen with the rest of the HUD's settings. Your choice is kept.",
+        "Changed the Moments buttons to two to a row so their labels fit, and stacked the text at the foot of the side panel."
+      ],
+      "fixed": [
+        "Fixed torch glows being cut into straight edged shapes by the stone around them, which 0.4.0 brought in, and light from a flame in a niche shining through the stone around it.",
+        "Fixed the rings of cuttable shrubs and rocks in Hyrule Field appearing and vanishing close by at a high Render distance. They now appear as far out as the row reaches.",
+        "Fixed the older autosaves missing from the Moments list, so any of the five can be resumed.",
+        "Fixed the cursor missing on the pause menu's Equipment page, and Link's picture there showing artifacts with the traced lighting on."
+      ]
+    }
+  },
+  {
+    "version": "0.4.0",
+    "date": "2026-10-08",
+    "title": "Light through the windows, and dust in it",
+    "summary": "With the traced lighting on, beams, songs and the Temple of Time's windows give real light, dust floats in the light and blows in gusts outdoors, and every menu sits beside the picture.",
+    "sections": {
+      "added": [
+        "Added traced light to the game's drawn beams and spotlights, so they light what stands in them, and to the Sun's Song and the blue warp, which light their surroundings instead of lighting Link whole from one side.",
+        "Added daylight through the Temple of Time's windows, each in its own pointed shape, with the walls holding the sun out everywhere else. The tall window behind the Master Sword's pedestal lands its light where the game painted its beam, and the drawn beam is hidden.",
+        "Added a Light brightness row to the Lighting menu: how far traced light can lift a surface above the game's own lighting, from Normal to Harsh.",
+        "Added dust that floats in the light and shows only where light reaches it, in the color of that light. Indoors and outdoors each have their own amount, visibility and size, indoor dust drifts, and each place has a distance at which the dust fades out. Every mote varies in size, opacity and brightness, and the dust gathers in drifts with clear air between.",
+        "Added an outdoor wind for the dust, with a speed, gusts and a direction or Varied. Gusts rise, hold and die away with calm between them, each from its own direction when the wind is Varied.",
+        "Added two tools to the Debugging menu: a switch for every painted element of the rooms around you, and rows to aim each window's light."
+      ],
+      "changed": [
+        "Changed every menu, sub menu and confirmation to follow the Menu placement row, as a full height panel beside the picture, so the picture is never covered.",
+        "Changed the Temple of Time's Master Sword room to take the main hall's lighting while the traced lighting is on, so the two rooms match."
+      ],
+      "fixed": [
+        "Fixed Navi's body showing through Link, characters and walls with the traced lighting on, which 0.3.8 brought in. It is hidden behind whatever stands in front of it again, and still never dimmed by the lighting.",
+        "Fixed clicking the Time of day arrows in the Debugging menu, which changed another setting instead of the time."
+      ]
+    }
+  },
+  {
+    "version": "0.3.9",
+    "date": "2026-10-08",
+    "title": "The sun behind the hills",
+    "summary": "With the traced lighting on, the sun sits behind the land again instead of showing through it.",
+    "sections": {
+      "fixed": [
+        "Fixed the sun showing through hills, walls and the ground with the traced lighting on, which 0.3.8 brought in. Whatever stands in front of it hides it again, as on the console, and Navi's body still stays bright in the shade."
+      ]
+    }
+  },
+  {
+    "version": "0.3.8",
+    "date": "2026-10-08",
+    "title": "Vines and Navi in the light",
+    "summary": "Vines and other cut-outs drawn flat on a wall take the traced lighting again, and Navi's body stays bright in the sun's shade.",
+    "sections": {
+      "fixed": [
+        "Fixed vines, and the other cut-outs the game draws on a wall as a single square (grates, painted backdrops, webs), taking none of the traced lighting and covering the lit wall behind them with an unlit square. They take light and shadow like the trees again, through their own gaps.",
+        "Fixed Navi's body dimming and turning see-through in the sun's shade. It is laid over the picture in its own color, as the console drew it, and the light she casts is unchanged."
+      ]
+    }
+  },
+  {
+    "version": "0.3.7",
+    "date": "2026-10-08",
+    "title": "The console's own picture to start",
+    "summary": "A fresh install starts as the console played it, and the traced lighting starts light when it is first turned on. Settings already saved are kept.",
+    "sections": {
+      "changed": [
+        "Changed a first run to start as the console played it: 320 by 240 at 4:3, the interface where the console put it, the game's own 20 frames a second and draw distance, no antialiasing and no texture pack, in fullscreen. Every one of them can be raised in the settings.",
+        "Changed the traced lighting to start light when it is first turned on: two shadow rays, the game's own shadow casters, light ambient occlusion from four rays, and no bounced light. Each can be raised in the Lighting menu, and its Reset puts these starting values back."
+      ],
+      "fixed": [
+        "Fixed a fresh install skipping its first-run settings once the question about checking for updates had been answered.",
+        "Fixed the removed reflections switching back on for a new player who turned the traced lighting on before changing any lighting setting."
+      ]
+    }
+  },
+  {
+    "version": "0.3.6",
+    "date": "2026-10-08",
+    "title": "Texture packs, and light on the things it was missing",
+    "summary": "Texture packs load from a folder you drop them into, at a detail you choose. Trees, fences and everything else the game cuts out of its texture take the traced lighting they were being left out of, Downsampling works at every resolution within what your card can hold, and the program carries everything it needs to start on a machine with nothing installed.",
+    "sections": {
+      "added": [
+        "Added texture packs. Your files opens a Texture packs folder, and the Texture pack row lists every pack in it: a .rtz or .zip file, or a folder holding rt64.json. Nothing is unpacked or copied, and the folder holds a note on where to find a pack made for this renderer.",
+        "Added a Texture detail row, shown while a pack is chosen, that reads the pack at a quarter, a half or all of its own size. It starts on Quarter, so the first load is the light one on any machine; raise it once the game runs well."
+      ],
+      "changed": [
+        "Changed Downsampling to work at Match the window, where it did nothing before: the picture is drawn larger than the window and shrunk to fit. If the row was already set, the game now draws more than it did and may run slower; Off gives the earlier picture back.",
+        "Changed the limit on how large the picture is drawn from a fixed 2,880 lines to half of the graphics card's own memory, worked out from the antialiasing and the traced lighting. A setting that would not fit steps its downsampling down by itself, and each Downsampling option shows the size it draws at and says when it does not fit. 720p with 4x downsampling took 19.7 GB and now takes about 5.",
+        "Changed the traced lighting to stand down in the rooms the game draws as a painted backdrop, such as the castle courtyard. Such a room is a picture with a few blocks behind it for the game to stand actors on, so the lighting had almost nothing to work with and ended along the top of a block. The game's own picture is shown there instead, with its own shadows."
+      ],
+      "fixed": [
+        "Fixed trees, fences, shrubbery, vines and everything else the game cuts out of its texture taking almost none of the traced lighting. How much of a pixel one of these covered was estimated from the texels around it, so a fence slat or a leaf whose neighbors are gaps counted as barely there and its shading was spent as darkness. The pixel's own texel decides now, and the estimate is kept only for the ragged edge of a distant tree line, which is what it was for.",
+        "Fixed a fairy wiping the lighting off whatever stood behind her. Her own glow takes no shading, so the traced sun cannot cast a shadow across her, but the test for her body was a sphere around her light and it swallowed the wall, the bush or the tree line she was in front of, at any distance from the camera. Her body is now her sprite at the light, which is where it actually is.",
+        "Fixed quick save doing nothing once all eight slots held a moment. It takes the oldest of them now, so a control bound to it always saves.",
+        "Fixed the controls, moments and warps lists and the ROM browser jumping back to the top on every change, which moved a row you had scrolled to out from under the pointer with each step.",
+        "Fixed the headings on the controls screen sitting to the left of the columns they name.",
+        "Fixed the program failing to start on a machine without Microsoft's Visual C++ runtime installed, where it flashed and closed with nothing written anywhere. Windows refused to load it before any of its own code ran, which is why there was no message and no log. The files it needs ship beside it now, so there is nothing to install.",
+        "Fixed the game halting itself while a texture pack loaded. The game stops when one frame takes longer than three seconds, a check the console needed and this program does not, so a slow frame is now waited for instead.",
+        "Fixed the picture freezing, and the program crashing as it closed, after the Texture pack row was changed during play. The pack is now handed to the renderer on the one thread that may give it textures.",
+        "Fixed trees and other foliage taking no light from Navi or a torch and hiding the fog in front of them, without the hard triangular shadows that glows and sparks cast along the way.",
+        "Fixed the traced lighting, shadows and fog stopping short of the top of a wall that a texture pack draws taller than the original, along a jagged line. The lighting now reads each texture at the same place the picture does.",
+        "Fixed the free camera's swing warping to the other side of Link, and climbing over a wall instead of staying level and moving closer.",
+        "Fixed the free camera sinking through the floor when swung down from above a ledge, instead of coming along the floor toward Link.",
+        "Fixed the left stick aim inversion also inverting movement through the pause menu and through dialogs."
+      ],
+      "removed": [
+        "Removed the traced reflections and their rows. Every way of drawing them that was tried looked worse than none."
+      ]
+    }
+  },
+  {
+    "version": "0.3.5",
+    "date": "2026-09-27",
+    "title": "Saying what it is doing",
+    "summary": "The controls screen explains its second column and marks the bindings free aim is holding, the quick keys tell you they worked, and the camera distance row is named after what it actually does.",
+    "sections": {
+      "added": [
+        "Added headings to the controls screen naming its columns: the N64 control, its binding, and the alternate. Both bindings work at the same time, which is how the C buttons sit on the right stick and on the face buttons at once, and nothing on screen had said so.",
+        "Added a line over the game when a state is saved or restored with the quick keys. It appears when the state has actually been written or taken, not when the key was pressed, because a save waits for a frame it is safe to take."
+      ],
+      "changed": [
+        "Changed the controls screen to strike through a C button bound to the right stick while free aim is on, with a line saying the right stick belongs to free aim and that nothing needs rebinding. The binding is kept, so turning free aim off gives it straight back.",
+        "Changed the camera distance row to read Original, A little further, Further, Furthest. It said Near, Original, Medium, Far, which put the name Original a step out from the camera the game actually draws. The distances themselves are untouched and the step you chose is the step you keep."
+      ],
+      "fixed": [
+        "Fixed one press of the quick save control filling three slots. A control bound to a trigger, a shoulder or a d-pad direction does not cross its threshold once when you press it, it crosses, wobbles and crosses again, and quick save takes the first empty slot each time it is asked. It now takes one moment per press: a second request while one is still waiting to be taken, or within two seconds of the last, is ignored. Quick resume is held to the same rule."
+      ]
+    }
+  },
+  {
+    "version": "0.3.4",
+    "date": "2026-09-26",
+    "title": "Moments you can actually pick",
+    "summary": "The Moments screen takes a choice and hands you the buttons, the autosave keeps five instead of one, and a fairy's shadow is as smooth as the sun's.",
+    "sections": {
+      "added": [
+        "Added a Cancel button to the Moments screen, so there is a way out from the buttons themselves rather than only from the list.",
+        "Added four more autosave slots. The five most recent are kept, newest first, above a divider, with the eight slots you name below it.",
+        "Added a Debugging menu that gathers everything meant for development rather than for playing: the warps, the frame recorder and its length, the lighting sweep, and the two lighting rows that replace the picture with a single stage of how it was drawn. Opening it asks first, and says plainly that none of it is needed to play or supported.",
+        "Added a warning before the frame recorder can be switched on, which does the arithmetic in your own numbers: the picture size, the frame rate you have set, how many files that is, how many gigabytes for the length you chose, how many for every minute it runs, and how long until a hundred gigabytes have gone."
+      ],
+      "changed": [
+        "Changed the Moments screen so that pressing a moment once chooses it and moves the cursor to the buttons, where the next press is Load or Cancel. Back returns to the list with your choice kept. The mouse, the keyboard and the pad all work the same way.",
+        "Changed the Resume button to read Load.",
+        "Changed the lighting screen to say when the graphics card cannot trace rays, instead of leaving every row on it looking as though it does nothing.",
+        "Changed the settings and lighting menus to hold only what a person playing the game would want. The recorder, its length, Inspect one pass and Experiment moved to the Debugging menu."
+      ],
+      "fixed": [
+        "Fixed being unable to choose a saved moment and load it. A moment could be highlighted but the buttons were reachable only by pushing the pad left or right, which nothing on screen said.",
+        "Fixed the grain in the shadow a fairy casts of Link on the ground beneath him. Her light traced one ray where the sun traces eight, so the ground under him was either fully in shadow or fully lit from one frame to the next, and she never stops moving for it to settle.",
+        "Fixed the shadows disappearing entirely on a graphics card that cannot trace rays. Turning Ray traced lighting on told the game to stop drawing its own shadows under everything, and that instruction did not check whether the card could draw the traced ones in their place, so on such a card the game simply had no shadows in it. The card's ability now decides, so the original shadows stay where the traced ones cannot go."
+      ]
+    }
+  },
+  {
+    "version": "0.3.3",
+    "date": "2026-09-25",
+    "title": "Surfaces the game shades by hand",
+    "summary": "A fault that had every hand shaded surface lit as though it faced the wrong way, and the lighting given the game's own answers rather than its own guesses.",
+    "sections": {
+      "added": [
+        "Added an Indoor light row to the Lighting menu (Off, 25, 50, 75, 100 percent), which gives a place with no sky a light of its own overhead so that what stands there has a shadow. It adds no brightness and takes nothing off a room except where something is in the way.",
+        "Added two wider steps to Shadow softness, Very soft and Hazy. A sun is half a degree across, so its shadow near whatever casts it was about a pixel of softness at the old widest.",
+        "Added a Camera drift row (Off, On), where On is the game's own easing of the camera's distance as Link runs and stops, and Off holds one distance.",
+        "Added a Medium step to Camera distance, between Original and Far.",
+        "Added a Normals step to Inspect one pass, which shows the direction each surface is shaded about."
+      ],
+      "fixed": [
+        "Fixed every surface the game shades by hand being lit as though it faced some other direction. The console keeps a vertex's facing and its color in the same place, and uses one or the other depending on how the surface is drawn; the lighting was reading the color as a facing. Floors read as bands of flat shade with hard edges, and nothing near such a surface lit it the way it should.",
+        "Fixed the lighting deciding for itself whether a place has a sun, which it got wrong in both directions: a cavern with a lit floor was treated as open sky, so its walls threw hard shadows the length of the room, and outdoors the answer could change as the camera turned and put every shadow in the picture out at once. The game is now asked instead.",
+        "Fixed a fairy's light passing through whatever it hovers over, so Navi above Link now casts his shadow on the ground beneath him.",
+        "Fixed the lighting seeing only the first sixteen lights of a scene when the game can hold thirty two, which is why a fairy in a place that already had torches lit nothing at all.",
+        "Fixed the Camera distance row reaching only the free camera. It now moves the game's own camera and the one Z targeting hands back to.",
+        "Fixed the free camera measuring its distance from the point it looks at rather than from Link, so it backed away as he ran."
+      ],
+      "changed": [
+        "Changed Camera distance so that Near is the game's own distance, with Original, Medium and Far standing further back. The step closer than the game's own is gone."
+      ]
+    }
+  },
+  {
+    "version": "0.3.2",
+    "date": "2026-09-24",
+    "title": "Shadows keep their casters",
+    "summary": "A fix for shadows vanishing when whatever cast them left the top or the bottom of the view.",
+    "sections": {
+      "fixed": [
+        "Fixed shadows disappearing as the camera moved, even with Shadow casters set to Everything: a torch on a wall above the view, or anything under a ledge, was still being dropped by the game's own up and down limits, and its light and its shadow went with it. Those limits now follow the row, exactly as the sideways one already did.",
+        "Fixed trees and bushes behind the camera not existing to cast their shadows forward into the picture when the row asks for them."
+      ]
+    }
+  },
+  {
+    "version": "0.3.1",
+    "date": "2026-09-24",
+    "title": "Torches that cast shadows, and the camera everywhere",
+    "summary": "A torch or a fairy now throws a real shadow, rooms have their own shading, and the free camera reaches first person, aiming and the horse.",
+    "sections": {
+      "added": [
+        "Added shadows from the game's own lights: a torch, a fairy or any light in a scene now throws a shadow of whatever stands in it, rather than only adding light. Indoors the room's own light gives soft shading under things and steps aside wherever a torch reaches.",
+        "Added a Darkness row to the Lighting menu (Off, Light, Deep), which takes the game's own flat brightness away wherever no traced light falls, so a room is dark but for its torches and what they light.",
+        "Added a Shadow casters row (Game's own, Near, Far, Everything), which decides how much of the world behind and beside the camera stays in the lighting, so a shadow's caster is not dropped as you turn away from it.",
+        "Added a Glow size row beside the renamed Glow density, so a light's visible halo is set apart from how far its light reaches.",
+        "Added the right stick to first person and to aiming with the bow, the slingshot, the hookshot and the boomerang, with an Aiming axes row that inverts those on their own.",
+        "Added the free camera to the horse."
+      ],
+      "changed": [
+        "Changed the Light reach and Light strength rows to be measured against the game's own light, with 100 percent as the game's own and the rows reaching three times that. A strong light on a sunlit wall now reads as a glow rather than blowing out to white.",
+        "Changed the menu as a side panel to fill the window's height, with its title at the top, its foot at the bottom, and only the rows scrolling between them."
+      ],
+      "fixed": [
+        "Fixed a saved moment losing the area it was taken in: chests you had opened, switches you had pressed and rooms you had cleared came back when you resumed. A moment now keeps them.",
+        "Fixed the menus scrolling back to the top when a value was changed on a row you had scrolled down to.",
+        "Fixed a fairy's glow and other effects going gray when they sat in a shadow, instead of lighting the dark as they should.",
+        "Fixed there being no shadow at all under anything indoors, where the sun does not reach.",
+        "Fixed the free camera stopping its turn when it was pointed down into the ground, instead of sliding along it."
+      ]
+    }
+  },
+  {
+    "version": "0.3.0",
+    "date": "2026-09-24",
+    "title": "Ray traced lighting, saved moments, and a free camera",
+    "summary": "The renderer now traces light through the frame the game hands it, the game can be saved and resumed at any moment, and the right stick turns the camera.",
+    "sections": {
+      "added": [
+        "Added ray traced lighting, drawn from the same frame the game hands the renderer: soft shadows from the sun, darkening where surfaces meet, the game's own lights (a fairy, a torch) falling on the ground and the walls around them with a natural falloff, light bounced from lit surfaces, reflections on water, and the sun's haze in the air. Each part switches on its own in a new Lighting menu, with rows for the reach and the strength of the lights, the range of the bounce and of the reflections, and an Inspect row that shows one pass in place of the picture.",
+        "Added a free camera on the right stick, off until switched on in Settings: the stick turns the camera around Link wherever the game's own camera is free to turn, Z recenters it, and a Camera axes row inverts either direction. Fixed and scripted cameras never see it. While it holds the stick the C buttons on the stick stand aside, so C down and C left have the right trigger and the left bumper as well.",
+        "Added saved moments: F6 saves the game as it stands and F9 resumes the newest, a Moments document lists every saved moment with a picture, an Autosave row keeps one every five, ten or fifteen minutes, Save on quit keeps one as the program closes, and Resume on start opens straight into the newest one, skipping the title and the file select.",
+        "Added fixed picture heights to the Resolution row (720p, 1080p, 1440p, 4K) and fixed ratios to the Aspect row (16:9, 16:10, 21:9, 32:9), so the picture can be drawn at a chosen size whatever the window is.",
+        "Added a Menu placement row: the settings and lighting menus can sit as a panel on the right or the left with the picture scaled beside them, ratio kept, so a lighting change is seen as it is made.",
+        "Added the installer window in the program's own look, and an Open button on every row of Your files."
+      ],
+      "changed": [
+        "Changed the menus so a change to a row lower down no longer moves the list, and every press lands on the row it was aimed at."
+      ],
+      "fixed": [
+        "Fixed the traced lighting stopping at a straight edge across the picture during a fast camera swing, most often when backing away from an enemy at night with Z held: the rays and the picture were aimed by two different cameras once the interpolated camera carried a roll. They agree by construction now.",
+        "Fixed a fixed picture height with 4x downsampling asking the graphics card for a picture taller than it can draw, which stalled the program at a frame a second and showed colored squares in the recorder's plate. The picture is capped and the downsampling steps down to fit.",
+        "Fixed fences, ladders, vines and tree lines cutting holes in the fog and the lighting where their textures are transparent.",
+        "Fixed a startup crash and a graphics device hang that the first lighting builds could hit."
+      ]
+    }
+  },
+  {
+    "version": "0.2.2",
+    "date": "2026-09-23",
+    "title": "Your Menu key works, and the controls screen says what it sees",
+    "summary": "A patch for the controls screen.",
+    "sections": {
+      "added": [
+        "Added a note on the controls screen when a pad is seen as an Xbox 360 controller, which is what a PlayStation pad looks like behind DS4Windows or Steam Input: the touchpad and the PS button then arrive only as the buttons that layer maps them to."
+      ],
+      "changed": [
+        "Changed the rebind prompt to stack its title, its instruction and its countdown on their own lines instead of running them together."
+      ],
+      "fixed": [
+        "Fixed a keyboard key bound to Menu on the controls screen doing nothing: it was saved and shown but only F1 ever opened the menu. The bound key opens it now, and F1 still does."
+      ]
+    }
+  },
+  {
+    "version": "0.2.1",
+    "date": "2026-09-23",
+    "title": "Updates that install themselves, and two corrections",
+    "summary": "The first release an installed copy can update to on its own. Also corrects the first run question and the frame recorder.",
+    "sections": {
+      "added": [
+        "Added the update plate: once Check for updates is on and a newer version exists, the setup file downloads in the background, a small plate at the bottom left of the picture says so, and the plate then says the update installs the next time the program opens. A click on the plate, or F5, installs it straight away. The downloaded file is verified twice (against the release manifest and by its signature) before it is ever run. Portable copies are told a version exists and download nothing.",
+        "Added a repeat of the update check every four hours while the program is open, and an immediate first check when Check for updates is switched on in the settings, so a long session is not left behind."
+      ],
+      "fixed": [
+        "Fixed the first run question \"Should this check for updates?\" not taking effect: Yes was switching on the frame recorder instead, and Check for updates stayed off in the settings. The answer now lands on the Updates row and is remembered either way.",
+        "Fixed the frame recorder's plate and the frame rate counter staying switched on from one launch to the next. Both are overlays for one session: they start off every time, whatever the settings file says.",
+        "Fixed the in-game menu having no Quit button: it sits in the same bar the launcher uses, at the end of the keyboard and controller order, so the program can be closed with the title bar off."
+      ]
+    }
+  },
+  {
+    "version": "0.2.0",
+    "date": "2026-09-23",
+    "title": "One file to install, and a place for your things",
+    "summary": "The program now installs itself from a single download, keeps your saves and settings somewhere they cannot be lost with it, and can tell you when a newer version exists. Busy scenes no longer make the game skip ahead.",
+    "sections": {
+      "added": [
+        "Added the center touchpad of a PlayStation 4 or 5 controller as a second way to open the menu in play, beside Share. It can be rebound like any other input, and the startup hint names every button that opens the menu.",
+        "Added a single setup file as the main download: it installs the program into your own application data, adds it to the Start menu and to Windows' installed apps list, and starts it. It asks for no administrator rights and writes nothing outside your own profile.",
+        "Added a portable download alongside it, which installs nothing and keeps its saves, settings and mods in its own folder.",
+        "Added Your files, a surface listing exactly where the program keeps everything, with a click on any row opening that folder. It carries the uninstall as well.",
+        "Added an uninstall that removes the program, the shortcut and the listing, and moves any copy of the game it was holding to your Downloads folder rather than deleting it.",
+        "Added an update check, off until you say otherwise, which asks once on first open. It reports a newer version in the launcher's foot, and F5 fetches and installs it after checking both its digest and its signature.",
+        "Added an offer, on first run, to keep a copy of your own game file with the program, with its size stated before you answer. Your original is never moved or changed either way.",
+        "Added a step either side of every setting value, so a setting can be changed in both directions with the mouse rather than only forwards."
+      ],
+      "changed": [
+        "Changed where saves, settings, controls and mods live for an installed copy: they sit beside the program's own files rather than among them, so an update replaces one and never the other.",
+        "Changed Play and Quit to sit half and half under the list with the same gap above them as between them, reached with left and right rather than up and down on the keyboard and on every pad, with Play selected first."
+      ],
+      "fixed": [
+        "Fixed the game skipping ahead in busy scenes, Kakariko Village by day above all: Link teleported, the camera jumped, the time of day raced when leaving, and the sound broke, all at once. The game was dropping frames whose drawing lists had overflowed and running on without waiting; it now has room for everything the wider, farther picture asks it to draw, and a dropped frame can no longer become a runaway.",
+        "Fixed a setting reaching the end of its range and becoming a dead end for anyone using the mouse: the frame rate could be raised to 240 with no way back down.",
+        "Fixed the launcher's foot being cut off by a window that did not grow with its list."
+      ]
+    }
+  },
+  {
+    "version": "0.1.0",
+    "date": "2026-09-19",
+    "title": "The first playable build",
+    "summary": "The game runs natively from your own copy of the ROM, with a launcher, settings, controllers, and a picture drawn between the game's own frames.",
+    "sections": {
+      "added": [
+        "Added the launcher: your ROM found beside the program by what it is rather than its name, or picked in a browser; every setting chosen before Play with defaults from your machine; a controller set up first.",
+        "Added the settings document in play: window mode, resolution, downsampling, aspect, interface placement, antialiasing, frame rate and volume, with the version in its foot.",
+        "Added fixed frame rates to the frame rate row (30 to 240) after the game's own rate and the display's.",
+        "Added a frame rate counter, off by default: a small plate at the top right of the picture with the frames shown each second.",
+        "Added the controls document: every game input bound by pressing, for the keyboard and for each pad, with rumble and a deadzone per pad.",
+        "Added keyboard defaults for play without a pad: WASD moves, Space is A, Left Shift is B, Q targets, E and R are the shoulders, I, J, K and L are the C buttons, Enter is Start and the arrows are the D-pad.",
+        "Added a startup hint naming the key and the pad button that open the menu.",
+        "Added frames drawn between the game's own at the display's rate, and a wide picture with the interface anchored to its edges.",
+        "Added the game window's own chrome: a title bar with the mark and the window buttons, and a brass edge.",
+        "Added the About surface with the exact commits the build was made from, the build's signature and this list.",
+        "Added a crash report, written to the log beside the program, that names the function and the address and never the game's data."
+      ],
+      "fixed": [
+        "Fixed a double click on the program doing nothing and leaving an empty log: the log is written from the first line now, and the crash report also covers the endings the C runtime used to keep to itself."
+      ]
+    }
+  }
+]

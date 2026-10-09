@@ -1,0 +1,202 @@
+/* Design tokens. Every value our interface uses lives here and nowhere else.
+ *
+ * These come from the finalized design decision 9693d652-0b2a-43e6-ae79-09ea2382cad3, direction A,
+ * "Instrument Case": a walnut dark case lit from one warm source at the top left, hardware doing
+ * the dividing, and the focused row catching the lamplight the way metal actually would.
+ *
+ * NO COMPONENT STYLESHEET MAY CONTAIN A LITERAL COLOR, SIZE, SPACING, RADIUS OR DURATION. If a
+ * value is needed and is not here, it gets a token here first. That rule is what makes the whole
+ * palette a one file edit, which is the thing the decision was chosen on the strength of.
+ *
+ * Names describe MATERIAL AND ROLE, never the game. Nothing in this interface is named after
+ * anything in the ROM, and nothing in it is drawn from anything in the ROM.
+ */
+
+@spritesheet case-hardware
+{
+	/* Reserved. Our own drawn hardware goes here when it exists; until then the case is built
+	 * from borders and gradients, which is honest rather than a placeholder image. */
+}
+
+body
+{
+	/* Type.
+	 *
+	 * ONE FAMILY PER TOKEN, no stack. RCSS custom properties do not take a comma separated list,
+	 * and a declaration containing one is rejected outright: the variable then does not exist, and
+	 * every rule that referenced it falls back to nothing. That failed silently apart from one
+	 * warning buried in the log.
+	 *
+	 * The fallback ordering the decision describes is done by LOADING instead: the shell tries our
+	 * own faces first and only registers the system ones if none are present. So these three names
+	 * are the ones that are actually registered, and dropping licensed faces into assets/fonts
+	 * means changing these three lines to their family names. */
+	--font-display: Georgia;
+	--font-body: Segoe UI;
+	--font-mono: Consolas;
+
+	--size-title: 21dp;
+	--size-heading: 16dp;
+	--size-row: 15dp;
+	--size-note: 13dp;
+	--size-caption: 12dp;
+
+	--weight-display: 600;
+	--weight-body: 400;
+
+	/* Ground. The case WAS translucent, so the scene behind it read through (the pinned
+	 * comment on the decision asked for it, borrowed from the lantern direction). On
+	 * 2026-09-19 the user, reading About over the launcher, found the rows behind it made the
+	 * text hard to read and asked for a blur or a solid background; a backdrop blur needs
+	 * layer and filter support in the render backend, which is not here yet, so the case is
+	 * solid: the same three colors at full alpha. The scrim still dims what is behind. */
+	--case-top: rgba(58, 44, 32, 255);
+	--case-mid: rgba(43, 32, 23, 255);
+	--case-bottom: rgba(36, 26, 19, 255);
+	--case-raise: #42332a;
+	--scrim: rgba(12, 9, 6, 150);
+
+	/* Ink */
+	--text: #f2e7d5;
+	--text-dim: #b39a78;
+	--text-faint: #ab9476;
+	--on-accent: #241a13;
+
+	/* Brass. One accent, used for the one moment: the focused row's lit edge. */
+	--accent: #cfa33c;
+	--accent-soft: rgba(207, 163, 60, 60);
+
+	/* Hardware */
+	--line: #5d472f;
+	--line-bright: #8a6a36;
+	--track: #1c150f;
+	--row-on: rgba(70, 54, 34, 128);
+
+	/* Judgment colors, kept apart from the accent so they never compete with it */
+	--ok: #9fb46a;
+	--bad: #cd7a5a;
+
+	/* Metrics */
+	--radius: 4dp;
+	--radius-tight: 2dp;
+	--pad: 17dp;
+	--pad-row: 8dp;
+	--pad-row-side: 11dp;
+	--gap: 1dp;
+	--rule: 1dp;
+	--edge: 3dp;
+
+	--case-width: 620dp;
+	--case-max-height: 78%;
+
+	/* The controls document (phase 50): a binding slot's width, so the two slots of every row
+	 * line up down the list; the list's scrollbar; the capture panel's width. The toast (the
+	 * startup hint) follows the decision's toast surface: its width, its inner spacing and the
+	 * brass mark beside the text. */
+	--slot-width: 150dp;
+	--scroll: 6dp;
+	--capture-width: 360dp;
+	--toast-width: 330dp;
+	--pad-toast: 12dp;
+
+	/* The action bar under the launcher's list: Play and Quit as real buttons, and the destructive
+	   button on the files surface. Their height and their side padding, so the three read as one
+	   family and a fourth cannot drift. */
+	--act-height: 40dp;
+	--pad-act-side: 22dp;
+
+	/* A step chevron's hit width: wide enough for a pointer to land on without aiming at the
+	   glyph (the user, 2026-09-24: the side arrows did not take clicks). */
+	--step-width: 30dp;
+	/* A box to tick (the HUD menu's Comes back for, 2026-10-09): its side, and the filled square
+	 * inside it, inset from its edge, while it is ticked. */
+	--check: 14dp;
+	--check-inset: 3dp;
+	--check-tick: 8dp;
+	/* A divider's small name inside a list, spaced out (2026-10-09), and how far a badge under a
+	 * control's name sits below it (the controls screen, 2026-10-09). */
+	--divider-tracking: 1dp;
+	--badge-drop: 3dp;
+
+	/* A setting's value sits in a box of ONE width whatever it reads, so the step chevrons either
+	   side of it hold still while a row is stepped rather than sliding under the pointer. Wide
+	   enough for the longest option text in the table ("Expand to the window"). */
+	--value-width: 140dp;
+
+	/* The label column on the files surface, wide enough for its longest label ("Your copy of
+	   the game") so every path on that screen starts at the same x. */
+	--files-label-width: 160dp;
+
+	/* The mark: our three stacked triangles in the decision's brass (the panel header's mark,
+	 * .p-h h4::before in its snapshots, a masked gradient with a gleam crossing it every five
+	 * seconds), drawn by the mark's pixel shader through the shader decorator (mark.rcss). The
+	 * box here has the mark's own proportions (24 by 20); the brass quartet below is the
+	 * shader's palette, repeated in ui.hlsl under these names because a shader cannot read a
+	 * stylesheet, and tools/make_icon.py cuts the window's icon from the same four. */
+	--brass: #b8912f;
+	--brass-light: #e8cd7e;
+	--brass-peak: #fff7d8;
+	--brass-deep: #a8801f;
+	--mark-w: 18dp;
+	--mark-h: 15dp;
+
+	/* The window chrome (window.rcss): the minimize, maximize and close buttons, and the glyphs
+	 * inside them. ONE SIZE, USED BY BOTH BARS, the launcher's lid and the game window's own
+	 * title bar. The band the window is dragged by is the lid, whose height main/launch.cpp
+	 * repeats in pixels for the hit test.
+	 *
+	 * The launcher's used to be 32dp against the game's 22dp, and every attempt to make the two
+	 * agree while keeping them different sizes moved the fault from one surface to the other
+	 * rather than fixing it. 22dp is the game bar's, which is the one the user judged correct:
+	 * "make them both the same exact size as the now in-game window bar". */
+	--win-btn: 22dp;
+	--glyph-w: 10dp;
+	/* Where a close cross's bar sits inside its box, and the one token here that is DERIVED from
+	 * two others rather than chosen: (--glyph-w minus --rule) / 2, which is (10 - 1) / 2. RCSS has
+	 * no arithmetic, so the sum is done here and has to be redone by hand if either of those two
+	 * changes.
+	 *
+	 * It is a token rather than the literal it used to be in window.rcss because tools/
+	 * check_tokens.py is right that a bare 4.5dp in a component stylesheet is unreadable: the
+	 * number means nothing without the two it comes from, and putting it next to them is the only
+	 * place the relationship is visible. window.rcss keeps the paragraph on WHY the half pixel
+	 * matters, which is about rasterization rather than about the palette. */
+	--glyph-bar-top: 4.5dp;
+	/* The game window's title bar (frame.rml): a regular title bar's height, with a smaller
+	 * mark and smaller buttons than the launcher's lid. */
+	--chrome-bar: 30dp;
+	/* A corner plate's top while the title bar shows: the bar's height plus the side gap it
+	 * keeps from the window edge (30 plus 11), so it stands off the bar by the same distance;
+	 * with the bar hidden it sits that gap from the window's top edge instead.
+	 *
+	 * SHARED BY BOTH PLATES, which is why it is not called the counter's: the frame rate counter
+	 * at the top right and the frame recorder at the top left are the same piece of hardware in
+	 * opposite corners, and they must move together when the bar appears. It was named after the
+	 * counter when the counter was the only one. */
+	--plate-top-under-bar: 41dp;
+
+	/* The frame recorder (the user's ask of 2026-09-22). Its own red, because "recording" is a
+	 * state and not a fault: --bad is the color of something being wrong and would read as an
+	 * error sitting in the corner of the picture. Kept apart from the accent for the same reason
+	 * the other judgment colors are, so nothing competes with the focused row's lit edge.
+	 * --record-idle is the dot before anything is happening, which is the same hardware unlit. */
+	--record: #d0533f;
+	--record-idle: #6b5640;
+	--dot: 9dp;
+	/* There is deliberately NO --win-btn-small and NO --glyph-small. Both bars draw the same
+	 * controls at the same size now, and the two tokens that used to shrink the game's (22dp
+	 * buttons and 8dp glyphs) are gone rather than kept "in case".
+	 *
+	 * Each of them caused a defect the user reported. The smaller GLYPH broke the close cross
+	 * outright: it is two one pixel bars rotated forty five degrees, and at eight device pixels
+	 * they stopped meeting (window.rcss says how). The smaller BUTTON, left behind when the
+	 * glyphs were matched, made the launcher's controls read as small and widely spaced. A token
+	 * left lying about invites both mistakes back. */
+	--mark-small-w: 14dp;
+	--mark-small-h: 12dp;
+
+	/* Motion. Nothing over the game may be slow: an interface that lingers on top of a live
+	 * scene reads as lag rather than as polish. */
+	--duration-fast: 0.10s;
+	--duration-slow: 0.18s;
+}

@@ -1,0 +1,43 @@
+<rml>
+<head>
+    <title>Debug</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="controls.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim">
+        <div class="case">
+
+            <div class="lid stacked">
+                <div class="lid-top">
+                    <div class="head">
+                        <div class="mark"></div>
+                        <div class="title">Debug</div>
+                    </div>
+                    <div class="chrome">
+                        <div class="win-btn" id="modal-close"><div class="glyph-x"><div class="bar a"></div><div class="bar b"></div></div></div>
+                    </div>
+                </div>
+                <!-- Where in the nesting you are: empty at the top, then the region, then the
+                     region and the place. The shell fills it every time the level changes. -->
+                <div class="hint" id="warp-trail"></div>
+                <div class="hint">Up and down to move, Enter goes in or warps, Escape or the pad's B goes back</div>
+            </div>
+
+            <!-- Built at runtime from src/ui/ui_warps.cpp, the same way the controls list is:
+                 the document holds no names of its own, so the order on screen is the order in
+                 the generated table and nothing here can drift away from it. -->
+            <div class="rows long" id="warp-rows"></div>
+
+            <div class="foot">
+                <span id="warp-note"></span>
+                <span id="warp-foot"></span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

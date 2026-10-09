@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 19:05:00 +0100
+Subject: [PATCH] The depth image cannot answer for a depthless surface
+
+Patch 0016 of the renderer series (OoT: Recompiled).
+
+The user's Hits view settled this, where five readings of the code had not. In that view green is
+a kept hit and red is a hit the cut-out depth compare dropped. On the rung without the alpha test
+the artifact is a large solid RED triangle. With the alpha test it becomes red tree SHAPED
+speckle: the see-through texels had stopped registering, and the leaves that remained were still
+being dropped.
+
+So the triangles are that compare. It drops a traced hit lying in front of what the rasterized
+depth image shows, on the reasoning that such a hit is the see-through part of an alpha tested
+quad, and that reasoning assumes the surface is in the image. This game's foliage is not: it reads
+depth and never writes it, so at a pixel showing a leaf the image still holds the wall behind, and
+the ray is sent on to the wall. The leaf is then lit as the wall is, and every disagreement
+between the two shows as the quad's own shape.
+
+THIS WAS TRIED ONCE AND REVERTED, and the difference is the whole point. That attempt removed the
+compare while the alpha test was not running on these draws, so every transparent texel became
+surface, which was worse than the fault. The compare was the only thing dropping them. With the
+alpha test in place they are dropped first and on their own merit, so the compare has nothing left
+to catch here. Both halves at once is what neither attempt had.
+
+Also retires the two rungs that raised the triangle count. They were meant to keep a fairy's glow
+out of the classification and they threw the trees out with it: an OoT pine's foliage is a couple
+of crossed quads, which is four triangles. A triangle count cannot separate a sprite from a tree
+in this game because they are the same size. Their places are kept so the row does not renumber
+under somebody mid-test.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -58,6 +58,11 @@ struct ShadowPayload {
+ 
+ // The alpha test at the hit (below the passes): how much of the pixel a surface covers.
+ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, bool primary);
++// Whether the surface a hit landed on is one the depth image can be asked about (patch 0016):
++// false for a draw in the translucent z mode that never writes depth, which is this game's
++// foliage. Defined beside alphaCoverage because it reads the same two buffers, and declared here
++// because the primary ray's cut-out compare needs it long before those buffers exist.
++bool hitWritesDepth(int instanceId);
+ 
+ // The eye, from the inverse view matrix. The parameter block is written by hlslpp on the CPU
+ // with row vectors, so its translation is the fourth row there; HLSL packs the same bytes as a
+@@ -201,6 +206,25 @@ void PrimaryRayGen() {
+             if (rasterDepth <= hitDepth + CutoutDepthSlack) {
+                 break;
+             }
++            // A SURFACE THAT NEVER WRITES DEPTH IS NOT IN THE DEPTH IMAGE (patch 0016), so asking
++            // this image about it gets an answer about whatever is BEHIND it. This game's foliage
++            // is exactly that, and at a pixel showing a leaf the image still holds the wall: the
++            // compare sees a hit far in front of the picture, drops it, and the ray walks on to
++            // the wall, so the leaf is lit as the wall is. That is the triangle.
++            //
++            // HIS HITS VIEW IS WHAT PROVED IT rather than any reading of mine: on the rung without
++            // the alpha test the artifact is a solid RED triangle, red being a hit this compare
++            // dropped; with the alpha test it becomes red tree-SHAPED speckle, so the see-through
++            // texels had stopped registering and the remaining LEAVES were still being dropped.
++            //
++            // THIS WAS TRIED ONCE AND REVERTED, and the difference now is the whole point. That
++            // attempt removed the compare while the alpha test was NOT running on these draws, so
++            // every transparent texel became surface and it was worse than the fault. The compare
++            // was the only thing dropping them. Now the alpha test drops them first and on their
++            // own merit, so the compare has nothing left to catch here.
++            if ((RtParams.tuneExperiment.x >= 24.0f) && !hitWritesDepth(payload.instanceId)) {
++                break;
++            }
+             depthsWeighed = float2(rasterDepth, hitDepth);
+             if (step == 3) {
+                 // Nothing along the ray agreed with the picture: a miss.
+@@ -1308,6 +1332,21 @@ void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersect
+ // pixel and always tests the texel.
+ // Returns how much of the pixel the surface covers here: 1 for a solid draw or a covered texel,
+ // 0 for a cut one, and a fraction far away where several texels fall in the pixel (below).
++bool hitWritesDepth(int instanceId) {
++    if (instanceId < 0) {
++        return true;
++    }
++    const RenderIndices ri = instanceRenderIndices[instanceId];
++    const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
++    const OtherMode otherMode = { rp.omL, rp.omH };
++    // Narrowed to the class this is about, so a change meant for foliage cannot quietly alter a
++    // decal or a depthless opaque draw somewhere else in the game.
++    if ((otherMode.zMode() == ZMODE_XLU) && !otherMode.zUpd()) {
++        return false;
++    }
++    return true;
++}
++
+ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, bool primary) {
+     const RenderIndices ri = instanceRenderIndices[instanceId];
+     const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1898,8 +1898,22 @@ namespace RT64 {
+                             // Bracketed rather than guessed at one number, because the right cut
+                             // sits somewhere between a sprite and a tree and neither of us knows
+                             // where: a pine is a few crossed quads, a hedge line is many.
+-                            case 22: solidDraw = otherMode.zCmp() && (call.callDesc.triangleCount > 4); castsNothing = true; break;
+-                            case 23: solidDraw = otherMode.zCmp() && (call.callDesc.triangleCount > 16); castsNothing = true; break;
++                            // 22 and 23 RETIRED (patch 0016). They raised the bar to four and
++                            // sixteen triangles to keep a fairy's glow out of the classification,
++                            // and they threw the TREES out with it: an OoT pine's foliage is a
++                            // couple of crossed quads, which is four triangles. A triangle count
++                            // cannot separate a sprite from a tree in this game because they are
++                            // the same size. Left in place so the row's numbering does not shift
++                            // under a person mid-test, and doing nothing but the winning rule.
++                            case 22:
++                            case 23: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
++                            // 24 and 25 are rung 20 AND the cut-out depth compare skipped for
++                            // these draws (patch 0016, in the raygen). Both halves at once, which
++                            // is what neither earlier attempt had: the alpha test drops the
++                            // see-through texels, and the compare stops dropping the leaves that
++                            // survive it. 24 keeps the shadow off, 25 puts it back.
++                            case 24: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
++                            case 25: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
+                         }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).

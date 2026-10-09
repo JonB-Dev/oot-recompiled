@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 17:06:28 -0400
+Subject: [PATCH] No grid to see in the dust, and clumps
+
+Patch 0043 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08: "the particles are too uniform almost, like they don't have enough
+dispersity, and they feel like they're just along the lines of invisible cubes".
+
+Three things drew the cubes. The cells lay along the world's axes, the lines of every wall and
+floor; each mote was kept in the middle 80% of its cell, which left an empty slab on every face;
+and the march sampled the ray every half cell, so it could cross a cell's corner without looking in
+it. The cells are now turned by a fixed rotation (DustLattice) that lines up with nothing, the march
+walks every cell the ray crosses in order (a 3D DDA, at most DustMaxCells), and a mote may sit
+anywhere in its cell, its wander held to 90% of the way to the nearest face so it never leaves the
+cell it is looked for in.
+
+The density is no longer even: a smooth noise over cells DustClumpCells across scales it from
+nothing to twice the row's, about the row's on average, so the dust gathers in drifts with clear
+air between.
+
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1609,7 +1609,6 @@ float3 windOffset(float seconds) {
+ // motes in front of a near wall faded out). A long reach takes longer steps, at most 128 of them
+ // to a ray; the far motes it then misses are the ones the fade has all but taken already.
+ static const float AmbienceFadeStart = 0.2f;  // the share of the distance where the fade begins
+-static const uint DustMaxSteps = 128;
+ static const uint DustMaxMovers = 4;          // the movers near one ray that push the motes it passes
+ static const float AirPushLimit = 100.0f;     // patch 0039: world units at most that the movers together push a mote
+ 
+@@ -1624,12 +1623,48 @@ float3 airPush(float3 x, uint movers[DustMaxMovers], uint moverCount) {
+     return (pushedLength > AirPushLimit) ? (pushed * (AirPushLimit / pushedLength)) : pushed;
+ }
+ 
++// NO GRID TO SEE, AND CLUMPS (patch 0043, the user, 2026-10-08: "the particles are too uniform
++// almost, like they don't have enough dispersity, and they feel like they're just along the lines
++// of invisible cubes"). Three things made the cubes: the cells lay along the world's own axes, the
++// same lines as the walls and the floor; each mote was kept off its cell's faces (the middle 80%),
++// leaving an empty slab on every face; and the march sampled the ray every half cell, so it could
++// cut across a cell's corner without looking in it. Now the cells are turned (DustLattice, a fixed
++// rotation that lines up with nothing the game builds), the march visits every cell the ray
++// crosses, in order (a 3D DDA), and a mote may sit anywhere in its cell: its wander shrinks near a
++// face, so it never leaves the cell it is looked for in.
++//
++// And the dust is not one even density: a slow noise over cells several wide thins it to almost
++// nothing in places and thickens it in others, about the same on average, so it gathers in drifts
++// and leaves clear air between.
++static const float3x3 DustLattice = {
++    0.691148f, -0.573403f, 0.439913f,
++    0.648256f, 0.760957f, -0.026610f,
++    -0.319497f, 0.303568f, 0.897646f
++};
++static const float DustClumpCells = 3.5f;     // cells across one clump or gap
++static const uint DustMaxCells = 192;         // cells one ray visits at most; the far ones are faded out
++
++// How thick the dust is in this cell, as a share of the row's: 0 to 2, about 1 on average.
++float dustClump(int3 cell) {
++    const float3 q = float3(cell) / DustClumpCells;
++    const float3 i = floor(q);
++    const float3 f = q - i;
++    const float3 u = f * f * (3.0f - 2.0f * f);
++    float n = 0.0f;
++    for (uint c = 0; c < 8u; c++) {
++        const int3 corner = int3(i) + int3(int(c & 1u), int((c >> 1) & 1u), int((c >> 2) & 1u));
++        const float value = float(dustHash(uint4(uint3(corner), 0x5BD1E995u)).x) * (1.0f / 4294967295.0f);
++        const float3 w = float3(((c & 1u) != 0u) ? u.x : (1.0f - u.x), ((c & 2u) != 0u) ? u.y : (1.0f - u.y), ((c & 4u) != 0u) ? u.z : (1.0f - u.z));
++        n += value * w.x * w.y * w.z;
++    }
++
++    return 2.0f * smoothstep(0.2f, 0.8f, n);
++}
++
+ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, float medianSize, bool outdoors) {
+     // Indoors and outdoors each their own distance (patch 0041).
+     const float fadeEnd = outdoors ? RtParams.tuneAmbience.w : RtParams.tuneAmbience.x;
+     const float range = min(end, fadeEnd);
+-    const float stepLength = max(DustCell * 0.5f, range / float(DustMaxSteps));
+-    const uint steps = min(uint(range / stepLength) + 1u, DustMaxSteps);
+     const float pixelAngle = RtParams.fovRadians / max(RtParams.viewport.w, 1.0f);
+ 
+     // The bodies that could reach this ray's motes at all (patch 0037; 0042: a body's whole capsule).
+@@ -1657,41 +1692,44 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+     // Where the field has travelled to, and how fast a mote wanders in it.
+     const float3 carried = outdoors ? windOffset(seconds) : float3(0.0f, 0.0f, 0.0f);
+     const float wander = outdoors ? (1.0f + RtParams.tuneWind.w) : RtParams.tuneReflection.w;
+-    int3 lastCell = int3(2147483647, 2147483647, 2147483647);
+-    float3 sum = 0.0f;
+-    for (uint s = 0; s < steps; s++) {
+-        // LOOKED UP THROUGH THE PUSH (patch 0039): the air at this point of the ray came from
+-        // about where the movers' push takes it back to, so that is the cell searched, and a mote
+-        // pushed in from a cell the ray never crosses is still found.
+-        const float3 world = origin + direction * (float(s) * stepLength);
+-        const float3 p = world - carried - ((moverCount > 0u) ? airPush(world, movers, moverCount) : float3(0.0f, 0.0f, 0.0f));
+-        const int3 cell = int3(floor(p / DustCell));
+-        if (all(cell == lastCell)) {
+-            continue;
+-        }
+-
+-        lastCell = cell;
+ 
++    // The ray in the turned lattice, in cells, and the walk from cell to cell (patch 0043).
++    const float3 o = mul(DustLattice, origin - carried) / DustCell;
++    const float3 d = mul(DustLattice, direction);
++    int3 cell = int3(floor(o));
++    const int3 walk = int3(d.x >= 0.0f ? 1 : -1, d.y >= 0.0f ? 1 : -1, d.z >= 0.0f ? 1 : -1);
++    const float3 cellCross = 1.0f / max(abs(d), 1.0e-6f);
++    float3 next = float3(walk.x > 0 ? (float(cell.x) + 1.0f - o.x) : (o.x - float(cell.x)),
++                         walk.y > 0 ? (float(cell.y) + 1.0f - o.y) : (o.y - float(cell.y)),
++                         walk.z > 0 ? (float(cell.z) + 1.0f - o.z) : (o.z - float(cell.z))) * cellCross;
++    const float rangeCells = range / DustCell;
++    float t = 0.0f;
++    float3 sum = 0.0f;
++    for (uint s = 0; (s < DustMaxCells) && (t < rangeCells); s++) {
+         // MANY MOTES TO A CELL, EACH ITS OWN (patch 0038, the user, 2026-10-08, at the Temple of
+         // Time's window with Thick dust: "shows almost no particles ... the density is WAY too low
+         // ... this thick setting should probably be a new "very sparse" setting and then it needs
+         // to densen significantly"; "there needs to be variance in size, there needs to be variance
+         // in opacity, and there needs to be a variance in brightness for every single particle
+-        // ... most of them, would be more transparent"). The density is now motes to a cell, the
+-        // whole part always and the fraction by chance, up to DustMaxPerCell. Each mote draws its
+-        // own place, its own size (half to twice the size row's median), its own opacity (most of
+-        // them faint, a few full) and its own brightness (a third either side of the row's).
++        // ... most of them, would be more transparent"). The density is motes to a cell, the
++        // whole part always and the fraction by chance, up to DustMaxPerCell, thinned and thickened
++        // by the clumps (patch 0043). Each mote draws its own place, its own size (half to twice
++        // the size row's median), its own opacity (most of them faint, a few full) and its own
++        // brightness (a third either side of the row's).
+         const float4 cellHash = float4(dustHash(uint4(uint3(cell), 0x2545F491u))) * (1.0f / 4294967295.0f);
+-        const uint motes = min(uint(density) + ((cellHash.w < frac(density)) ? 1u : 0u), DustMaxPerCell);
++        const float here = density * dustClump(cell);
++        const uint motes = min(uint(here) + ((cellHash.w < frac(here)) ? 1u : 0u), DustMaxPerCell);
+         for (uint j = 0; j < motes; j++) {
+             const float4 h = float4(dustHash(uint4(uint3(cell), 0x2545F491u + 0x9E3779B9u * (j + 1u)))) * (1.0f / 4294967295.0f);
+             const float4 own = float4(dustHash(uint4(uint3(cell) ^ uint3(0x68E31DA4u, 0xB5297A4Du, 0x1B56C4E9u), j))) * (1.0f / 4294967295.0f);
+             const float3 phase = h.xyz * 6.28318531f;
+-            const float3 drift = sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
+-            float3 mote = (float3(cell) + 0.1f + h.xyz * 0.8f) * DustCell + drift + carried;
++            // Anywhere in its cell, and its wander held inside it: never further than 90% of the
++            // way to the nearest face, nor than DustDrift of a cell.
++            const float3 reachInCell = min(min(h.xyz, 1.0f - h.xyz) * 0.9f, DustDrift);
++            const float3 inCell = h.xyz + sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * reachInCell;
++            float3 mote = mul(float3(cell) + inCell, DustLattice) * DustCell + carried;
+ 
+-            // Pushed by whatever moves near it (patch 0039: as far as AirPushLimit, the march
+-            // having looked it up through the push).
++            // Kept out of the bodies near it (patch 0042).
+             if (moverCount > 0u) {
+                 mote += airPush(mote, movers, moverCount);
+             }
+@@ -1723,6 +1761,23 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+             const float peak = max(max(moteLight.r, moteLight.g), moteLight.b);
+             sum += (peak > 1.0f) ? (moteLight / peak) : moteLight;
+         }
++
++        // On to the next cell the ray enters.
++        if ((next.x <= next.y) && (next.x <= next.z)) {
++            t = next.x;
++            next.x += cellCross.x;
++            cell.x += walk.x;
++        }
++        else if (next.y <= next.z) {
++            t = next.y;
++            next.y += cellCross.y;
++            cell.y += walk.y;
++        }
++        else {
++            t = next.z;
++            next.z += cellCross.z;
++            cell.z += walk.z;
++        }
+     }
+ 
+     return sum;

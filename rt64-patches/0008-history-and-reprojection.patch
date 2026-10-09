@@ -1,0 +1,3150 @@
+From a2734255f94a526d28bd2c0702eb049980f636da Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 24 Sep 2026 08:10:46 -0400
+Subject: [PATCH] The passes keep their history across the presented frames
+
+Patch 0008 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md).
+
+Every pass is one noisy sample per pixel per frame. The direct pass's factor and the scatter are
+blended now with what the previous presented frame held for the same surface point: the point is
+projected through the previous frame's view projection, and the history there is kept only where
+the previous depth and normal say it was the same surface (the depth compared as the point's own
+distance from the previous eye, in the depth view's encoding). The renderer interpolates the
+camera on the CPU for every presented frame, so the previous frame's view is the previous
+presented one and the traced passes run once per presented frame with the interpolated camera;
+nothing is traced once per game update and reprojected in between, because the passes cost a few
+milliseconds at 1440p and every presented frame is a new sample.
+
+A cut clears the history: the eye moving more than 150 units or the view turning more than about
+25 degrees between two presented frames, a resize, the first frames. The parameter block carries
+the previous eye and the flag. The direct pass counts, on one pixel in sixty four, how many took
+their history and how many were traced, into a small buffer copied to a readback slot per ring
+position, and the trace prints `[rt] reprojected n of m` once a second.
+
+Pinned edits, each marked "patch 0008": the previous eye and the flag in the parameter block; the
+scatter texture's pair and the count buffer in the common set and the register block; the
+bindings, barriers and the count's clear and copy around the direct dispatch; the previous eye and
+the cut test where the previous view projection is computed.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bb2fb47..1d87cc1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -550,6 +550,14 @@ build_compute_shader(rt64 "src/shaders/RSPWorldCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPSmoothNormalCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl")
+ build_compute_shader(rt64 "src/shaders/RSPVertexTestZCS.hlsl" "src/shaders/RSPVertexTestZCSMS.hlsl" "-D MULTISAMPLING")
++# The traced passes' copy of the rasterized depth (OoT: Recompiled, patch 0008), plain and multisampled.
++build_compute_shader(rt64 "src/shaders/RtDepthResolveCS.hlsl")
++build_compute_shader(rt64 "src/shaders/RtDepthResolveCS.hlsl" "src/shaders/RtDepthResolveCSMS.hlsl" "-D MULTISAMPLING")
++# The direct light's spatial filter (patch 0008), one build per step.
++build_compute_shader(rt64 "src/shaders/RtFilterCS.hlsl" "src/shaders/RtFilterCS1.hlsl" "-D STEP=1")
++build_compute_shader(rt64 "src/shaders/RtFilterCS.hlsl" "src/shaders/RtFilterCS2.hlsl" "-D STEP=2")
++# The direct light's history with temporal clamping (patch 0008).
++build_compute_shader(rt64 "src/shaders/RtTemporalCS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/RtCopyColorToDepthPS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/RtCopyColorToDepthPS.hlsl" "src/shaders/RtCopyColorToDepth2XPS.hlsl" "-D SAMPLES_2X")
+ build_pixel_shader(  rt64 "src/shaders/RtCopyColorToDepthPS.hlsl" "src/shaders/RtCopyColorToDepth4XPS.hlsl" "-D SAMPLES_4X")
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 7de5b69..4dfab61 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -324,6 +324,9 @@ namespace RT64 {
+                     renderParams.filtering = filtering;
+                     renderParams.vi = &present.screenVI;
+                     renderParams.removeBlackBorders = removeBlackBorders;
++                    // The picture beside a panel (patch 0008): two words, read without the lock.
++                    renderParams.insetLeft = ext.sharedResources->pictureInsetLeft;
++                    renderParams.insetRight = ext.sharedResources->pictureInsetRight;
+ 
+                     const bool useDownsampling = (colorTarget->downsampleMultiplier > 1);
+                     if (useDownsampling) {
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index 8e23269..d631f00 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -68,6 +68,17 @@ namespace RT64 {
+             }
+         }
+ 
++        // The picture beside a panel (OoT: Recompiled, patch 0008): pixels of the window's width
++        // the interface holds at each edge, read by the present queue every frame.
++        uint32_t pictureInsetLeft = 0;
++        uint32_t pictureInsetRight = 0;
++
++        void setPictureInset(uint32_t left, uint32_t right) {
++            std::scoped_lock<std::mutex> configurationLock(configurationMutex);
++            pictureInsetLeft = left;
++            pictureInsetRight = right;
++        }
++
+         void setSwapChainRate(uint32_t rate) {
+             std::scoped_lock<std::mutex> configurationLock(configurationMutex);
+             swapChainRate = rate;
+@@ -118,6 +129,15 @@ namespace RT64 {
+             std::scoped_lock<std::mutex> configurationLock(configurationMutex);
+             rtLights = newRtLights;
+         }
++
++        // The scene's sun and ambient as the game holds them (patch 0008), published with the
++        // lights and taken by the workload queue every frame under the same mutex.
++        RaytracingEnvironment rtEnvironment;
++
++        void setRtEnvironment(const RaytracingEnvironment &newRtEnvironment) {
++            std::scoped_lock<std::mutex> configurationLock(configurationMutex);
++            rtEnvironment = newRtEnvironment;
++        }
+ #   endif
+     };
+ };
+\ No newline at end of file
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index f1f1c2f..f3f248c 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -249,10 +249,17 @@ namespace RT64 {
+             ext.sharedResources->rtConfigChanged = false;
+         }
+ 
++        // Only while the pipeline built (patch 0008): a refused state object leaves the frame
++        // rasterized, with the refusal in the log, rather than reading a binding table off it.
++        if (workloadConfig.raytracingEnabled && !ext.rtShaderCache->isUsable()) {
++            workloadConfig.raytracingEnabled = false;
++        }
++
+         // The game's point lights for the traced passes, every frame (patch 0006), read here
+         // because this function holds the shared resources' configuration mutex already.
+         if (workloadConfig.raytracingEnabled) {
+             framebufferRenderer->setRaytracingLights(ext.sharedResources->rtLights);
++            framebufferRenderer->setRaytracingEnvironment(ext.sharedResources->rtEnvironment);   // patch 0008
+         }
+ #   endif
+         
+diff --git a/src/render/rt64_descriptor_sets.h b/src/render/rt64_descriptor_sets.h
+index b13a4fe..107ec79 100644
+--- a/src/render/rt64_descriptor_sets.h
++++ b/src/render/rt64_descriptor_sets.h
+@@ -215,6 +215,9 @@ namespace RT64 {
+         uint32_t gOcclusion;    // patch 0006
+         uint32_t gLocalLight;   // patch 0006
+         uint32_t gScatter;      // patch 0007
++        uint32_t gPrevScatter;  // patch 0008
++        uint32_t gStats;        // patch 0008
++        uint32_t gRasterDepth;  // patch 0008
+ 
+         FramebufferRendererDescriptorCommonSet(const SamplerLibrary &samplerLibrary, bool raytracing, RenderDevice *device = nullptr) {
+             builder.begin();
+@@ -288,6 +291,9 @@ namespace RT64 {
+             gOcclusion = builder.addReadWriteTexture(68);    // patch 0006
+             gLocalLight = builder.addReadWriteTexture(69);   // patch 0006
+             gScatter = builder.addReadWriteTexture(70);      // patch 0007
++            gPrevScatter = builder.addReadWriteTexture(71);  // patch 0008
++            gStats = builder.addReadWriteFormattedBuffer(72); // patch 0008
++            gRasterDepth = builder.addReadWriteTexture(73);   // patch 0008
+             builder.end();
+ 
+             if (device != nullptr) {
+@@ -587,6 +593,86 @@ namespace RT64 {
+         }
+     };
+ 
++    // The traced passes' depth resolve (OoT: Recompiled, patch 0008): the pair's depth target in,
++    // one sample per pixel out.
++    struct RtDepthResolveDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gDepth;
++        uint32_t gOutput;
++
++        RtDepthResolveDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gDepth = builder.addTexture(1);
++            gOutput = builder.addReadWriteTexture(2);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    // The direct light's spatial filter (patch 0008): the factor in, the pixel's position,
++    // normal and instance to weigh the taps by, the filtered factor out. Every one a storage
++    // texture, so nothing changes layout for it.
++    // The direct light's history with temporal clamping (patch 0008): the parameter block for
++    // the reprojection, this frame's raw factor and surfaces, the previous frame's accumulation,
++    // depth and normals, the accumulation out, and the reprojection count.
++    struct RtTemporalDescriptorSet : RenderDescriptorSetBase {
++        uint32_t RtParams;
++        uint32_t gRaw;
++        uint32_t gPrev;
++        uint32_t gPosition;
++        uint32_t gNormal;
++        uint32_t gInstance;
++        uint32_t gPrevDepth;
++        uint32_t gPrevNormal;
++        uint32_t gOutput;
++        uint32_t gStats;
++        uint32_t gVelocity;
++
++        RtTemporalDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            RtParams = builder.addConstantBuffer(0);
++            gRaw = builder.addReadWriteTexture(1);
++            gPrev = builder.addReadWriteTexture(2);
++            gPosition = builder.addReadWriteTexture(3);
++            gNormal = builder.addReadWriteTexture(4);
++            gInstance = builder.addReadWriteTexture(5);
++            gPrevDepth = builder.addReadWriteTexture(6);
++            gPrevNormal = builder.addReadWriteTexture(7);
++            gOutput = builder.addReadWriteTexture(8);
++            gStats = builder.addReadWriteFormattedBuffer(9);
++            gVelocity = builder.addReadWriteTexture(10);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
++    struct RtFilterDescriptorSet : RenderDescriptorSetBase {
++        uint32_t gInput;
++        uint32_t gPosition;
++        uint32_t gNormal;
++        uint32_t gInstance;
++        uint32_t gOutput;
++
++        RtFilterDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            gInput = builder.addReadWriteTexture(1);
++            gPosition = builder.addReadWriteTexture(2);
++            gNormal = builder.addReadWriteTexture(3);
++            gInstance = builder.addReadWriteTexture(4);
++            gOutput = builder.addReadWriteTexture(5);
++            builder.end();
++
++            if (device != nullptr) {
++                create(device);
++            }
++        }
++    };
++
+     struct RSPVertexTestZDescriptorSet : RenderDescriptorSetBase {
+         uint32_t screenPos;
+         uint32_t srcFaceIndices;
+@@ -609,6 +695,7 @@ namespace RT64 {
+         uint32_t srcPos;
+         uint32_t srcVel;
+         uint32_t srcNorm;
++        uint32_t srcLightCounts;   // patch 0008: zero lights means srcNorm holds color, not a normal
+         uint32_t srcIndices;
+         uint32_t worldMats;
+         uint32_t invTWorldMats;
+@@ -622,6 +709,7 @@ namespace RT64 {
+             srcPos = builder.addFormattedBuffer(1);
+             srcVel = builder.addFormattedBuffer(2);
+             srcNorm = builder.addFormattedBuffer(3);
++            srcLightCounts = builder.addFormattedBuffer(11);   // patch 0008
+             srcIndices = builder.addFormattedBuffer(4);
+             worldMats = builder.addStructuredBuffer(5);
+             invTWorldMats = builder.addStructuredBuffer(6);
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 92dd72f..ffea50b 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -372,7 +372,10 @@ namespace RT64 {
+             descCommonSet->setBuffer(descCommonSet->instanceExtraParams, drawBuffers->extraParamsBuffer.get(), RenderBufferStructuredView(sizeof(interop::ExtraParams)));
+             descCommonSet->setTexture(descCommonSet->gOcclusion, rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL);     // patch 0006
+             descCommonSet->setTexture(descCommonSet->gLocalLight, rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL);   // patch 0006
+-            descCommonSet->setTexture(descCommonSet->gScatter, rtResources->scatterTexture.get(), RenderTextureLayout::GENERAL);         // patch 0007
++            descCommonSet->setTexture(descCommonSet->gScatter, rtResources->scatterTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL);       // patch 0007, the pair since 0008
++            descCommonSet->setTexture(descCommonSet->gPrevScatter, rtResources->scatterTexture[rtResources->swapBuffers ? 0 : 1].get(), RenderTextureLayout::GENERAL);   // patch 0008
++            descCommonSet->setBuffer(descCommonSet->gStats, rtResources->statsBuffer.get(), 16, rtResources->statsBufferView.get());                                     // patch 0008
++            descCommonSet->setTexture(descCommonSet->gRasterDepth, rtResources->rasterDepthTexture.get(), RenderTextureLayout::GENERAL);                                   // patch 0008
+             descCommonSet->setBuffer(descCommonSet->RtParams, rtResources->rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
+         }
+ #   endif
+@@ -723,6 +726,30 @@ namespace RT64 {
+         rtParams.viewProj = hlslpp::mul(rtParams.view, rtParams.projection);
+         rtParams.prevViewProj = hlslpp::mul(rtScene.prevViewMatrix, rtScene.prevProjMatrix);
+ 
++        // The history (patch 0008): the previous presented frame's eye, and whether the history
++        // may be used. A cut is the eye moving more than 150 units or the view turning more
++        // than about 25 degrees between two presented frames; a resize and the first frames
++        // clear it too (skipReprojection).
++        {
++            interop::float4x4 prevViewI;
++            prevViewI = hlslpp::inverse(rtScene.prevViewMatrix);
++            rtParams.prevEye = interop::float4(prevViewI.m[3][0], prevViewI.m[3][1], prevViewI.m[3][2], 0.0f);
++            const hlslpp::float3 eye(rtParams.viewI.m[3][0], rtParams.viewI.m[3][1], rtParams.viewI.m[3][2]);
++            const hlslpp::float3 prevEye(prevViewI.m[3][0], prevViewI.m[3][1], prevViewI.m[3][2]);
++            const hlslpp::float3 forward = hlslpp::normalize(hlslpp::float3(rtParams.viewI.m[2][0], rtParams.viewI.m[2][1], rtParams.viewI.m[2][2]));
++            const hlslpp::float3 prevForward = hlslpp::normalize(hlslpp::float3(prevViewI.m[2][0], prevViewI.m[2][1], prevViewI.m[2][2]));
++            const float eyeJump = float(hlslpp::length(eye - prevEye));
++            const float turn = float(hlslpp::dot(forward, prevForward));
++            const bool cut = rtResources->skipReprojection || (eyeJump > 150.0f) || (turn < 0.9f);
++            rtParams.reprojectValid = cut ? 0u : 1u;
++        }
++
++        // Whether the rasterized depth was resolved last frame (patch 0008): the block is uploaded
++        // before this frame's resolve runs, so the flag is one frame behind, which is fine.
++        rtParams.rasterDepthValid = rtResources->rasterDepthValid ? 1u : 0u;
++        rtParams.depthScale = rtScene.depthScale;
++        rtParams.depthTranslate = rtScene.depthTranslate;
++
+         // TODO: There's probably a way to compute this without calculating the FOV/Near/Far values.
+         // Pinhole camera vectors to generate non-normalized ray direction.
+         // TODO: Make a fake target and focal distance at the midpoint of the near/far planes
+@@ -758,7 +785,7 @@ namespace RT64 {
+         // The binding table is built in endFramebuffers, after the descriptor sets exist (patch 0003).
+     }
+     
+-    void FramebufferRenderer::submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene) {
++    void FramebufferRenderer::submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, RenderTarget *depthTarget, const RaytracingScene &rtScene) {
+         // Unbind any render targets.
+         worker->commandList->setFramebuffer(nullptr);
+ 
+@@ -785,7 +812,9 @@ namespace RT64 {
+                 RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
+                 RenderTextureBarrier(rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL),    // patch 0006
+                 RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL),   // patch 0006
+-                RenderTextureBarrier(rtResources->scatterTexture.get(), RenderTextureLayout::GENERAL)       // patch 0007
++                RenderTextureBarrier(rtResources->scatterTexture[0].get(), RenderTextureLayout::GENERAL),   // patch 0007, the pair since 0008
++                RenderTextureBarrier(rtResources->scatterTexture[1].get(), RenderTextureLayout::GENERAL),
++                RenderTextureBarrier(rtResources->rasterDepthTexture.get(), RenderTextureLayout::GENERAL)    // patch 0008
+             };
+ 
+             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCreationBarriers, uint32_t(std::size(afterCreationBarriers)));
+@@ -807,6 +836,9 @@ namespace RT64 {
+ 
+         worker->commandList->barriers(RenderBarrierStage::COMPUTE, preDispatchBarriers, uint32_t(std::size(preDispatchBarriers)));
+         
++        // The game's rasterized depth, one sample per pixel, for the primary rays (patch 0008).
++        rtResources->resolveRasterDepth(worker, depthTarget, shaderLibrary);
++
+         // Bind pipeline and dispatch primary rays.
+         RT64_LOG_PRINTF("Dispatching primary rays");
+         Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
+@@ -855,6 +887,20 @@ namespace RT64 {
+         rtResources->timerBegin(worker, RaytracingResources::Span::Bounce);
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+         rtResources->timerEnd(worker, RaytracingResources::Span::Bounce);
++        // The bounce's history with temporal clamping and its spatial filter (patch 0008), in
++        // place, before the direct pass reads it: one ray a frame with nothing after it was
++        // most of the grain in shadow.
++        rtResources->temporalAndFilterBounce(worker, shaderLibrary);
++        // THE RAY TRACING STATE BACK. The step is compute dispatches on this command list, and
++        // they leave the compute pipeline and its layout bound; the direct dispatch after them
++        // ran with those and the device hung on the first traced frame (2026-09-24, found by
++        // the user's installed copy and bisected here).
++        worker->commandList->setPipeline(rtState->pipeline.get());
++        worker->commandList->setRaytracingPipelineLayout(rtPipelineLayout);
++        worker->commandList->setRaytracingDescriptorSet(descCommonSet->get(), 0);
++        worker->commandList->setRaytracingDescriptorSet(descTextureSet->get(), 1);
++        worker->commandList->setRaytracingDescriptorSet(descTextureSet->get(), 2);
++        worker->commandList->setRaytracingDescriptorSet(descRealFbSet, 3);
+ 
+         RenderTextureBarrier factorInputBarriers[] = {
+             RenderTextureBarrier(rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL),
+@@ -867,9 +913,11 @@ namespace RT64 {
+         // Dispatch rays for direct light.
+         RT64_LOG_PRINTF("Dispatching direct light rays");
+         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 1;
++        rtResources->statsClear(worker);   // patch 0008: the reprojection count, cleared before and read after
+         rtResources->timerBegin(worker, RaytracingResources::Span::Shadows);   // patch 0005
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+         rtResources->timerEnd(worker, RaytracingResources::Span::Shadows);
++        rtResources->statsCopy(worker);
+ 
+         // The volumetric pass (patch 0007). The bounce moved before the direct pass, which reads
+         // it; this reads the primary pass alone and nothing reads it before the composite.
+@@ -878,7 +926,7 @@ namespace RT64 {
+         rtResources->timerBegin(worker, RaytracingResources::Span::Scatter);
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+         rtResources->timerEnd(worker, RaytracingResources::Span::Scatter);
+-        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rtResources->scatterTexture.get(), RenderTextureLayout::GENERAL));
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rtResources->scatterTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL));
+ 
+         // Dispatch rays for refraction.
+         RT64_LOG_PRINTF("Dispatching refraction rays");
+@@ -914,6 +962,10 @@ namespace RT64 {
+             }
+         }
+ 
++        // The direct light's history, clamped to this frame's neighborhood (patch 0008), into
++        // the direct light slot the copy below and the next frame read.
++        rtResources->temporalDirectLight(worker, shaderLibrary);
++
+         // Copy direct light raw buffer to the first direct filtered buffer.
+         {
+             RenderTexture *source = rtResources->directLightTexture[rtResources->swapBuffers ? 1 : 0].get();
+@@ -935,6 +987,9 @@ namespace RT64 {
+             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCopyBarriers, uint32_t(std::size(afterCopyBarriers)));
+         }
+ 
++        // The direct light's spatial filter (patch 0008), over the copy the compose reads.
++        rtResources->filterDirectLight(worker, shaderLibrary);
++
+         // Copy indirect light raw buffer to the first indirect filtered buffer.
+         bool denoiseGI = rtResources->denoiserEnabled && (rtResources->rtParams.giSamples > 0) && (rtResources->upscalerMode != UpscaleMode::DLSS);
+         {
+@@ -990,7 +1045,7 @@ namespace RT64 {
+         RenderTextureBarrier afterDispatchBarriers[] = {
+             RenderTextureBarrier(rtOutputCur, RenderTextureLayout::COLOR_WRITE),
+             RenderTextureBarrier(rtResources->additiveTexture.get(), RenderTextureLayout::COLOR_WRITE),   // patch 0007
+-            RenderTextureBarrier(rtResources->scatterTexture.get(), RenderTextureLayout::SHADER_READ),     // patch 0007
++            RenderTextureBarrier(rtResources->scatterTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::SHADER_READ),   // patch 0007, the pair since 0008
+             RenderTextureBarrier(colorTarget->texture.get(), RenderTextureLayout::COLOR_WRITE),
+             RenderTextureBarrier(rtResources->diffuseTexture.get(), RenderTextureLayout::SHADER_READ),
+             RenderTextureBarrier(rtResources->reflectionTexture.get(), RenderTextureLayout::SHADER_READ),
+@@ -1000,6 +1055,11 @@ namespace RT64 {
+ 
+         worker->commandList->barriers(RenderBarrierStage::GRAPHICS, afterDispatchBarriers, uint32_t(std::size(afterDispatchBarriers)));
+ 
++        // The depth target back to depth writing after its resolve (patch 0008).
++        if ((depthTarget != nullptr) && (depthTarget->texture != nullptr)) {
++            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(depthTarget->texture.get(), RenderTextureLayout::DEPTH_WRITE));
++        }
++
+         // Set the output as the current render target.
+         worker->commandList->setFramebuffer(rtResources->outputFramebuffer[rtResources->swapBuffers ? 1 : 0].get());
+ 
+@@ -1338,7 +1398,20 @@ namespace RT64 {
+                 }
+ 
+                 submitDepthAccess(worker, targetDrawCall.fbStorage, true, depthState);
+-                submitRaytracingScene(worker, targetDrawCall.fbStorage->colorTarget, rtScene);
++                // Only a pair with a depth image is traced (patch 0008): the frame in which the
++                // game opens or closes its pause menu draws the world into a pair without one
++                // (the picture the menu keeps behind itself), and tracing that pair remade the
++                // traced textures at its size, which threw the history away twice and flashed the
++                // whole screen with the raw passes as they accumulated again.
++                RenderTarget *pairDepth = targetDrawCall.fbStorage->depthTarget;
++                if ((pairDepth != nullptr) && (pairDepth->texture != nullptr)) {
++                    submitRaytracingScene(worker, targetDrawCall.fbStorage->colorTarget, pairDepth, rtScene);
++                }
++                // The pair's framebuffer and its depth back after the pass (patch 0008), for the
++                // translucent scene that follows: its draws neither write depth nor read it as a
++                // decal, so nothing else would rebind them, and a depth tested sprite drawn onto
++                // the color target's depthless framebuffer was lost.
++                submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
+             }
+             else
+ #       endif
+@@ -1363,6 +1436,10 @@ namespace RT64 {
+         rtExternalLights = lights;   // patch 0006
+     }
+ 
++    void FramebufferRenderer::setRaytracingEnvironment(const RaytracingEnvironment &environment) {
++        rtExternalEnvironment = environment;   // patch 0008
++    }
++
+     void FramebufferRenderer::setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged) {
+         assert(rtResources != nullptr);
+         rtResources->setRaytracingConfig(rtConfig, resolutionChanged);
+@@ -1471,6 +1548,7 @@ namespace RT64 {
+ #   if RT_ENABLED
+         RaytracingScene rtScene;
+         RasterScene tracedRasterScene;   // the traced calls, rasterized too (patch 0005)
++        RasterScene tracedTranslucentScene;   // the translucent ones, rasterized AFTER the traced pass (patch 0008)
+         auto checkRtScene = [&](RaytracingScene &rtScene) {
+             if (!rtScene.instanceIndices.empty()) {
+                 // The traced calls' own raster scene goes first, so the color target holds
+@@ -1487,6 +1565,16 @@ namespace RT64 {
+                 targetDrawCall.sceneIndices.push_back({ sceneIndex, true });
+                 rtScene.instanceIndices.clear();
+ 
++                // The translucent draws over the relit picture (patch 0008): a glow, a sparkle,
++                // a fire keep the game's own brightness whatever shadow lies on the surface
++                // behind them, instead of being multiplied by it with that surface.
++                if (!tracedTranslucentScene.instanceIndices.empty()) {
++                    uint32_t translucentIndex = static_cast<uint32_t>(targetDrawCall.rasterScenes.size());
++                    targetDrawCall.rasterScenes.push_back(tracedTranslucentScene);
++                    targetDrawCall.sceneIndices.push_back({ translucentIndex, false });
++                    tracedTranslucentScene.instanceIndices.clear();
++                }
++
+                 return true;
+             }
+             else {
+@@ -1527,6 +1615,7 @@ namespace RT64 {
+         // a view of its own, so the scene would hold the four sky quads and the world after them
+         // would be judged incompatible and rasterized.
+         int32_t rtMainTransforms = -1;
++        int32_t rtMainProj = -1;   // patch 0008: the projection itself, for its scissor and viewport
+         uint32_t rtMainCalls = 0;
+         if (p.rtEnabled) {
+             for (uint32_t pr = 0; pr < fbPair.projectionCount; pr++) {
+@@ -1534,6 +1623,7 @@ namespace RT64 {
+                 if ((candidate.type == Projection::Type::Perspective) && !candidate.scissorRect.isNull() && (candidate.gameCallCount > rtMainCalls)) {
+                     rtMainCalls = candidate.gameCallCount;
+                     rtMainTransforms = int32_t(candidate.transformsIndex);
++                    rtMainProj = int32_t(pr);
+                 }
+             }
+         }
+@@ -1818,9 +1908,13 @@ namespace RT64 {
+                     tracedRasterScene.instanceIndices.insert(tracedRasterScene.instanceIndices.end(), rasterScene.instanceIndices.begin(), rasterScene.instanceIndices.end());
+                     rasterScene.instanceIndices.clear();
+                     if (rtScene.instanceIndices.empty()) {
++                        // The main projection's rectangle and depth mapping, whichever call starts the
++                        // scene (patch 0008): the joining projections share its matrices, not its
++                        // scissor, and one with a partial scissor clipped and squeezed the picture.
++                        const Projection &mainProj = (rtMainProj >= 0) ? fbPair.projections[rtMainProj] : proj;
+                         float projRatioScale = 1.0f / aspectRatioScale;
+                         float invRatioScale = 1.0f / aspectRatioScale;
+-                        const bool coversScissorWidth = (proj.scissorRect.ulx <= fbPair.scissorRect.ulx) && (proj.scissorRect.lrx >= fbPair.scissorRect.lrx);
++                        const bool coversScissorWidth = (mainProj.scissorRect.ulx <= fbPair.scissorRect.ulx) && (mainProj.scissorRect.lrx >= fbPair.scissorRect.lrx);
+                         if (coversScissorWidth) {
+                             invRatioScale = 1.0f;
+                         }
+@@ -1833,14 +1927,34 @@ namespace RT64 {
+                         rtScene.prevViewMatrix = drawData.prevViewTransforms[proj.transformsIndex];
+                         rtScene.prevProjMatrix = drawData.prevProjTransforms[proj.transformsIndex];
+ 
+-                        const auto &viewport = drawData.rspViewports[proj.transformsIndex];
++                        const auto &viewport = drawData.rspViewports[mainProj.transformsIndex];
++                        // How the rasterizer maps depth for this projection (patch 0008): the primary ray
++                        // puts its hit's depth beside the depth image through the same scale and translate.
++                        rtScene.depthScale = viewport.scale.z;
++                        rtScene.depthTranslate = viewport.translate.z;
+                         // The viewport itself, not the clip bound (patch 0003): rect(viewportClipRatios) is
+                         // the RSP viewport expanded by the game's clip ratio, the guard band the raster
+                         // path uses only to clip triangles. This game sets a ratio of 2, so the traced
+                         // scene's viewport (the compose quad, the ray mapping) covered twice the screen.
+                         static const int16_t RtViewportRatios[4] = { 1, 1, -1, -1 };
+                         rtScene.viewport = convertViewportRect(viewport.rect(RtViewportRatios), p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0.0f, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
+-                        rtScene.scissor = convertFixedRect(proj.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
++                        rtScene.scissor = convertFixedRect(mainProj.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
++                        // THE RECTANGLE, TRACED (2026-09-24, the moving edge under Z targeting): once a second,
++                        // the main projection's scissor against the pair's, the starter's, whether the width is
++                        // covered, and the rectangle the compose and the rays get. In the game's own units for
++                        // the fixed rectangles and in pixels for the traced ones.
++                        {
++                            static uint32_t rectFrames = 0;
++                            if ((rectFrames++ % 60) == 0) {
++                                std::fprintf(stderr, "[rt] rect: main scissor (%d %d %d %d) calls %u, pair (%d %d %d %d), starter (%d %d %d %d), covers %d, ratio %.3f; traced scissor (%d %d %d %d) viewport (%.0f %.0f %.0f %.0f) of %ux%u\n",
++                                    int(mainProj.scissorRect.ulx), int(mainProj.scissorRect.uly), int(mainProj.scissorRect.lrx), int(mainProj.scissorRect.lry), mainProj.gameCallCount,
++                                    int(fbPair.scissorRect.ulx), int(fbPair.scissorRect.uly), int(fbPair.scissorRect.lrx), int(fbPair.scissorRect.lry),
++                                    int(proj.scissorRect.ulx), int(proj.scissorRect.uly), int(proj.scissorRect.lrx), int(proj.scissorRect.lry),
++                                    coversScissorWidth ? 1 : 0, invRatioScale,
++                                    rtScene.scissor.left, rtScene.scissor.top, rtScene.scissor.right, rtScene.scissor.bottom,
++                                    rtScene.viewport.x, rtScene.viewport.y, rtScene.viewport.width, rtScene.viewport.height, unsigned(lround(float(p.fbWidth) * p.resolutionScale.x)), unsigned(lround(float(p.fbHeight) * p.resolutionScale.y)));
++                            }
++                        }
+ 
+                         rtScene.presetScene = p.presetScene;
+                         rtScene.screenWidth = lround(static_cast<float>(p.fbWidth) * p.resolutionScale.x);
+@@ -1895,13 +2009,29 @@ namespace RT64 {
+                             rtScene.sunColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
+                             rtScene.ambientColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
+                             rtScene.sunShadows = hasSky;   // patch 0006
+-                            if ((sun != nullptr) && (sun->intensityTotal > 0.0f)) {
++                            // The game's own environment light when the program published it (patch
++                            // 0008), else the search above. The search could take a point light's per
++                            // actor stand-in for the sun: Navi's swung the whole scene as she flew.
++                            if (rtExternalEnvironment.valid) {
++                                rtScene.sunDirection = hlslpp::normalize(rtExternalEnvironment.sunDirection);
++                                rtScene.sunColor = rtExternalEnvironment.sunColor;
++                                rtScene.ambientColor = rtExternalEnvironment.ambientColor;
++                            }
++                            else if ((sun != nullptr) && (sun->intensityTotal > 0.0f)) {
+                                 rtScene.sunDirection = hlslpp::normalize(sun->dir);
+                                 rtScene.sunColor = sun->colTotal / sun->intensityTotal;
+                                 if (lit->ambientSum > 0) {
+                                     rtScene.ambientColor = lit->estimatedAmbientLight(1.0f);
+                                 }
+                             }
++
++                            // The game's own answer to whether this place has a sun (patch
++                            // 0008), which the program publishes beside the environment. The
++                            // sky sniff above moves with the camera and calls a lit cavern an
++                            // outdoor scene; this does neither.
++                            if (rtExternalEnvironment.sunShadowsKnown) {
++                                rtScene.sunShadows = rtExternalEnvironment.sunShadows;
++                            }
+                         }
+ 
+                         // The game's own light list, published by the program (patch 0006), before
+@@ -1925,7 +2055,12 @@ namespace RT64 {
+ 
+                     // The raster copy at instanceIndex and the traced instance at the next index,
+                     // with the render indices duplicated so both line up (patch 0005).
+-                    tracedRasterScene.instanceIndices.push_back(instanceIndex);
++                    if ((tracedCall.raytracing.queryMask & TranslucentRayQueryMask) != 0) {
++                        tracedTranslucentScene.instanceIndices.push_back(instanceIndex);   // after the traced pass (patch 0008)
++                    }
++                    else {
++                        tracedRasterScene.instanceIndices.push_back(instanceIndex);
++                    }
+                     instanceDrawCallVector.push_back(instanceDrawCall);
+                     renderIndicesVector.push_back(renderIndices);
+                     const uint32_t tracedIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
+@@ -1965,7 +2100,15 @@ namespace RT64 {
+ 
+             for (uint32_t i = 0; i < framebufferCount; i++) {
+                 RenderTargetDrawCall &targetDrawCall = framebufferVector[i].renderTargetDrawCall;
+-                if (!targetDrawCall.rtScenes.empty()) {
++                // A pair without a depth image is not traced (patch 0008, see submitRaytracingScene);
++                // the image is made on first use, so a pair that never wrote depth has the target
++                // and no texture, and the trace names the frame.
++                const RenderTarget *pairDepth = targetDrawCall.fbStorage->depthTarget;
++                const bool pairHasDepth = (pairDepth != nullptr) && (pairDepth->texture != nullptr);
++                if (!targetDrawCall.rtScenes.empty() && !pairHasDepth) {
++                    std::fprintf(stderr, "[rt] pair with a traced scene and no depth image skipped\n");
++                }
++                if (!targetDrawCall.rtScenes.empty() && pairHasDepth) {
+                     chosenFramebuffer = &framebufferVector[i];
+                     chosenRtScene = &targetDrawCall.rtScenes[0];
+                 }
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index 6fceade..25e5495 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -175,9 +175,11 @@ namespace RT64 {
+ #   if RT_ENABLED
+         void resetRaytracing(RaytracingShaderCache *rtShaderCache, const RenderTexture *blueNoiseTexture);
+         void updateRaytracingScene(RenderWorker *worker, const RaytracingScene &rtScene);
+-        void submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene);
++        void submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, RenderTarget *depthTarget, const RaytracingScene &rtScene);   // the depth target since patch 0008
+         void setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged);
+         void setRaytracingLights(const std::vector<interop::PointLight> &lights);
++        void setRaytracingEnvironment(const RaytracingEnvironment &environment);   // patch 0008
++        RaytracingEnvironment rtExternalEnvironment;
+ 
+         // The game's point lights for the traced scene (patch 0006), set every frame by the
+         // workload queue from what the program published; taken before the projection's own.
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index f967822..fc54b73 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -88,6 +88,7 @@ namespace RT64 {
+         retired.clear();
+         graveyardRing[ringIndex % RingDepth].clear();
+         timerResolve();
++        statsResolve();   // patch 0008
+ 
+         if (bottomLevelPool.size() < bottomLevelASVector.size()) {
+             bottomLevelPool.resize(bottomLevelASVector.size());
+@@ -227,6 +228,20 @@ namespace RT64 {
+                 (topLevelAS != nullptr) ? "built" : "none");
+         }
+         traceBuild();
++        traceState();
++    }
++
++    void RaytracingResources::traceState() {
++        stateFrame++;
++        const uint32_t key = (rtParams.sunShadows != 0 ? 1u : 0u) | (rtParams.reprojectValid != 0 ? 2u : 0u) | (rtParams.rasterDepthValid != 0 ? 4u : 0u) |
++            ((rtParams.sunColor.x > 0.0f || rtParams.sunColor.y > 0.0f || rtParams.sunColor.z > 0.0f) ? 8u : 0u);
++        if (key == lastStateKey) {
++            return;
++        }
++
++        lastStateKey = key;
++        std::fprintf(stderr, "[rt] state frame %u: sun %s, shadows %s, history %s, raster depth %s\n", stateFrame,
++            (key & 8u) ? "lit" : "none", (key & 1u) ? "on" : "off", (key & 2u) ? "kept" : "cut", (key & 4u) ? "there" : "none");
+     }
+ 
+     void RaytracingResources::traceBuild() {
+@@ -247,6 +262,13 @@ namespace RT64 {
+             (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), spanMs(Span::Occlusion), spanMs(Span::Lights),
+             spanMs(Span::Bounce), spanMs(Span::Reflections), spanMs(Span::Scatter), recordingMs, buildFrames);
+ 
++        // The reprojection count (patch 0008): pixels that took their history over pixels traced,
++        // on a one in sixty four sample, summed over the second.
++        std::fprintf(stderr, "[rt] reprojected %llu of %llu\n",
++            static_cast<unsigned long long>(reprojectedAccepted), static_cast<unsigned long long>(reprojectedTraced));
++        reprojectedAccepted = 0;
++        reprojectedTraced = 0;
++
+         // The scene's lights as the passes see them (patch 0005), beside the budget line.
+         std::fprintf(stderr, "[rt] light sun (%.2f %.2f %.2f) toward (%.2f %.2f %.2f) ambient (%.2f %.2f %.2f) point lights %u\n",
+             float(rtParams.sunColor.x), float(rtParams.sunColor.y), float(rtParams.sunColor.z),
+@@ -308,6 +330,209 @@ namespace RT64 {
+         timerWritten[slot] = 0;
+     }
+ 
++    // ---- the reprojection count (patch 0008) ------------------------------------------------
++
++    void RaytracingResources::statsClear(RenderWorker *worker) {
++        if (statsBuffer == nullptr) {
++            return;
++        }
++
++        worker->commandList->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(statsBuffer.get(), RenderBufferAccess::WRITE));
++        worker->commandList->copyBufferRegion(statsBuffer->at(0), statsZeroBuffer->at(0), 16);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(statsBuffer.get(), RenderBufferAccess::WRITE));
++    }
++
++    void RaytracingResources::statsCopy(RenderWorker *worker) {
++        if (statsBuffer == nullptr) {
++            return;
++        }
++
++        const uint32_t slot = ringIndex % RingDepth;
++        worker->commandList->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(statsBuffer.get(), RenderBufferAccess::READ));
++        worker->commandList->copyBufferRegion(statsReadback[slot]->at(0), statsBuffer->at(0), 16);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(statsBuffer.get(), RenderBufferAccess::WRITE));
++        statsWritten[slot] = true;
++    }
++
++    void RaytracingResources::resolveRasterDepth(RenderWorker *worker, RenderTarget *depthTarget, const ShaderLibrary *shaderLibrary) {
++        if ((depthTarget == nullptr) || (depthTarget->texture == nullptr) || (rasterDepthTexture == nullptr) || (depthResolveSet == nullptr)) {
++            rasterDepthValid = false;
++            return;
++        }
++
++        // The depth target is read as a texture while it is resolved, and the renderer puts it
++        // back to depth writing with the color target after the traced pass.
++        depthResolveSet->setTexture(depthResolveSet->gDepth, depthTarget->texture.get(), RenderTextureLayout::DEPTH_READ, depthTarget->textureView.get());
++        depthResolveSet->setTexture(depthResolveSet->gOutput, rasterDepthTexture.get(), RenderTextureLayout::GENERAL);
++
++        RenderTextureBarrier beforeBarriers[] = {
++            RenderTextureBarrier(depthTarget->texture.get(), RenderTextureLayout::DEPTH_READ),
++            RenderTextureBarrier(rasterDepthTexture.get(), RenderTextureLayout::GENERAL)
++        };
++
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, beforeBarriers, uint32_t(std::size(beforeBarriers)));
++
++        const bool multisampled = depthTarget->multisampling.sampleCount > 1;
++        const ShaderRecord &resolve = multisampled ? shaderLibrary->rtDepthResolveMS : shaderLibrary->rtDepthResolve;
++        worker->commandList->setPipeline(resolve.pipeline.get());
++        worker->commandList->setComputePipelineLayout(resolve.pipelineLayout.get());
++        worker->commandList->setComputeDescriptorSet(depthResolveSet->get(), 0);
++        worker->commandList->dispatch((textureWidth + 7) / 8, (textureHeight + 7) / 8, 1);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rasterDepthTexture.get(), RenderTextureLayout::GENERAL));
++        rasterDepthValid = true;
++    }
++
++    void RaytracingResources::filterDirectLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary) {
++        if ((filterSets[0] == nullptr) || (filteredDirectLightTexture[0] == nullptr) || (shadingPositionTexture == nullptr)) {
++            return;
++        }
++        RtFilterDescriptorSet *const sets[2] = { filterSets[0].get(), filterSets[1].get() };
++        RenderTexture *const ping[2] = { filteredDirectLightTexture[0].get(), filteredDirectLightTexture[1].get() };
++        filterLight(worker, shaderLibrary, sets, ping);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(filteredDirectLightTexture[1].get(), RenderTextureLayout::SHADER_READ));
++    }
++
++    void RaytracingResources::filterLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary, RtFilterDescriptorSet *const sets[2], RenderTexture *const ping[2]) {
++        if (filterSteps <= 0) {
++            return;
++        }
++
++        // The input sits in the second slot; the first step reads it into the first slot, the
++        // second step back into the second, which is where the result is read. With one step
++        // asked for, the one step runs twice over (the second at the wider spacing is what is
++        // left out), so the result is still in the second slot.
++        const ShaderRecord *steps[2] = { &shaderLibrary->rtFilter1, (filterSteps >= 2) ? &shaderLibrary->rtFilter2 : &shaderLibrary->rtFilter1 };
++        for (uint32_t step = 0; step < 2; step++) {
++            RenderTexture *input = ping[(step == 0) ? 1 : 0];
++            RenderTexture *output = ping[(step == 0) ? 0 : 1];
++            RtFilterDescriptorSet *set = sets[step];
++            set->setTexture(set->gInput, input, RenderTextureLayout::GENERAL);
++            set->setTexture(set->gPosition, shadingPositionTexture.get(), RenderTextureLayout::GENERAL);
++            set->setTexture(set->gNormal, shadingNormalTexture.get(), RenderTextureLayout::GENERAL);
++            set->setTexture(set->gInstance, instanceIdTexture.get(), RenderTextureLayout::GENERAL);
++            set->setTexture(set->gOutput, output, RenderTextureLayout::GENERAL);
++
++            RenderTextureBarrier stepBarriers[] = {
++                RenderTextureBarrier(input, RenderTextureLayout::GENERAL),
++                RenderTextureBarrier(output, RenderTextureLayout::GENERAL)
++            };
++
++            worker->commandList->barriers(RenderBarrierStage::COMPUTE, stepBarriers, uint32_t(std::size(stepBarriers)));
++            worker->commandList->setPipeline(steps[step]->pipeline.get());
++            worker->commandList->setComputePipelineLayout(steps[step]->pipelineLayout.get());
++            worker->commandList->setComputeDescriptorSet(set->get(), 0);
++            worker->commandList->dispatch((textureWidth + 7) / 8, (textureHeight + 7) / 8, 1);
++        }
++    }
++
++    void RaytracingResources::temporalAndFilterBounce(RenderWorker *worker, const ShaderLibrary *shaderLibrary) {
++        if ((bounceTemporalSet == nullptr) || (filteredIndirectLightTexture[0] == nullptr) || (indirectLightTexture[0] == nullptr)) {
++            return;
++        }
++        RenderTexture *raw = indirectLightTexture[swapBuffers ? 1 : 0].get();
++        RenderTexture *previous = indirectLightTexture[swapBuffers ? 0 : 1].get();
++        // The history into raw, then the filter over a copy of it and the result back into raw,
++        // which the direct pass reads and the next frame takes as its previous.
++        temporalLight(worker, shaderLibrary, bounceTemporalSet.get(), raw, previous, filteredIndirectLightTexture[0].get(), false);
++        if (filterSteps <= 0) {
++            return;
++        }
++        RenderTextureBarrier toCopy[] = {
++            RenderTextureBarrier(raw, RenderTextureLayout::COPY_SOURCE),
++            RenderTextureBarrier(filteredIndirectLightTexture[1].get(), RenderTextureLayout::COPY_DEST)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COPY, toCopy, uint32_t(std::size(toCopy)));
++        worker->commandList->copyTexture(filteredIndirectLightTexture[1].get(), raw);
++        RenderTextureBarrier afterCopy[] = {
++            RenderTextureBarrier(raw, RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCopy, uint32_t(std::size(afterCopy)));
++        RtFilterDescriptorSet *const sets[2] = { bounceFilterSets[0].get(), bounceFilterSets[1].get() };
++        RenderTexture *const ping[2] = { filteredIndirectLightTexture[0].get(), filteredIndirectLightTexture[1].get() };
++        filterLight(worker, shaderLibrary, sets, ping);
++        RenderTextureBarrier back[] = {
++            RenderTextureBarrier(filteredIndirectLightTexture[1].get(), RenderTextureLayout::COPY_SOURCE),
++            RenderTextureBarrier(raw, RenderTextureLayout::COPY_DEST)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COPY, back, uint32_t(std::size(back)));
++        worker->commandList->copyTexture(raw, filteredIndirectLightTexture[1].get());
++        RenderTextureBarrier done[] = {
++            RenderTextureBarrier(filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(raw, RenderTextureLayout::GENERAL)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, done, uint32_t(std::size(done)));
++    }
++
++    void RaytracingResources::temporalDirectLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary) {
++        if ((temporalSet == nullptr) || (filteredDirectLightTexture[0] == nullptr) || (statsBuffer == nullptr)) {
++            return;
++        }
++        temporalLight(worker, shaderLibrary, temporalSet.get(), directLightTexture[swapBuffers ? 1 : 0].get(), directLightTexture[swapBuffers ? 0 : 1].get(), filteredDirectLightTexture[0].get(), true);
++    }
++
++    void RaytracingResources::temporalLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary, RtTemporalDescriptorSet *set, RenderTexture *raw, RenderTexture *previous, RenderTexture *scratch, bool countStats) {
++        set->setBuffer(set->RtParams, rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
++        set->setTexture(set->gRaw, raw, RenderTextureLayout::GENERAL);
++        set->setTexture(set->gPrev, previous, RenderTextureLayout::GENERAL);
++        set->setTexture(set->gPosition, shadingPositionTexture.get(), RenderTextureLayout::GENERAL);
++        set->setTexture(set->gNormal, shadingNormalTexture.get(), RenderTextureLayout::GENERAL);
++        set->setTexture(set->gInstance, instanceIdTexture.get(), RenderTextureLayout::GENERAL);
++        set->setTexture(set->gPrevDepth, depthTexture[swapBuffers ? 0 : 1].get(), RenderTextureLayout::GENERAL);
++        set->setTexture(set->gPrevNormal, normalRoughnessTexture[swapBuffers ? 0 : 1].get(), RenderTextureLayout::GENERAL);
++        set->setTexture(set->gOutput, scratch, RenderTextureLayout::GENERAL);
++        // The count is one buffer and the shader always adds to it, so the bounce's run adds as
++        // well as the direct light's; the readback halves each frame's words (statsResolve).
++        set->setBuffer(set->gStats, statsBuffer.get(), 16, statsBufferView.get());
++        set->setTexture(set->gVelocity, shadingSpecularTexture.get(), RenderTextureLayout::GENERAL);   // the hit's motion, or water
++
++        RenderTextureBarrier before[] = {
++            RenderTextureBarrier(raw, RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(previous, RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(scratch, RenderTextureLayout::GENERAL)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, before, uint32_t(std::size(before)));
++        worker->commandList->setPipeline(shaderLibrary->rtTemporal.pipeline.get());
++        worker->commandList->setComputePipelineLayout(shaderLibrary->rtTemporal.pipelineLayout.get());
++        worker->commandList->setComputeDescriptorSet(set->get(), 0);
++        worker->commandList->dispatch((textureWidth + 7) / 8, (textureHeight + 7) / 8, 1);
++
++        if (countStats) {
++            // The reprojection count is made here now, so the readback takes it from here (the
++            // copy after the direct pass ran before anything was counted).
++            statsCopy(worker);
++        }
++
++        // The accumulation goes back into the raw slot: what reads the pass reads it from there,
++        // and the next frame reads it as its previous.
++        RenderTextureBarrier toCopy[] = {
++            RenderTextureBarrier(scratch, RenderTextureLayout::COPY_SOURCE),
++            RenderTextureBarrier(raw, RenderTextureLayout::COPY_DEST)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COPY, toCopy, uint32_t(std::size(toCopy)));
++        worker->commandList->copyTexture(raw, scratch);
++        RenderTextureBarrier back[] = {
++            RenderTextureBarrier(scratch, RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(raw, RenderTextureLayout::GENERAL)
++        };
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, back, uint32_t(std::size(back)));
++    }
++
++    void RaytracingResources::statsResolve() {
++        // Like timerResolve: this slot's frame is RingDepth frames old and finished.
++        const uint32_t slot = ringIndex % RingDepth;
++        if (statsWritten[slot] && (statsReadback[slot] != nullptr)) {
++            const uint32_t *words = static_cast<const uint32_t *>(statsReadback[slot]->map());
++            // Two runs a frame add to the count since 14:50 (the direct light's and the bounce's),
++            // so each frame's words are halved to keep the trace's meaning.
++            reprojectedAccepted += words[0] / 2;
++            reprojectedTraced += words[1] / 2;
++            statsReadback[slot]->unmap();
++        }
++
++        statsWritten[slot] = false;
++    }
++
+     // ---- binding table and lights -------------------------------------------------------------
+ 
+     void RaytracingResources::createShaderBindingTable(RenderWorker *worker, const RaytracingState *rtState, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount, const std::vector<RenderPipelineProgram> &hitGroups) {
+@@ -347,7 +572,12 @@ namespace RT64 {
+         rtParams.ambientBaseColor = hlslpp::float4(rtScene.ambientColor, 0.0f);
+         rtParams.sunDirection = hlslpp::float4(rtScene.sunDirection, SunAngularRadius);
+         rtParams.sunColor = hlslpp::float4(rtScene.sunColor, 0.0f);
+-        rtParams.sunShadows = rtScene.sunShadows ? 1u : 0u;   // patch 0006
++        // 1 under a sky (the sun casts, patch 0006); 2 indoors, where the scene's directional
++        // light is the room's fill and casts only a short, softened contact shadow (2026-09-24,
++        // the user in the Deku Tree: "link seems shadowless ... add a simulated more subtle
++        // sunlight"). Zero would leave every actor indoors without any shadow, the painted ones
++        // being hidden while the lighting is traced.
++        rtParams.sunShadows = rtScene.sunShadows ? 1u : 2u;
+ 
+         const uint64_t size = sizeof(interop::PointLight) * std::max(count, 1u);
+         const uint32_t slot = ringIndex % RingDepth;
+@@ -389,8 +619,16 @@ namespace RT64 {
+         retire(lockMaskTexture);
+         retire(occlusionTexture);
+         retire(localLightTexture);
+-        retire(scatterTexture);
++        retire(scatterTexture[0]);
++        retire(scatterTexture[1]);
++        retire(rasterDepthTexture);
+         retire(additiveTexture);
++        retire(statsBufferView);
++        retire(statsBuffer);
++        retire(statsZeroBuffer);
++        for (uint32_t i = 0; i < RingDepth; i++) {
++            retire(statsReadback[i]);
++        }
+         retire(lumaAverageTexture);
+         retire(downscaledOutputTexture);
+         retire(upscaledOutputTexture);
+@@ -434,8 +672,27 @@ namespace RT64 {
+ 
+         // Patch 0007: the scatter pass's output, and the composite's additive output, which is
+         // the second attachment of the output framebuffers below.
+-        scatterTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        scatterTexture[0] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        scatterTexture[1] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        rasterDepthTexture = makeStorage(device, width, height, RenderFormat::R32_FLOAT);   // patch 0008
++        rasterDepthValid = false;
+         additiveTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::RENDER_TARGET);
++
++        // The reprojection count (patch 0008): two words the direct pass adds to, their zero
++        // source, and a readback slot per ring position.
++        const RenderBufferFlags statsFlags = RenderBufferFlag::FORMATTED | RenderBufferFlag::UNORDERED_ACCESS;
++        statsBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(16, statsFlags));
++        statsBufferView = statsBuffer->createBufferFormattedView(RenderFormat::R32_UINT);
++        statsZeroBuffer = device->createBuffer(RenderBufferDesc::UploadBuffer(16));
++        {
++            void *zero = statsZeroBuffer->map();
++            std::memset(zero, 0, 16);
++            statsZeroBuffer->unmap();
++        }
++        for (uint32_t i = 0; i < RingDepth; i++) {
++            statsReadback[i] = device->createBuffer(RenderBufferDesc::ReadbackBuffer(16));
++            statsWritten[i] = false;
++        }
+         lumaAverageTexture = makeStorage(device, 1, 1, RenderFormat::R32_FLOAT);
+         downscaledOutputTexture = makeStorage(device, std::max(width / 8, 1u), std::max(height / 8, 1u), RenderFormat::R32G32B32A32_FLOAT);
+         upscaledOutputTexture = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::RENDER_TARGET);
+@@ -496,6 +753,13 @@ namespace RT64 {
+             lumaSetSet = std::make_unique<HistogramSetDescriptorSet>(device);
+             postProcessSet = std::make_unique<PostProcessDescriptorSet>(shaderLibrary->samplerLibrary, device);
+             postProcessAddSet = std::make_unique<PostProcessDescriptorSet>(shaderLibrary->samplerLibrary, device);   // patch 0007
++            depthResolveSet = std::make_unique<RtDepthResolveDescriptorSet>(device);                                   // patch 0008
++            filterSets[0] = std::make_unique<RtFilterDescriptorSet>(device);                                          // patch 0008
++            filterSets[1] = std::make_unique<RtFilterDescriptorSet>(device);
++            temporalSet = std::make_unique<RtTemporalDescriptorSet>(device);                                          // patch 0008
++            bounceFilterSets[0] = std::make_unique<RtFilterDescriptorSet>(device);                                    // the bounce's own (14:50)
++            bounceFilterSets[1] = std::make_unique<RtFilterDescriptorSet>(device);
++            bounceTemporalSet = std::make_unique<RtTemporalDescriptorSet>(device);
+             setsCreated = true;
+         }
+ 
+@@ -514,7 +778,7 @@ namespace RT64 {
+         composeSet->setTexture(composeSet->gReflection, reflectionTexture.get(), RenderTextureLayout::SHADER_READ);
+         composeSet->setTexture(composeSet->gRefraction, refractionTexture.get(), RenderTextureLayout::SHADER_READ);
+         composeSet->setTexture(composeSet->gTransparent, transparentTexture.get(), RenderTextureLayout::SHADER_READ);
+-        composeSet->setTexture(composeSet->gScatter, scatterTexture.get(), RenderTextureLayout::SHADER_READ);   // patch 0007
++        composeSet->setTexture(composeSet->gScatter, scatterTexture[swapBuffers ? 1 : 0].get(), RenderTextureLayout::SHADER_READ);   // patch 0007, the pair since 0008
+ 
+         // The filter alternates between the two filtered slots: set 0 reads the first and writes
+         // the second, set 1 the other way, which is the order the renderer's loop and its
+@@ -566,6 +830,21 @@ namespace RT64 {
+         rtParams.maxLights = uint32_t(std::max(rtConfig.maxLights, 0));
+         rtParams.level = uint32_t(std::max(rtConfig.level, 0));                       // patch 0006
+         rtParams.occlusionSamples = uint32_t(std::max(rtConfig.occlusionSamples, 0));  // patch 0006
++        // The lighting controls (patch 0008), packed four to a word group as the parameter block
++        // names them.
++        rtParams.tuneOcclusion = hlslpp::float4(rtConfig.occlusionStrength, rtConfig.occlusionRadius, rtConfig.shadowStrength, rtConfig.lightStrength);
++        rtParams.tuneBounce = hlslpp::float4(rtConfig.bounceStrength, rtConfig.bounceRange, std::max(rtConfig.glowSize, 0.0f), 0.0f);   // z the Glow size row (2026-09-24)
++        rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, 0.0f, 0.0f);
++        rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
++        rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
++        // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
++        // lit pixel takes, a moving surface twice that (2026-09-24).
++        // w the Indoor light row: the share of a sunless room's ambient that becomes a sun of
++        // our own, overhead, casting real shadows (2026-09-24).
++        rtParams.tuneExperiment = hlslpp::float4(float(std::max(rtConfig.experiment, 0)), std::max(rtConfig.darkness, 0.0f),
++                                                 float(std::max(rtConfig.shadowRays, 1)),
++                                                 std::max(std::min(rtConfig.indoorLight, 1.0f), 0.0f));
++        filterSteps = std::max(0, std::min(rtConfig.filterSteps, 2));
+         rtParams.motionBlurStrength = rtConfig.motionBlurStrength;
+         rtParams.motionBlurSamples = uint32_t(std::max(rtConfig.motionBlurSamples, 0));
+         rtParams.visualizationMode = rtConfig.visualizationMode;
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index eab299f..1300233 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -69,6 +69,33 @@ namespace RT64 {
+         // occlusion and the local lights, 3 the rest. The occlusion's rays per pixel per frame.
+         int level = 1;
+         int occlusionSamples = 4;
++
++        // The lighting controls (patch 0008, the user's sub menu of 2026-09-24): every value the
++        // passes used to carry as a constant, so each can be switched off, scaled and reached
++        // from the program's settings while the picture is on screen. The defaults are the
++        // design's values (lighting-design.md). Ranges are in the game's world units.
++        float shadowStrength = 1.0f;         // 0 leaves the sun's shadow untraced
++        float shadowSoftness = 1.0f;         // a scale on the sun's angular radius
++        float occlusionStrength = 0.7f;      // 0 off
++        float occlusionRadius = 40.0f;
++        float lightStrength = 1.0f;          // 0 leaves the local lights untraced
++        float lightReach = 1.0f;             // a scale on the game's own light radius
++        float bounceStrength = 0.25f;        // 0 off
++        float bounceRange = 3000.0f;
++        float reflectionStrength = 0.5f;     // 0 off
++        float reflectionRangeScale = 1.0f;   // a scale on twice the far plane
++        float lightGlow = 0.0002f;           // per world unit at a light's center; 0 off (ten times fainter since 2026-09-24)
++        float glowSize = 0.5f;               // the glow's radius as a scale on the game's own light radius, apart from the reach (2026-09-24)
++        float sunHaze = 0.0f;                // per world unit of sunlit air; 0 off
++        float hazeRange = 1400.0f;           // where the air's light is gone
++        float fogFade = 1.0f;                // 1: the lighting fades with the game's own fog
++        float distanceFade = 0.0f;           // 0 off, else the fraction of the far plane where the lighting is gone
++        float historyBlend = 0.12f;          // the new frame's share; 1 is no history
++        int filterSteps = 2;                 // 0 off, 1 or 2 a trous steps
++        int experiment = 0;                  // the lighting menu's Experiment row: 0 off, else a variant of a disputed sum
++        float darkness = 0.0f;               // the Darkness row (2026-09-24): how much of the game's own ambient is taken away where no traced light falls; 0 off
++        int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
++        float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+         float motionBlurStrength = 0.0f;
+         interop::VisualizationMode visualizationMode = interop::VisualizationMode::Final;
+@@ -82,6 +109,26 @@ namespace RT64 {
+         bool denoiserEnabled = false;
+     };
+ 
++    // The scene's sun and ambient as the game itself holds them (patch 0008): the environment's
++    // live light settings, published by the program each frame beside the point lights. When
++    // valid, the traced scene takes these rather than searching the RSP light state, whose
++    // strongest directional light could be a point light's per actor stand-in (Navi's, swinging
++    // the whole scene's sun as she flew).
++    struct RaytracingEnvironment {
++        hlslpp::float3 sunDirection = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        hlslpp::float3 sunColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        hlslpp::float3 ambientColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        // Whether this place has a sun, which is the game's own light mode: outdoors it follows
++        // the time of day, indoors it holds a fixed setting whose directional light is the room's
++        // fill. The renderer used to sniff this out of the draw list and the answer was wrong in
++        // both directions (see rt64_framebuffer_renderer.cpp).
++        bool sunShadows = false;
++        // Whether that answer could be read at all. False leaves the sniff in charge, so nothing
++        // is worse than it was before this was published.
++        bool sunShadowsKnown = false;
++        bool valid = false;
++    };
++
+     // One traced projection of one framebuffer pair: the instances that went into it, the
+     // matrices, the viewport, the lights the game set, and the rasterized scenes interleaved
+     // with it (drawn to their own targets and composited by the traced pass).
+@@ -113,6 +160,13 @@ namespace RT64 {
+         // directional light is a fill the game invents; it stays in the passes' arithmetic as
+         // the game's own lighting but shadows nothing.
+         bool sunShadows = false;
++
++        // How the rasterizer maps a clip depth into the depth image (patch 0008): the RSP
++        // viewport's z scale and translate for the traced projection, so the primary ray can
++        // put its hit's depth beside the game's own (RSPProcessCS: z over w times the scale,
++        // plus the translate).
++        float depthScale = 1.0f;
++        float depthTranslate = 0.0f;
+     };
+ 
+     struct RaytracingResources {
+@@ -179,8 +233,52 @@ namespace RT64 {
+         // The volumetric pass's in-scattered light (patch 0007), and the composite's second
+         // output: the light added to the frame (reflections, scatter) that a factor cannot carry,
+         // drawn onto the color target by a second post process draw with an additive blend.
+-        std::unique_ptr<RenderTexture> scatterTexture;
++        std::unique_ptr<RenderTexture> scatterTexture[2];   // a pair since patch 0008, for its history
+         std::unique_ptr<RenderTexture> additiveTexture;
++
++        // The reprojection count (patch 0008): the direct pass adds, on a sample of pixels, how
++        // many took their history and how many were traced; cleared before the dispatch, copied
++        // to a readback slot after it, read when the slot comes round, printed with the trace.
++        std::unique_ptr<RenderBuffer> statsBuffer;
++        std::unique_ptr<RenderBufferFormattedView> statsBufferView;
++        std::unique_ptr<RenderBuffer> statsZeroBuffer;
++        void statsClear(RenderWorker *worker);
++        void statsCopy(RenderWorker *worker);
++
++        // The game's own rasterized depth, one sample per pixel (patch 0008): resolved from the
++        // pair's depth target before the primary rays, which drop a hit the raster does not show
++        // at that pixel (the cut-out part of an alpha-tested quad). Invalid when the pair has no
++        // depth target; the flag reaches the shaders through the parameter block a frame later.
++        std::unique_ptr<RenderTexture> rasterDepthTexture;
++        std::unique_ptr<RtDepthResolveDescriptorSet> depthResolveSet;
++        bool rasterDepthValid = false;
++        void resolveRasterDepth(RenderWorker *worker, RenderTarget *depthTarget, const ShaderLibrary *shaderLibrary);
++
++        // The direct light's spatial filter (patch 0008, RtFilterCS.hlsl): two a trous steps over
++        // the copy of the factor the compose reads, the first slot to the second and back, so the
++        // compose still reads the second. One set per step.
++        std::unique_ptr<RtFilterDescriptorSet> filterSets[2];
++        int filterSteps = 2;   // from the configuration: 0 leaves the raw factor, 1 or 2 steps
++        void filterDirectLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary);
++        // The same steps over any pair of slots: the input in ping[1], the result left in ping[1].
++        void filterLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary, RtFilterDescriptorSet *const sets[2], RenderTexture *const ping[2]);
++        // THE BOUNCE KEEPS A HISTORY AND IS FILTERED TOO (14:50). One ray a frame with nothing
++        // after it was most of the grain and the paint in shadow, where the bounce is the whole
++        // shade (the user: "the bounce range has a HUGE effect on graininess and painting"). Runs
++        // between the bounce dispatch and the direct pass that reads it, in place.
++        std::unique_ptr<RtFilterDescriptorSet> bounceFilterSets[2];
++        std::unique_ptr<RtTemporalDescriptorSet> bounceTemporalSet;
++        void temporalAndFilterBounce(RenderWorker *worker, const ShaderLibrary *shaderLibrary);
++
++        // The history with temporal clamping (patch 0008, RtTemporalCS.hlsl): the direct pass's
++        // raw factor and the previous frame's accumulation in, the accumulation for this frame
++        // out, back into the direct light slot the next frame reads as its previous.
++        std::unique_ptr<RtTemporalDescriptorSet> temporalSet;
++        void temporalDirectLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary);
++        // The step itself over any raw, previous and scratch: the accumulation is copied back
++        // into raw, which the next frame reads as its previous. countStats: whether this run
++        // adds to the reprojection count the trace prints (the direct light's does).
++        void temporalLight(RenderWorker *worker, const ShaderLibrary *shaderLibrary, RtTemporalDescriptorSet *set, RenderTexture *raw, RenderTexture *previous, RenderTexture *scratch, bool countStats);
+         std::unique_ptr<RenderTexture> downscaledOutputTexture;
+         std::unique_ptr<RenderTexture> lumaAverageTexture;
+         std::unique_ptr<RenderTexture> upscaledOutputTexture;
+@@ -350,7 +448,22 @@ namespace RT64 {
+         uint32_t spanFrames[uint32_t(Span::Count)] = {};
+         void timerResolve();
+ 
++        // The reprojection count's readback slots (patch 0008) and the sums the trace prints.
++        std::unique_ptr<RenderBuffer> statsReadback[RingDepth];
++        bool statsWritten[RingDepth] = {};
++        uint64_t reprojectedAccepted = 0;
++        uint64_t reprojectedTraced = 0;
++        void statsResolve();
++
+         std::unique_ptr<RenderBuffer> &ringSlot(std::unique_ptr<RenderBuffer> *ring, uint64_t *sizes, uint64_t size, RenderBufferFlags flags);
+         void traceBuild();
++
++        // The frame's state flags (patch 0008), traced on the frame they change: whether the sun
++        // casts shadows (the sky gate), whether the history was kept or cut, whether the game's
++        // depth was there to compare. A one frame flip of any of them is a flash on screen (the
++        // user's report of a flash of light on the ground as the pause menu closes).
++        uint32_t stateFrame = 0;
++        uint32_t lastStateKey = 0xFFFFFFFFu;
++        void traceState();
+     };
+ };
+diff --git a/src/render/rt64_raytracing_shader_cache.cpp b/src/render/rt64_raytracing_shader_cache.cpp
+index b5798c6..a9780ed 100644
+--- a/src/render/rt64_raytracing_shader_cache.cpp
++++ b/src/render/rt64_raytracing_shader_cache.cpp
+@@ -26,6 +26,10 @@ namespace RT64 {
+         return setupDone;
+     }
+ 
++    bool RaytracingShaderCache::isUsable() const {
++        return setupDone && !setupFailed;
++    }
++
+     void RaytracingShaderCache::setup() {
+         if (setupDone) {
+             return;
+@@ -85,15 +89,27 @@ namespace RT64 {
+         pipelineDesc.hitGroups = hitGroups;
+         pipelineDesc.hitGroupsCount = uint32_t(std::size(hitGroups));
+         pipelineDesc.pipelineLayout = pipelineLayout.get();
+-        // SurfacePayload in Raytracing.hlsl is five floats; rounded up so a later pass can grow it
+-        // without a layout change.
+-        pipelineDesc.maxPayloadSize = 32;
++        // SurfacePayload in Raytracing.hlsl is nine 32 bit values, 36 bytes, since patch 0008 added
++        // the hit velocity. THE MAXIMUM MUST COVER IT: with 32 declared for that payload,
++        // CreateStateObject refused the pipeline (0x80070057) and the program crashed at the
++        // first frame (2026-09-24). 48 leaves three values of room.
++        pipelineDesc.maxPayloadSize = 48;
+         pipelineDesc.maxAttributeSize = 2 * sizeof(float);
+         pipelineDesc.maxRecursionDepth = 1;
+         pipelineDesc.stateUpdateEnabled = false;
+ 
+         RaytracingState &state = states[0];
+         state.pipeline = device->createRaytracingPipeline(pipelineDesc);
++        // A pipeline the device refused has no programs to look up, and the binding table built
++        // from it read past the end of an empty map (the startup crash of 2026-09-24). The
++        // traced lighting stays off for the run instead, and the log says so.
++        if ((state.pipeline == nullptr) || !state.pipeline->isValid()) {
++            std::fprintf(stderr, "[rt] pipeline failed to build; the traced lighting stays off for this run\n");
++            setupFailed = true;
++            setupDone = true;
++            return;
++        }
++
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Primary)] = state.pipeline->getProgram("PrimaryRayGen");
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Direct)] = state.pipeline->getProgram("DirectRayGen");
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Indirect)] = state.pipeline->getProgram("IndirectRayGen");
+diff --git a/src/render/rt64_raytracing_shader_cache.h b/src/render/rt64_raytracing_shader_cache.h
+index 1623316..31e5fc2 100644
+--- a/src/render/rt64_raytracing_shader_cache.h
++++ b/src/render/rt64_raytracing_shader_cache.h
+@@ -92,6 +92,11 @@ namespace RT64 {
+         bool isSetup() const;
+         void setup();
+ 
++        // True once setup() has run AND the pipeline built. The workload queue traces only while
++        // this holds: a pipeline the device refused (a payload past the declared maximum, an
++        // export the library lacks) is a run without the traced lighting, never a crash.
++        bool isUsable() const;
++
+         // A traced draw call's shader description, so a specialized hit group can be built for
+         // it later. Nothing is built from it yet.
+         void submit(const ShaderDescription &shaderDesc);
+@@ -101,6 +106,7 @@ namespace RT64 {
+ 
+     private:
+         bool setupDone = false;
++        bool setupFailed = false;
+         int32_t activeState = 0;
+     };
+ };
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index 9e1cf26..c98f467 100644
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -30,6 +30,11 @@
+ #include "shaders/RSPSmoothNormalCS.hlsl.spirv.h"
+ #include "shaders/RSPVertexTestZCS.hlsl.spirv.h"
+ #include "shaders/RSPVertexTestZCSMS.hlsl.spirv.h"
++#include "shaders/RtDepthResolveCS.hlsl.spirv.h"
++#include "shaders/RtDepthResolveCSMS.hlsl.spirv.h"
++#include "shaders/RtFilterCS1.hlsl.spirv.h"
++#include "shaders/RtFilterCS2.hlsl.spirv.h"
++#include "shaders/RtTemporalCS.hlsl.spirv.h"
+ #include "shaders/RSPWorldCS.hlsl.spirv.h"
+ #include "shaders/RtCopyColorToDepthPS.hlsl.spirv.h"
+ #include "shaders/RtCopyColorToDepth2XPS.hlsl.spirv.h"
+@@ -76,6 +81,11 @@
+ #   include "shaders/RSPSmoothNormalCS.hlsl.dxil.h"
+ #   include "shaders/RSPVertexTestZCS.hlsl.dxil.h"
+ #   include "shaders/RSPVertexTestZCSMS.hlsl.dxil.h"
++#   include "shaders/RtDepthResolveCS.hlsl.dxil.h"
++#   include "shaders/RtDepthResolveCSMS.hlsl.dxil.h"
++#   include "shaders/RtFilterCS1.hlsl.dxil.h"
++#   include "shaders/RtFilterCS2.hlsl.dxil.h"
++#   include "shaders/RtTemporalCS.hlsl.dxil.h"
+ #   include "shaders/RSPWorldCS.hlsl.dxil.h"
+ #   include "shaders/RtCopyColorToDepthPS.hlsl.dxil.h"
+ #   include "shaders/RtCopyColorToDepth2XPS.hlsl.dxil.h"
+@@ -121,6 +131,11 @@
+ #   include "shaders/RSPSmoothNormalCS.hlsl.metal.h"
+ #   include "shaders/RSPVertexTestZCS.hlsl.metal.h"
+ #   include "shaders/RSPVertexTestZCSMS.hlsl.metal.h"
++#   include "shaders/RtDepthResolveCS.hlsl.metal.h"
++#   include "shaders/RtDepthResolveCSMS.hlsl.metal.h"
++#   include "shaders/RtFilterCS1.hlsl.metal.h"
++#   include "shaders/RtFilterCS2.hlsl.metal.h"
++#   include "shaders/RtTemporalCS.hlsl.metal.h"
+ #   include "shaders/RSPWorldCS.hlsl.metal.h"
+ #   include "shaders/RtCopyColorToDepthPS.hlsl.metal.h"
+ #   include "shaders/RtCopyColorToDepth2XPS.hlsl.metal.h"
+@@ -923,6 +938,50 @@ namespace RT64 {
+             rspVertexTestZMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rspVertexTestZMS.pipelineLayout.get(), computeShaderMS.get(), 1, 1, 1));
+         }
+ 
++        // The traced passes' rasterized depth (patch 0008), plain and multisampled.
++        {
++            RtDepthResolveDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            rtDepthResolve.pipelineLayout = layoutBuilder.create(device);
++            rtDepthResolveMS.pipelineLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RtDepthResolveCSBlobDXIL, RtDepthResolveCSBlobSPIRV, RtDepthResolveCSBlobMSL, "CSMain", shaderFormat));
++            rtDepthResolve.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtDepthResolve.pipelineLayout.get(), computeShader.get(), 8, 8, 1));
++
++            std::unique_ptr<RenderShader> computeShaderMS = device->createShader(CREATE_SHADER_INPUTS(RtDepthResolveCSMSBlobDXIL, RtDepthResolveCSMSBlobSPIRV, RtDepthResolveCSMSBlobMSL, "CSMain", shaderFormat));
++            rtDepthResolveMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtDepthResolveMS.pipelineLayout.get(), computeShaderMS.get(), 8, 8, 1));
++        }
++
++        // The direct light's spatial filter (patch 0008), steps 1 and 2.
++        {
++            RtFilterDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            rtFilter1.pipelineLayout = layoutBuilder.create(device);
++            rtFilter2.pipelineLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> filterShader1 = device->createShader(CREATE_SHADER_INPUTS(RtFilterCS1BlobDXIL, RtFilterCS1BlobSPIRV, RtFilterCS1BlobMSL, "CSMain", shaderFormat));
++            rtFilter1.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtFilter1.pipelineLayout.get(), filterShader1.get(), 8, 8, 1));
++
++            std::unique_ptr<RenderShader> filterShader2 = device->createShader(CREATE_SHADER_INPUTS(RtFilterCS2BlobDXIL, RtFilterCS2BlobSPIRV, RtFilterCS2BlobMSL, "CSMain", shaderFormat));
++            rtFilter2.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtFilter2.pipelineLayout.get(), filterShader2.get(), 8, 8, 1));
++        }
++
++        // The direct light's history with temporal clamping (patch 0008).
++        {
++            RtTemporalDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            rtTemporal.pipelineLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> temporalShader = device->createShader(CREATE_SHADER_INPUTS(RtTemporalCSBlobDXIL, RtTemporalCSBlobSPIRV, RtTemporalCSBlobMSL, "CSMain", shaderFormat));
++            rtTemporal.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtTemporal.pipelineLayout.get(), temporalShader.get(), 8, 8, 1));
++        }
++
+         // Texture Resolve.
+         if (TextureResolvePSBlob != nullptr) {
+             TextureCopyDescriptorSet descriptorSet;
+diff --git a/src/render/rt64_shader_library.h b/src/render/rt64_shader_library.h
+index edc0a8f..b27f915 100644
+--- a/src/render/rt64_shader_library.h
++++ b/src/render/rt64_shader_library.h
+@@ -47,6 +47,11 @@ namespace RT64 {
+         ShaderRecord rspSmoothNormal;
+         ShaderRecord rspVertexTestZ;
+         ShaderRecord rspVertexTestZMS;
++        ShaderRecord rtDepthResolve;     // patch 0008: the rasterized depth to one sample, for the traced passes
++        ShaderRecord rtDepthResolveMS;
++        ShaderRecord rtFilter1;          // patch 0008: the direct light's spatial filter, steps 1 and 2
++        ShaderRecord rtFilter2;
++        ShaderRecord rtTemporal;         // patch 0008: the direct light's history with temporal clamping
+         ShaderRecord rspWorld;
+         ShaderRecord rtCopyColorToDepth;
+         ShaderRecord rtCopyDepthToColor;
+diff --git a/src/render/rt64_vertex_processor.cpp b/src/render/rt64_vertex_processor.cpp
+index ee48dad..bb7b1e3 100644
+--- a/src/render/rt64_vertex_processor.cpp
++++ b/src/render/rt64_vertex_processor.cpp
+@@ -30,6 +30,9 @@ namespace RT64 {
+         descriptorSet->setBuffer(descriptorSet->srcVel, p.drawBuffers->velocityBuffer.get(), p.drawBuffers->velocityBuffer.getView(0));
+         descriptorSet->setBuffer(descriptorSet->srcNorm, p.drawBuffers->normalColorBuffer.get(), p.drawBuffers->normalColorBuffer.getView(1));
+         descriptorSet->setBuffer(descriptorSet->srcIndices, p.drawBuffers->worldIndicesBuffer.get(), p.drawBuffers->worldIndicesBuffer.getView(0));
++        // Whether each vertex was lit at all (patch 0008): zero lights means the normal bytes are
++        // the vertex color and must not become a world normal. See RSPWorldCS.hlsl.
++        descriptorSet->setBuffer(descriptorSet->srcLightCounts, p.drawBuffers->lightCountsBuffer.get(), p.drawBuffers->lightCountsBuffer.getView(0));
+         descriptorSet->setBuffer(descriptorSet->worldMats, p.drawBuffers->worldTransformsBuffer.get(), RenderBufferStructuredView(sizeof(interop::float4x4)));
+         descriptorSet->setBuffer(descriptorSet->invTWorldMats, p.drawBuffers->invTWorldTransformsBuffer.get(), RenderBufferStructuredView(sizeof(interop::float4x4)));
+         descriptorSet->setBuffer(descriptorSet->prevWorldMats, p.drawBuffers->prevWorldTransformsBuffer.get(), RenderBufferStructuredView(sizeof(interop::float4x4)));
+diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
+index b4ff4e9..d82fc0d 100644
+--- a/src/render/rt64_vi_renderer.cpp
++++ b/src/render/rt64_vi_renderer.cpp
+@@ -69,7 +69,7 @@ namespace RT64 {
+ 
+         RenderViewport viewport;
+         RenderRect scissor;
+-        getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, p.removeBlackBorders, viewport, scissor);
++        getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, p.removeBlackBorders, viewport, scissor, p.insetLeft, p.insetRight);
+         p.commandList->setViewports(viewport);
+         p.commandList->setScissors(scissor);
+ 
+@@ -86,7 +86,7 @@ namespace RT64 {
+         p.commandList->drawInstanced(3, 1, 0, 0);
+     }
+ 
+-    void VIRenderer::getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor) {
++    void VIRenderer::getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor, uint32_t insetLeft, uint32_t insetRight) {
+         // We define three different coordinate spaces to work with to translate the VI parameters into the Window.
+         //
+         // VideoSD: This corresponds to the SD TV Scanline space, which is what the VI natively works on.
+@@ -121,5 +121,23 @@ namespace RT64 {
+ 
+         viewport = RenderViewport(topLeftViewport.x, topLeftViewport.y, bottomRightViewport.x - topLeftViewport.x, bottomRightViewport.y - topLeftViewport.y);
+         scissor = RenderRect(lround(topLeftScissor.x), lround(topLeftScissor.y), lround(bottomRightScissor.x), lround(bottomRightScissor.y));
++
++        // THE PICTURE BESIDE A PANEL (OoT: Recompiled, patch 0008). The interface can stand a panel
++        // against one edge of the window and asks for the picture to move out from under it: the
++        // whole window sized picture is scaled down uniformly to the width left, so it keeps its
++        // ratio and everything it held, and is stood in that space, centered in what remains of
++        // the height. The viewport and the scissor move together.
++        const uint32_t insets = insetLeft + insetRight;
++        const float windowW = float(windowSize.x);
++        const float windowH = float(windowSize.y);
++        if ((insets > 0) && (float(insets) < windowW)) {
++            const float availableWidth = windowW - float(insets);
++            const float scale = (availableWidth < windowW) ? (availableWidth / windowW) : 1.0f;
++            const float offsetX = float(insetLeft) + (availableWidth - windowW * scale) * 0.5f;
++            const float offsetY = (windowH - windowH * scale) * 0.5f;
++            viewport = RenderViewport(offsetX + viewport.x * scale, offsetY + viewport.y * scale, viewport.width * scale, viewport.height * scale);
++            scissor = RenderRect(lround(offsetX + float(scissor.left) * scale), lround(offsetY + float(scissor.top) * scale),
++                                 lround(offsetX + float(scissor.right) * scale), lround(offsetY + float(scissor.bottom) * scale));
++        }
+     }
+ };
+\ No newline at end of file
+diff --git a/src/render/rt64_vi_renderer.h b/src/render/rt64_vi_renderer.h
+index 8a3782a..875a7ef 100644
+--- a/src/render/rt64_vi_renderer.h
++++ b/src/render/rt64_vi_renderer.h
+@@ -29,11 +29,13 @@ namespace RT64 {
+             UserConfiguration::Filtering filtering = UserConfiguration::Filtering::Linear;
+             const VI *vi = nullptr;
+             bool removeBlackBorders = false;
++            uint32_t insetLeft = 0;    // patch 0008: pixels of the window held by the interface at the left
++            uint32_t insetRight = 0;   // and at the right; the picture is scaled into what is left
+         };
+ 
+         VIRenderer();
+         ~VIRenderer();
+         void render(const RenderParams &p);
+-        static void getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor);
++        static void getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor, uint32_t insetLeft = 0, uint32_t insetRight = 0);
+     };
+ };
+\ No newline at end of file
+diff --git a/src/shaders/ComposePS.hlsl b/src/shaders/ComposePS.hlsl
+index 369b2f2..7333739 100644
+--- a/src/shaders/ComposePS.hlsl
++++ b/src/shaders/ComposePS.hlsl
+@@ -25,8 +25,17 @@ Texture2D<float4> gScatter : register(t8);   // patch 0007
+ // keeps its color.
+ //
+ // Patch 0007 adds the second output: the light ADDED to the frame, which a factor cannot carry
+-// (the reflections on water, the air catching light), in sRGB since the frame is, drawn onto
+-// the color target by a second post process draw with an additive blend.
++// (the reflections on water, the air catching light), drawn onto the color target by a second
++// post process draw with an additive blend.
++//
++// Patch 0008: the addition is made in LINEAR light. The frame is sRGB, and the blend adds in
++// sRGB, so what this writes is the sRGB DIFFERENCE: the pixel with the light added, encoded,
++// less the pixel as the factor pass left it, encoded. The first version encoded the added light
++// on its own and let the blend add that: a small amount of linear light encodes to a large sRGB
++// value (a tenth of the range encodes to a third), so every reflection and every trace of haze
++// landed on the frame several times too strong. That was the water reading white, the far
++// haze a hard bright line along the horizon, and a stream at a glancing angle a white band
++// through the scene (the user's reports of 2026-09-24).
+ struct ComposeOutput {
+     float4 factor : SV_Target0;
+     float4 added : SV_Target1;
+@@ -35,16 +44,31 @@ struct ComposeOutput {
+ ComposeOutput PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) {
+     ComposeOutput output;
+     float4 diffuse = gDiffuse.SampleLevel(gSampler, uv, 0);
++    float3 factor = float3(1.0f, 1.0f, 1.0f);
+     if (diffuse.a > EPSILON) {
+-        float3 directLight = gDirectLight.SampleLevel(gSampler, uv, 0).rgb;
+-        output.factor = float4(saturate(directLight), 1.0f);
+-    }
+-    else {
+-        output.factor = float4(1.0f, 1.0f, 1.0f, 1.0f);
++        // Above one where a local light lands (2026-09-24), bounded by the direct pass.
++        factor = max(gDirectLight.SampleLevel(gSampler, uv, 0).rgb, 0.0f);
+     }
+ 
++    // THE FACTOR RELIGHTS THE UNFOGGED PART OF THE PIXEL ONLY (2026-09-24). The frame's pixel is
++    // lerp(texture * shade, fogColor, fog) in the game's own numbers; the direct pass writes the
++    // fog's share, fog * fogColor, into the refraction slot, and the factor applies to the rest.
++    // A shadow then darkens what the fog left of the surface and never the fog itself, and a
++    // local light on a fogged wall brightens the wall and not the haze in front of it.
++    const float3 raster = LinearToSrgb(saturate(diffuse.rgb));
++    const float3 fogPart = gRefraction.SampleLevel(gSampler, uv, 0).rgb;
++    const float3 unfogged = max(raster - fogPart, 0.0f);
++    const float3 baseSrgb = saturate(raster + unfogged * (factor - 1.0f));
++    // What the post process multiplies the encoded frame by, to land on baseSrgb.
++    float3 applied;
++    applied.x = (raster.x > EPSILON) ? (baseSrgb.x / raster.x) : 1.0f;
++    applied.y = (raster.y > EPSILON) ? (baseSrgb.y / raster.y) : 1.0f;
++    applied.z = (raster.z > EPSILON) ? (baseSrgb.z / raster.z) : 1.0f;
++    output.factor = float4(applied, 1.0f);
++    const float3 baseLinear = SrgbToLinear(baseSrgb);
+     const float3 reflection = gReflection.SampleLevel(gSampler, uv, 0).rgb;
+     const float3 scatter = gScatter.SampleLevel(gSampler, uv, 0).rgb;
+-    output.added = float4(LinearToSrgb(saturate(reflection + scatter)), 1.0f);
++    const float3 litSrgb = LinearToSrgb(saturate(baseLinear + reflection + scatter));
++    output.added = float4(max(litSrgb - baseSrgb, 0.0f), 1.0f);
+     return output;
+ }
+diff --git a/src/shaders/DebugPS.hlsl b/src/shaders/DebugPS.hlsl
+index 9020138..7700fd7 100644
+--- a/src/shaders/DebugPS.hlsl
++++ b/src/shaders/DebugPS.hlsl
+@@ -72,12 +72,52 @@ float4 getInstanceId(float2 pos) {
+     }
+ }
+ 
++// A factor above one is light ADDED to a surface (a local light on ground the game lit in full)
++// and a gray view saturates at white and hides it (the user, 2026-09-24, judged Navi's light
++// as touching only the shadows); it shows warm instead, white to orange over the next unit.
++float4 factorView(float3 factor) {
++    const float over = max(max(factor.r, factor.g), factor.b) - 1.0f;
++    if (over > 0.0f) {
++        return float4(lerp(float3(1.0f, 1.0f, 1.0f), float3(1.0f, 0.55f, 0.1f), saturate(over)), 1.0f);
++    }
++    return float4(LinearToSrgb(saturate(factor)), 1.0f);
++}
++
+ float4 getDirectLightRaw(float2 pos) {
+-    return float4(LinearToSrgb(gDirectLightAccum[pos].rgb), 1.0f);
++    return factorView(gDirectLightAccum[pos].rgb);
+ }
+ 
+ float4 getDirectLightFiltered(float2 pos) {
+-    return float4(LinearToSrgb(gFilteredDirectLight[pos].rgb), 1.0f);
++    return factorView(gFilteredDirectLight[pos].rgb);
++}
++
++// How many presented frames of history the pixel holds (RtTemporalCS, the factor's spare
++// channel): red for this frame alone, yellow near eight, green from thirty two on.
++float4 getHistory(float2 pos) {
++    const float age = gFilteredDirectLight[pos].a;
++    const float3 color = (age < 8.0f) ? lerp(float3(1.0f, 0.1f, 0.1f), float3(1.0f, 0.9f, 0.1f), saturate((age - 1.0f) / 7.0f))
++                                       : lerp(float3(1.0f, 0.9f, 0.1f), float3(0.1f, 0.8f, 0.2f), saturate((age - 8.0f) / 24.0f));
++    return float4(color, 1.0f);
++}
++
++// What the primary ray made of each pixel (2026-09-24, the seam under Z targeting): green where
++// a hit stands, as bright as its coverage; red where the raster depth compare dropped the hit,
++// brighter the further the two depths lay apart, and magenta where they lay very far apart (a
++// genuine cut-out, the sky behind a tree line); black where no ray hit anything.
++float4 getHits(float2 pos) {
++    const float4 position = gShadingPosition[pos];
++    const int instanceId = gInstanceId[pos];
++    if (instanceId >= 0) {
++        return float4(0.0f, 0.25f + 0.75f * saturate(position.w), 0.0f, 1.0f);
++    }
++    if (position.w < 0.0f) {
++        const float apart = position.x - position.y;
++        if (apart > 0.05f) {
++            return float4(1.0f, 0.0f, 1.0f, 1.0f);
++        }
++        return float4(0.35f + 0.65f * saturate(apart / 0.01f), 0.0f, 0.0f, 1.0f);
++    }
++    return float4(0.0f, 0.0f, 0.0f, 1.0f);
+ }
+ 
+ float4 getIndirectLightRaw(float2 pos) {
+@@ -170,6 +210,10 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
+         return getLocalLight(uv * RtParams.resolution.xy);
+     case VisualizationMode::Scatter:
+         return getScatter(uv * RtParams.resolution.xy);
++    case VisualizationMode::History:
++        return getHistory(uv * RtParams.resolution.xy);
++    case VisualizationMode::Hits:
++        return getHits(uv * RtParams.resolution.xy);
+     default:
+         return float4(0.5f, 0.5f, 0.5f, 1.0f);
+     }
+diff --git a/src/shaders/FbRendererRT.hlsli b/src/shaders/FbRendererRT.hlsli
+index 0d77559..3738ef9 100644
+--- a/src/shaders/FbRendererRT.hlsli
++++ b/src/shaders/FbRendererRT.hlsli
+@@ -57,6 +57,9 @@ Texture2D<float4> gBlueNoise : register(t67, space0);
+ RWTexture2D<float> gOcclusion : register(u68, space0);      // patch 0006
+ RWTexture2D<float4> gLocalLight : register(u69, space0);    // patch 0006
+ RWTexture2D<float4> gScatter : register(u70, space0);       // patch 0007
++RWTexture2D<float4> gPrevScatter : register(u71, space0);   // patch 0008
++RWBuffer<uint> gStats : register(u72, space0);              // patch 0008
++RWTexture2D<float> gRasterDepth : register(u73, space0);    // patch 0008
+ 
+ // Set 3 - Framebuffer.
+ Texture2D<float4> gBackgroundColor : register(t1, space3);
+\ No newline at end of file
+diff --git a/src/shaders/RSPWorldCS.hlsl b/src/shaders/RSPWorldCS.hlsl
+index 205dc4c..d567bb6 100644
+--- a/src/shaders/RSPWorldCS.hlsl
++++ b/src/shaders/RSPWorldCS.hlsl
+@@ -15,6 +15,17 @@ struct RSPWorldCB {
+ Buffer<float> srcPos : register(t1);
+ Buffer<float> srcVel : register(t2);
+ Buffer<int> srcNorm : register(t3);
++// HOW MANY LIGHTS THE VERTEX WAS LIT BY, and zero means the bytes above are NOT a normal (patch
++// 0008). The source buffer is the console's own: the same four bytes per vertex carry the normal
++// when the microcode's lighting is on and the vertex COLOR when it is off, which is why the
++// renderer calls it the normal color buffer. Read unconditionally as a normal, an unlit surface
++// gets a direction made out of its color, and every traced pass then shades it about a direction
++// that has nothing to do with its face: a whole floor reading one flat value in the occlusion,
++// bounded by its own polygon edge, unchanged by the occlusion radius (the user, 2026-09-25, the
++// Forest Temple's courtyard, proven in the Normals view: the ground green and the band beside it
++// orange). Zero here means the hit keeps the triangle's own face normal, which is the right
++// answer for a surface the game shaded by hand.
++Buffer<uint> srcLightCounts : register(t11);
+ Buffer<uint> srcIndices : register(t4);
+ StructuredBuffer<float4x4> worldMats : register(t5);
+ StructuredBuffer<float4x4> invTWorldMats : register(t6);
+@@ -35,7 +46,10 @@ void CSMain(uint vertexIndex : SV_DispatchThreadID) {
+     const uint normIndex = vertexOffsetIndex * 4;
+     const float3 pos = float3(srcPos[posIndex + 0], srcPos[posIndex + 1], srcPos[posIndex + 2]);
+     const float3 vel = float3(srcVel[posIndex + 0], srcVel[posIndex + 1], srcVel[posIndex + 2]);
+-    const float3 norm = float3(srcNorm[normIndex + 0], srcNorm[normIndex + 1], srcNorm[normIndex + 2]);
++    const uint lightCount = srcLightCounts[vertexOffsetIndex];
++    const float3 norm = (lightCount > 0)
++        ? float3(srcNorm[normIndex + 0], srcNorm[normIndex + 1], srcNorm[normIndex + 2])
++        : float3(0.0f, 0.0f, 0.0f);
+     const float4 worldPos = mul(worldMats[transformIndex], float4(pos - vel * (1.0f - gConstants.curFrameWeight), 1.0f));
+     const float4 worldNorm = all(norm == 0.0f) ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(normalize(mul(invTWorldMats[transformIndex], float4(norm, 0.0f)).xyz), 1.0f);
+     const float4 prevWorldPos = mul(prevWorldMats[transformIndex], float4(pos - vel * (1.0f - gConstants.prevFrameWeight), 1.0f));
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+index 39febab..b82b901 100644
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -26,6 +26,7 @@
+ #include "FbRendererCommon.hlsli"
+ #include "FbRendererRT.hlsli"
+ #include "BlueNoise.hlsli"
++#include "TextureSampler.hlsli"   // the alpha test at the hit (patch 0008)
+ 
+ // The instance masks the renderer assigns (rt64_common.h): the same three bits, by the same names.
+ static const uint DepthRayQueryMask = 0x1;
+@@ -33,11 +34,17 @@ static const uint NoDepthRayQueryMask = 0x2;
+ static const uint ShadowCatcherRayQueryMask = 0x4;
+ static const uint TranslucentRayQueryMask = 0x8;   // patch 0006: the XLU z mode, which only the water probe traces
+ 
++// How much nearer than the rasterized depth a primary hit may be before it counts as a cut-out
++// the raster did not draw (patch 0008), in the depth buffer's own units.
++static const float CutoutDepthSlack = 0.001f;
++
+ struct SurfacePayload {
+     float hitDistance;      // RayTCurrent() at the closest hit, 0 on a miss
+     int instanceId;         // InstanceID(), which is the frame's instance draw call index, -1 on a miss
+     float3 hitNormal;       // the triangle's geometric normal, facing the ray
+     float3 shadedColor;     // the game's own lit vertex color at the hit, interpolated (patch 0007)
++    float3 hitVelocity;     // how the hit moved since the previous presented frame, in world units (patch 0008): zero for the still world
++    float coverage;         // how much of the pixel the hit surface covers, 1 for a solid one (patch 0008): a cutout far away is a blend
+ };
+ 
+ struct ShadowPayload {
+@@ -45,6 +52,9 @@ struct ShadowPayload {
+     float hitDistance;      // where it was stopped, for the occlusion pass's falloff; 0 when it escaped
+ };
+ 
++// The alpha test at the hit (below the passes): how much of the pixel a surface covers.
++float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, bool primary);
++
+ // The eye, from the inverse view matrix. The parameter block is written by hlslpp on the CPU
+ // with row vectors, so its translation is the fourth row there; HLSL packs the same bytes as a
+ // column major matrix, which reads that row as the fourth column.
+@@ -52,10 +62,21 @@ float3 eyePosition() {
+     return float3(RtParams.viewI[0][3], RtParams.viewI[1][3], RtParams.viewI[2][3]);
+ }
+ 
+-// A pinhole ray for a pixel of the traced viewport. cameraU, cameraV and cameraW are the
+-// renderer's own (rt64_framebuffer_renderer.cpp, updateRaytracingScene): W points down the view
+-// for the focal distance, U and V span the half width and the half height of the view at that
+-// distance. U is scaled by the aspect ratio here because the renderer leaves it square.
++// The ray for a pixel of the traced viewport: THE RASTER'S OWN MAPPING RUN BACKWARD. The
++// raster puts a world point at ndc = clip.xy / clip.w through the view and projection matrices
++// (RSPProcessCS; viewportPixel and the primary pass's depth compare below use the same
++// RtParams.viewProj), so the ray for a pixel is a point at that ndc on the far side of the
++// frustum, back through the two inverses, and the direction from the eye to it.
++//
++// It was a pinhole before (rt64_framebuffer_renderer.cpp, updateRaytracingScene): the view
++// direction, the WORLD up vector, a right vector crossed from the two, and the field of view
++// read off the projection matrix. That agrees with the raster only while the camera has no
++// roll about its view axis. The interpolated view matrix (a rigid lerp between two game
++// frames' orientations that differ in yaw and pitch at once) carries a small roll on every
++// presented frame between them, so under a fast camera swing the rays were turned against the
++// picture, most at the edges, and the depth compare dropped whole sloping pieces where the
++// picture's point lay further than the ray's: the seam under Z targeting (the user,
++// 2026-09-24, some twelve recordings). cameraU, V and W remain for the pixel angle only.
+ bool primaryRay(uint2 launchIndex, out float3 origin, out float3 direction) {
+     const float2 viewportOrigin = RtParams.viewport.xy;
+     const float2 viewportSize = RtParams.viewport.zw;
+@@ -66,11 +87,18 @@ bool primaryRay(uint2 launchIndex, out float3 origin, out float3 direction) {
+         return false;
+     }
+ 
+-    float2 d = (pixel / viewportSize) * 2.0f - 1.0f;
+-    d.x *= viewportSize.x / viewportSize.y;
+-    d.y = -d.y;
++    float2 ndc = (pixel / viewportSize) * 2.0f - 1.0f;
++    ndc.y = -ndc.y;
+     origin = eyePosition();
+-    direction = normalize(RtParams.cameraW.xyz + RtParams.cameraU.xyz * d.x + RtParams.cameraV.xyz * d.y);
++    float4 viewPoint = mul(RtParams.projectionI, float4(ndc, 1.0f, 1.0f));
++    viewPoint.xyz /= (abs(viewPoint.w) > 1.0e-9f) ? viewPoint.w : 1.0e-9f;
++    const float4 worldPoint = mul(RtParams.viewI, float4(viewPoint.xyz, 1.0f));
++    direction = normalize(worldPoint.xyz - origin);
++    // Whichever side of the eye the far plane's point came out on (the projection's depth
++    // convention), the ray goes forward.
++    if (dot(direction, RtParams.cameraW.xyz) < 0.0f) {
++        direction = -direction;
++    }
+     return true;
+ }
+ 
+@@ -123,6 +151,8 @@ void PrimaryRayGen() {
+     payload.instanceId = -1;
+     payload.hitNormal = 0.0f;
+     payload.shadedColor = 0.0f;
++    payload.hitVelocity = 0.0f;
++    payload.coverage = 1.0f;
+     // Only the instances that take part in depth (rt64_common.h, DepthRayQueryMask): a draw
+     // call with depth test and write both off is the game painting a backdrop, and this game
+     // draws its sky as a box around the eye that way, which would otherwise stand in front of
+@@ -131,20 +161,93 @@ void PrimaryRayGen() {
+ 
+     gViewDirection[launchIndex] = float4(direction, 0.0f);
+ 
++    // The game's own rasterized depth says what the frame shows at this pixel (patch 0008). A hit
++    // nearer than that is a surface the picture does not show: the cut-out part of an alpha
++    // tested quad (a tree line, a cliff's ragged top), which the rays treat as solid until the
++    // material work; a back face the game culls, which the rays do not (the Z target camera,
++    // pulled back fast, goes into the moat's bank and the game shows the field through the
++    // slope's back); a plane the game lays under its terrain. Lighting such a hit painted the
++    // hidden surface's light onto whatever the picture shows there.
++    //
++    // THE RAY GOES ON PAST IT (2026-09-24, the seam under Z targeting). The first version made
++    // the pixel a miss, and a miss is the game's own picture untouched, so wherever the culled
++    // back of a slope stood across the view the traced lighting stopped on its straight edge
++    // (the user: "everything on the left side of that seam is stuff that the in-game renderer
++    // only does"). Now the ray continues from the dropped hit, a few steps at most, until a hit
++    // agrees with the depth image or nothing is hit, and the surface the passes light is the
++    // one the picture shows. A pixel that finds no agreeing hit stays a miss.
++    // Whatever the rays first met, kept or dropped, is as far as the frame can see along this
++    // ray: the probe below never looks past it, so it cannot find the water plane under a bank
++    // the eye is inside of.
++    const bool opaqueHit = (payload.instanceId >= 0);
++    const float opaqueDistance = payload.hitDistance;
++    // Whether the compare dropped the last hit, and the two depths it weighed, for the Hits view
++    // (green a kept hit, red a dropped one, brighter the further the depths lay apart). The
++    // Experiment row's 6 turns the compare off altogether.
++    bool depthDropped = false;
++    float2 depthsWeighed = 0.0f;
++    if (RtParams.rasterDepthValid != 0 && (RtParams.tuneExperiment.x != 6.0f)) {
++        const float rasterDepth = gRasterDepth[launchIndex];
++        for (uint step = 0; (step < 4) && (payload.instanceId >= 0); step++) {
++            // The hit's depth as the rasterizer would have written it: clip z over w through the
++            // RSP viewport's depth scale and translate (RSPProcessCS). The raw z over w beside
++            // the depth image agreed with it only where the mapping happened to cross.
++            const float4 hitClip = mul(RtParams.viewProj, float4(origin + direction * payload.hitDistance, 1.0f));
++            const float hitDepth = (hitClip.z / max(hitClip.w, 1.0e-6f)) * RtParams.depthScale + RtParams.depthTranslate;
++            if (rasterDepth <= hitDepth + CutoutDepthSlack) {
++                break;
++            }
++            depthsWeighed = float2(rasterDepth, hitDepth);
++            if (step == 3) {
++                // Nothing along the ray agreed with the picture: a miss.
++                payload.instanceId = -1;
++                payload.hitDistance = 0.0f;
++                depthDropped = true;
++                break;
++            }
++            // Past the dropped hit, by a hair that grows with distance so the same surface is
++            // not met again.
++            ray.TMin = payload.hitDistance + 0.05f + 0.001f * payload.hitDistance;
++            payload.instanceId = -1;
++            payload.hitDistance = 0.0f;
++            payload.hitNormal = 0.0f;
++            payload.shadedColor = 0.0f;
++            payload.hitVelocity = 0.0f;
++            payload.coverage = 1.0f;
++            TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++            // Nothing further along the ray at all: the picture shows what the rays cannot see.
++            depthDropped = (payload.instanceId < 0);
++        }
++    }
++
+     // A second probe for the translucent draws no other ray sees (patch 0007): where the nearest
+     // one is a horizontal surface in front of the opaque hit, it is water, and the reflection
+     // pass takes its normal and distance from gShadingSpecular (zero where there is none).
+-    if (RtParams.level >= 3) {
++    //
++    // Only in front of an opaque hit, and only as far as the hit the rays met first (patch 0008).
++    // A probe that ran to the range where the hit was dropped, or where no ray hit at all, found
++    // the water planes the game lays under its terrain and behind its depth-free backdrops
++    // (Lake Hylia's water reaches under the shore; the field's river runs on under the title's
++    // hills), and a reflection on a plane the frame never shows was a thin gray or lavender
++    // sliver across a cliff or the title's grass (the user's streaks, 2026-09-24).
++    if ((RtParams.level >= 3) && opaqueHit) {
+         RayDesc probe = ray;
+-        probe.TMax = (payload.instanceId >= 0) ? payload.hitDistance : ray.TMax;
++        probe.TMax = opaqueDistance;
+ 
+         SurfacePayload water;
+         water.hitDistance = 0.0f;
+         water.instanceId = -1;
+         water.hitNormal = 0.0f;
+         water.shadedColor = 0.0f;
++        water.hitVelocity = 0.0f;
++        water.coverage = 1.0f;
+         TraceRay(SceneBVH, RAY_FLAG_NONE, TranslucentRayQueryMask, 0, 0, 0, probe, water);
+-        if ((water.instanceId >= 0) && (abs(water.hitNormal.y) > 0.9f)) {
++        // Water is a horizontal translucent surface seen from ABOVE (the hit normal faces the
++        // ray, so it points up): a translucent surface seen from below (Death Mountain's ring
++        // of smoke over Kakariko, a ceiling's haze) is not water, and the reflection pass drew
++        // its quad as a bright box (the user, 2026-09-24). The game's own water boxes are the
++        // proper test and come with the materials.
++        if ((water.instanceId >= 0) && (water.hitNormal.y > 0.9f)) {
+             gShadingSpecular[launchIndex] = float4(water.hitNormal, water.hitDistance);
+         }
+     }
+@@ -155,8 +258,53 @@ void PrimaryRayGen() {
+         gDiffuse[launchIndex] = float4(SrgbToLinear(raster), 1.0f);
+ 
+         const float3 hitPosition = origin + direction * payload.hitDistance;
+-        gShadingPosition[launchIndex] = float4(hitPosition, 1.0f);
+-        gShadingNormal[launchIndex] = float4(payload.hitNormal, 0.0f);
++        // How much of the pixel the surface covers rides in the position's spare component, for
++        // the direct pass to weight its factor by. A LIGHT'S OWN BODY IS NOT SHADED: a fairy is
++        // drawn at her glow light's position, and the traced sun shadow fell across her (the
++        // user, 2026-09-24: "navi falls under ray traced shadows"). The body is a MOVING surface
++        // within a few units of a glow light: the first version took any hit within 24 units, and
++        // wherever she hovered a crisp disc of the sun's shadow was wiped off the ground and off
++        // Link, whatever the light rows said (the user, 14:25: "shadows wiping away unnaturally
++        // via the light in a crisp circle ... regardless of the settings"). The ground never
++        // moves; her body always does.
++        // With or without motion (14:50, the user: the sun's shadow still fell across her): her
++        // glow sprite carries no motion, so the test is 8 units for any surface (a disc that
++        // small on the ground shows only when she is that low) and 16 for one that moves.
++        float coverage = payload.coverage;
++        {
++            // Her body is her glow sprite AT the light: a billboard some thirty units across,
++            // centered on it and facing the eye exactly, where a wall or the ground almost never
++            // does. A SPHERE AROUND THE LIGHT IS NOT THAT, and it swallowed whatever stood
++            // BEHIND her as well, so a bush, a grotto wall or the field's tree line took no
++            // lighting at all wherever she drifted in front of it, at any distance from the eye
++            // (the user, 2026-09-28: "solid custouts of unaffected lighting when navi is in
++            // between them and the camera even if we are very very far away", naming it as the
++            // objects that do not interact with light). Her own sprite spans the light along the
++            // eye's ray; the surface behind her is farther along it than the light is. So the
++            // hit must be within the reach AND no farther along the ray than the light itself,
++            // within a sprite's own depth of it.
++            const bool facesEye = dot(payload.hitNormal, -direction) > 0.97f;
++            const float bodyReach = facesEye ? 24.0f : 8.0f;
++            const float hitAlong = dot(hitPosition - origin, direction);
++            const uint lightCount = min(RtParams.lightsCount, RtParams.maxLights);
++            for (uint li = 0; li < lightCount; li++) {
++                const PointLight light = SceneLights[li];
++                const float lightAlong = dot(light.position - origin, direction);
++                if (((light.groupBits & 2u) != 0u) && (length(hitPosition - light.position) < bodyReach)
++                    && (hitAlong < lightAlong + 4.0f)) {
++                    coverage = 0.0f;
++                }
++            }
++        }
++        gShadingPosition[launchIndex] = float4(hitPosition, coverage);
++        // How far the hit moved rides in the normal's spare component (the direct pass spends more
++        // rays on what moves), and the motion itself in the specular slot where the surface is
++        // not water (the history reprojects a moving surface by it, RtTemporalCS). Water does not
++        // move, and its slot keeps the water normal with the hit distance as its flag.
++        gShadingNormal[launchIndex] = float4(payload.hitNormal, length(payload.hitVelocity));
++        if (gShadingSpecular[launchIndex].w <= 0.0f) {
++            gShadingSpecular[launchIndex] = float4(payload.hitVelocity, 0.0f);
++        }
+         gNormalRoughness[launchIndex] = float4(payload.hitNormal, 1.0f);
+         gInstanceId[launchIndex] = payload.instanceId;
+ 
+@@ -166,6 +304,11 @@ void PrimaryRayGen() {
+         // in the first few hundred, which a linear ramp shows as one shade of black.
+         gDepth[launchIndex] = sqrt(saturate(payload.hitDistance / RtParams.farDist));
+     }
++    else if (depthDropped) {
++        // A dropped hit for the Hits view only: the two depths, and a coverage below zero, which
++        // every pass reads as zero (saturate) and the view reads as "dropped".
++        gShadingPosition[launchIndex] = float4(depthsWeighed, 0.0f, -1.0f);
++    }
+ }
+ 
+ // An orthonormal pair around a direction, for the disc the soft shadow samples.
+@@ -180,6 +323,31 @@ void tangentFrame(float3 n, out float3 t, out float3 b) {
+ // surface with its ambient plus the sun times the cosine, and this is what remains of that with
+ // the sun blocked, so the base stays the game's own vertex lighting (lighting-design.md, section
+ // 3). A pixel the sun does not face keeps its color whatever the ray finds.
++static const float DarknessRestore = 0.25f;        // how much arriving light (as a share of full light) gives the ambient back in full
++static const float LocalShadowStrength = 0.45f;    // how dark a local light's shadow is at most, as a share of the surface's shade
++static const float LocalShadowLight = 0.2f;        // how much blocked light (as a share of full light) makes that shadow full
++// A ROOM'S FILL LIGHT IS NOT A SUN (2026-09-24). It began as a short sharp shadow so an actor
++// indoors had one at all; with the torches and the fairy casting their own now, the fill's job is
++// the soft contact shading under a thing, and its sharp band across a floor was the one the user
++// called out as unreal ("what in the game causes the unrealistic shadows", and the Shadows view
++// showed it was ours). So: a short reach, a gentle weight, and a wide angular radius, which is
++// what turns a straight edge into a gradient.
++static const float IndoorShadowReach = 140.0f;     // how far a room's light casts, world units; Link is about 60
++static const float IndoorShadowWeight = 0.35f;     // how much of the sun's darkening a room's light gives
++static const float IndoorShadowSpread = 6.0f;      // how much wider than the sun's disc, so its edge is soft
++// A ROOM WITH NO SUN GETS ONE OF ITS OWN (2026-09-24, the user in the Deku Tree: "i do not see
++// shadow unless navi is out ... lets add a default yet not super bright or strong skybox light in
++// these arease"; "it should act like a sun or moonlight but be like half as intense"; "i do NOT
++// want it using the games original ugly simulated one"). Overhead and a little to one side, so a
++// figure's shadow falls beside him rather than exactly under him where nothing of it shows.
++static const float3 IndoorSunDirection = float3(0.28f, 0.94f, 0.19f);
++// IT MUST NOT TRACE TO THE SKY. The first build of this let the indoor sun cast the whole way
++// like a real one, and the recording was unmistakable: the ray goes up, meets the cave's own
++// ceiling everywhere, and the entire room is called shadowed at once, so the place just went dark
++// and the one shadow that used to be there disappeared into it (the user, 2026-09-24: "when this
++// new setting is turned on it makes the whole cave darker rather than just this shadow you see
++// when its off"). It keeps the room fill's short reach, which is the length of a figure's shadow
++// on the floor beside him, and that is what makes it a shadow rather than a dimmer.
+ static const float ShadowBiasBase = 0.5f;          // world units off the surface, Link is about 60
+ static const float ShadowBiasPerUnit = 0.002f;     // more with distance, where the hit position is coarser
+ 
+@@ -189,12 +357,15 @@ float3 rayOrigin(float3 position, float3 normal) {
+     return position + normal * (ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition()));
+ }
+ 
+-// One shadow ray: 1 when nothing stands between the origin and tMax along the direction.
+-float traceVisibility(float3 origin, float3 direction, float tMax, out float hitDistance) {
++// One shadow ray between tMin and tMax: 1 when nothing stands in that stretch. A tMin above
++// zero is what keeps a large flat floor from shadowing ITSELF at a grazing angle to a nearby
++// light, which drew long dark bands across the Deku Tree's floor when a local light's shadow
++// began to darken the surface (2026-09-24, the user: "what the fuck").
++float traceVisibilityRange(float3 origin, float3 direction, float tMin, float tMax, out float hitDistance) {
+     RayDesc ray;
+     ray.Origin = origin;
+     ray.Direction = direction;
+-    ray.TMin = 0.0f;
++    ray.TMin = tMin;
+     ray.TMax = tMax;
+ 
+     ShadowPayload payload;
+@@ -205,6 +376,11 @@ float traceVisibility(float3 origin, float3 direction, float tMax, out float hit
+     return payload.visibility;
+ }
+ 
++// The same from the surface itself, for the sun.
++float traceVisibility(float3 origin, float3 direction, float tMax, out float hitDistance) {
++    return traceVisibilityRange(origin, direction, 0.0f, tMax, hitDistance);
++}
++
+ // THE OCCLUSION PASS (phase 55, patch 0006). A few cosine weighted rays over the hemisphere, as
+ // far as a design constant in world units, each blocked ray counting more the closer it was
+ // stopped; the result is the fraction of the ambient light the surface can see, which the direct
+@@ -223,6 +399,14 @@ void OcclusionRayGen() {
+         return;
+     }
+ 
++    // The controls (patch 0008): off at zero strength, and the radius the person chose.
++    const float occlusionStrength = RtParams.tuneOcclusion.x;
++    const float occlusionRadius = max(RtParams.tuneOcclusion.y, 1.0f);
++    if (occlusionStrength <= 0.0f) {
++        gOcclusion[launchIndex] = 1.0f;
++        return;
++    }
++
+     const uint samples = RtParams.occlusionSamples;
+     if ((RtParams.level < 2) || (samples == 0)) {
+         gOcclusion[launchIndex] = 1.0f;
+@@ -236,19 +420,47 @@ void OcclusionRayGen() {
+     for (uint s = 0; s < samples; s++) {
+         const float3 direction = getCosHemisphereSampleBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount * samples + s, normal);
+         float hitDistance;
+-        const float visibility = traceVisibility(origin, direction, OcclusionRadius, hitDistance);
+-        occluded += (1.0f - visibility) * (1.0f - saturate(hitDistance / OcclusionRadius));
++        const float visibility = traceVisibility(origin, direction, occlusionRadius, hitDistance);
++        occluded += (1.0f - visibility) * (1.0f - saturate(hitDistance / occlusionRadius));
+     }
+ 
+-    gOcclusion[launchIndex] = 1.0f - OcclusionStrength * (occluded / float(samples));
++    gOcclusion[launchIndex] = 1.0f - occlusionStrength * (occluded / float(samples));
+ }
+ 
+ // THE LOCAL LIGHTS PASS (phase 55, patch 0006). The game's own point lights (a torch, a candle,
+-// a fire), at the game's own falloff, 1 - (d / r)^2 (Lights_BindPoint in z_lights.c), each with a
+-// shadow ray toward a point on the flame so the shadow softens with the light's size. The sum is
+-// light the game never put on the room (it lights only actors with these, as a directional
+-// stand-in each), which the direct pass adds through the surface's own color.
++// a fire), each with a shadow ray toward a point on the flame so the shadow softens with the
++// light's size. The sum is light the game never put on the room (it lights only actors with
++// these, as a directional stand-in each), which the direct pass adds through the surface's own
++// color.
++//
++// THE FALLOFF IS A REAL ONE. The game's own, 1 - (d / r)^2 (Lights_BindPoint in z_lights.c), is
++// a dome that holds near full strength over most of the radius and drops at the edge, and a
++// fairy's light widened to three times its radius read as "a big expanded circle of light"
++// (the user, 2026-09-24: "must naturally show more transparent the further away it is and have
++// a natural falloff. that goes with any light"). So every local light, on a surface and in the
++// air, is an inverse square over a CORE (full at the flame, half at the core's edge), under a
++// window that carries it smoothly to nothing at the radius. The shadow rays still reach the
++// whole radius: a shadow is cast wherever there is any light to block.
++//
++// THE CORE IS THE LIGHT'S OWN AND THE REACH ONLY WIDENS THE WINDOW. The first version took the
++// core from the widened radius, so the Light reach row and the fairies' three times made a
++// light nine times as powerful as well as three times as far, and Navi at Triple reach washed
++// the whole of Kokiri white through the air ("she brightens EVERYTHING", the user). The core
++// comes from the game's own radius on the CPU (half of it, PointLight.attenuationExponent,
++// which these passes use for nothing else) and never changes with the reach.
++float lightFalloff(float distance2, float radius2, float core2) {
++    if (RtParams.tuneExperiment.x == 3.0f) {   // the Experiment row: the game's own dome
++        return saturate(1.0f - distance2 / radius2);
++    }
++    const float inverse = core2 / (distance2 + core2);
++    const float ratio = distance2 / radius2;
++    const float window = saturate(1.0f - ratio * ratio);
++    return inverse * window * window;
++}
+ static const float LightClearance = 48.0f;   // world units around a light its holder may fill (a sconce's bracket)
++// A local light's shadow ray starts this far along itself, so a floor cannot shadow itself at a
++// grazing angle to a torch a few steps away (2026-09-24, the bands across the Deku Tree floor).
++static const float LocalBlockerSkip = 10.0f;   // world units; Link is about 60
+ 
+ [shader("raygeneration")]
+ void LightsRayGen() {
+@@ -258,7 +470,7 @@ void LightsRayGen() {
+     }
+ 
+     const uint count = min(RtParams.lightsCount, RtParams.maxLights);
+-    if ((RtParams.level < 2) || (count == 0)) {
++    if ((RtParams.level < 2) || (count == 0) || (RtParams.tuneOcclusion.w <= 0.0f)) {   // the local lights' switch (patch 0008)
+         gLocalLight[launchIndex] = 0.0f;
+         return;
+     }
+@@ -266,13 +478,20 @@ void LightsRayGen() {
+     const float3 position = gShadingPosition[launchIndex].xyz;
+     const float3 normal = gShadingNormal[launchIndex].xyz;
+     const float3 origin = rayOrigin(position, normal);
++    const float biasBase = ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition());
+     const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 17);
+     float3 sum = 0.0f;
++    // What the lights WOULD give this surface were nothing in the way, beside what they do give
++    // (2026-09-24, the user: "torches and navi and all light types must be making [shadows]"):
++    // the difference is a local light's shadow, and the direct pass darkens the surface by it.
++    float3 sumUnblocked = 0.0f;
+     for (uint i = 0; i < count; i++) {
+         const PointLight light = SceneLights[i];
+         const float3 toLight = light.position - position;
+         const float distance2 = dot(toLight, toLight);
+-        const float radius2 = light.attenuationRadius * light.attenuationRadius;
++        // The reach control (patch 0008) scales the game's own radius.
++        const float radius = light.attenuationRadius * RtParams.tuneScatter.w;
++        const float radius2 = radius * radius;
+         if ((distance2 <= 0.0f) || (distance2 >= radius2)) {
+             continue;
+         }
+@@ -290,18 +509,42 @@ void LightsRayGen() {
+         const float angle = 6.28318531f * noise.x;
+         const float spread = sqrt(noise.y) * light.pointRadius;
+         const float3 target = light.position + tangent * (spread * cos(angle)) + bitangent * (spread * sin(angle));
+-        const float3 toTarget = target - origin;
++        // THE RAY LEAVES THE SURFACE FURTHER AT A GRAZING ANGLE (2026-09-24). Half a unit was
++        // enough while a wrong answer only cost a little added light; with a light's shadow
++        // darkening the surface, a floor lit from the side by a torch shadowed itself in
++        // stripes. The bias grows as the light nears the surface's plane.
++        const float3 shadowOrigin = position + normal * (biasBase * (1.0f + 2.0f / max(ndl, 0.25f)));
++        const float3 toTarget = target - shadowOrigin;
+         const float targetDistance = length(toTarget);
+         // The last stretch before the light is not traced: a flame sits in or on its holder (a
+         // sconce, a torch stand, a lantern), and traced to the point the holder shadowed every
+         // surface from its own light.
++        //
++        // A FAIRY HAS NO HOLDER (bit 4 of the group bits, set by the program beside the glow bit).
++        // The clearance did real harm to her: Navi floats a few dozen units over Link's head, so
++        // for the floor right under him the WHOLE ray to her is inside 48 units, tMax falls to
++        // nothing, the test is skipped and the floor is called fully lit. Her light went straight
++        // through him (the user, 2026-09-24: "she only causes proper shadow when out to the side
++        // but directly on top it disapears"; "the light should never pass through an object to
++        // reach it"). She gets her own point radius instead, and every other light keeps the 48.
+         float hitDistance;
+-        const float visibility = traceVisibility(origin, toTarget / targetDistance, max(targetDistance - max(light.pointRadius, LightClearance), 0.0f), hitDistance);
+-        const float falloff = 1.0f - distance2 / radius2;
++        const float clearance = ((light.groupBits & 4u) != 0u)
++            ? light.pointRadius
++            : max(light.pointRadius, LightClearance);
++        const float tMax = max(targetDistance - clearance, 0.0f);
++        const float visibility = (tMax > LocalBlockerSkip)
++            ? traceVisibilityRange(shadowOrigin, toTarget / targetDistance, LocalBlockerSkip, tMax, hitDistance)
++            : 1.0f;
++        const float core2 = light.attenuationExponent * light.attenuationExponent;
++        const float falloff = lightFalloff(distance2, radius2, core2);
+         sum += light.diffuseColor * (falloff * ndl * visibility);
++        sumUnblocked += light.diffuseColor * (falloff * ndl);
+     }
+ 
+-    gLocalLight[launchIndex] = float4(sum, 1.0f);
++    // The Light strength row (tuneOcclusion.w, 0 off): a person's scale on every local light.
++    // The spare channel carries the unblocked light's brightness, for the shadows.
++    const float unblockedLum = dot(sumUnblocked * RtParams.tuneOcclusion.w, float3(0.299f, 0.587f, 0.114f));
++    gLocalLight[launchIndex] = float4(sum * RtParams.tuneOcclusion.w, unblockedLum);
+ }
+ 
+ // THE LIGHT ARRIVING FROM A POINT, for the bounce and the reflections (phase 56, patch 0007).
+@@ -310,11 +553,11 @@ void LightsRayGen() {
+ // the hit, scaled by what a texture takes on average, where it is not; and the pixel's fog color
+ // where the ray left the scene, which is the game's own horizon.
+ static const float TextureAverage = 0.6f;     // what a texture multiplies the lit vertex color by, on average
++static const float OverlayRatio = 3.0f;       // a frame color this far above the lit estimate is a translucent overlay (radianceFrom)
+ static const float BounceStrength = 0.25f;    // how much of the bounced light joins the game's own ambient
+ static const float BounceRange = 1500.0f;     // world units a bounce ray travels
+ static const float ReflectionRange = 4000.0f; // world units a reflection ray travels
+-static const float ReflectionStrength = 0.8f;
+-
++static const float ReflectionStrength = 0.5f;   // the water read "super bright" at 0.8 (the user, 2026-09-24)
+ float3 fogColorOf(int instanceId) {
+     if (instanceId < 0) {
+         return RtParams.ambientBaseColor.rgb;
+@@ -351,17 +594,71 @@ float3 radianceFrom(float3 hitPosition, float3 shadedColor, bool hit, int pixelI
+         return fogColorOf(pixelInstance);
+     }
+ 
++    const float3 estimate = shadedColor * TextureAverage;
+     int2 pixel;
+     if (viewportPixel(hitPosition, pixel) && (gInstanceId[pixel] >= 0)) {
+         // The frame shows this point if what it shows at that pixel is the point itself.
+         const float3 shown = gShadingPosition[pixel].xyz;
+         const float tolerance = 4.0f + 0.02f * length(hitPosition - eyePosition());
+         if (length(shown - hitPosition) < tolerance) {
+-            return SrgbToLinear(gBackgroundColor.Load(int3(pixel, 0)).rgb);
++            const float3 frame = SrgbToLinear(gBackgroundColor.Load(int3(pixel, 0)).rgb);
++            // Unless something translucent is drawn over it there: the frame holds every
++            // translucent draw the rays never see (Navi's glow, a flame's sprite, a spark), and
++            // a bounce or a reflection that met the building behind her glow took the glow's
++            // white for the building, so the ground around it brightened as she flew (the user,
++            // 2026-09-24: "Navi brightens the building in the distance"). A frame color far
++            // above the surface's own lit color is such an overlay; the lit color stands in.
++            const float frameLuma = dot(frame, float3(0.299f, 0.587f, 0.114f));
++            const float estimateLuma = dot(estimate, float3(0.299f, 0.587f, 0.114f));
++            if (frameLuma <= estimateLuma * OverlayRatio + 0.02f) {
++                return frame;
++            }
+         }
+     }
+ 
+-    return shadedColor * TextureAverage;
++    return estimate;
++}
++
++// THE HISTORY (phase 57, patch 0008). Every pass is one noisy sample per pixel per frame; the
++// direct pass's factor and the scatter are blended with what the previous presented frame held
++// for the same surface point, found by projecting the point through the previous frame's view
++// (the renderer interpolates the camera for every presented frame, so the previous frame's view
++// is the previous presented one) and kept only where the previous depth and normal there say it
++// was the same surface. A cut, a warp or a resize clears the history (reprojectValid).
++static const float HistoryBlend = 0.12f;      // the new frame's share; about eight frames of history at the display's rate
++static const float ScatterHistoryBlend = 0.1f;
++
++bool reprojectHistory(float3 position, float3 normal, out int2 previousPixel) {
++    previousPixel = int2(0, 0);
++    if (RtParams.reprojectValid == 0) {
++        return false;
++    }
++
++    const float4 clip = mul(RtParams.prevViewProj, float4(position, 1.0f));
++    if (clip.w <= 0.0f) {
++        return false;
++    }
++
++    const float2 ndc = clip.xy / clip.w;
++    const float2 viewportOrigin = RtParams.viewport.xy;
++    const float2 viewportSize = RtParams.viewport.zw;
++    const float2 inViewport = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * viewportSize;
++    if (any(inViewport < 0.0f) || any(inViewport >= viewportSize)) {
++        return false;
++    }
++
++    previousPixel = int2(viewportOrigin + inViewport);
++
++    // The same surface: the previous normal there faces the same way, and the previous depth
++    // there is the point's own distance from the previous eye, in the depth view's encoding.
++    const float3 previousNormal = gPrevNormalRoughness[previousPixel].xyz;
++    if (dot(previousNormal, normal) < 0.8f) {
++        return false;
++    }
++
++    const float expectedDepth = sqrt(saturate(length(position - RtParams.prevEye.xyz) / RtParams.farDist));
++    const float previousDepth = gPrevDepth[previousPixel];
++    return abs(previousDepth - expectedDepth) < (0.01f + 0.03f * expectedDepth);
+ }
+ 
+ // THE DIRECT PASS: the factor the composite multiplies the game's own picture by. The game lit
+@@ -385,31 +682,195 @@ void DirectRayGen() {
+     const float3 toSun = RtParams.sunDirection.xyz;
+     const float ndl = any(sunColor > 0.0f) ? saturate(dot(normal, toSun)) : 0.0f;
+ 
++    // THE INDOOR LIGHT ROW (tuneExperiment.w). Indoors the shadow is cast by the room's own fill
++    // light, and a place whose light settings carry no directional light at all has nothing to
++    // cast with, so a figure stands shadowless once the game's painted blob is hidden. Here the
++    // room is given a DIRECTION of its own, overhead and a little to one side so the shadow falls
++    // beside him rather than exactly under him, and the row says how dark what it finds goes.
++    //
++    // IT ADDS NO LIGHT AND MOVES NO AMBIENT. Both were tried and both were wrong: taking the
++    // row's share out of the ambient darkened every wall the light met at a glancing angle, which
++    // is most of a cave. What it does is subtract, where something is actually in the way, and
++    // nothing anywhere else.
++    const float indoorWeight = saturate(RtParams.tuneExperiment.w);
++    const bool indoorRoom = (RtParams.sunShadows == 2u);
++    const bool indoorOwnLight = indoorRoom && !any(sunColor > 0.0f) && (indoorWeight > 0.0f);
++    const float3 shadowDirection = indoorOwnLight ? normalize(IndoorSunDirection) : toSun;
++    const float shadowNdl = indoorOwnLight ? saturate(dot(normal, shadowDirection)) : ndl;
++
+     // The sun's shadow: one point on its disc per pixel per frame, placed by the blue noise so
+     // neighbors and frames differ; the penumbra is the disc's angular radius.
++    // FOUR SAMPLES ON WHAT MOVES, ONE ON WHAT STANDS. The still world's history carries the
++    // penumbra to a smooth value over a few frames; an actor's is reprojected by its motion and
++    // often refused (a limb turns, a shadow sweeps), so his one sample a frame read as heavy
++    // grain on his model and at his feet (the user, 2026-09-24). Four rays there, on the small
++    // part of the screen an actor covers, halve the noise before the filter sees it.
+     float visibility = 1.0f;
+-    if ((RtParams.sunShadows != 0) && (ndl > 0.0f)) {
+-        const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount);
+-        const float angularRadius = RtParams.sunDirection.w;
+-        const float angle = 6.28318531f * noise.x;
+-        const float radius = sqrt(noise.y) * angularRadius;
++    if ((RtParams.sunShadows != 0) && (shadowNdl > 0.0f) && (RtParams.tuneOcclusion.z > 0.0f)) {   // the shadows' switch (patch 0008)
++        // The softness control (patch 0008), widened indoors where the light is a room's fill.
++        const float angularRadius = RtParams.sunDirection.w * RtParams.tuneFade.z *
++                                    ((RtParams.sunShadows == 2u) ? IndoorShadowSpread : 1.0f);
+         float3 tangent;
+         float3 bitangent;
+-        tangentFrame(toSun, tangent, bitangent);
+-        const float3 direction = normalize(toSun + tangent * (radius * cos(angle)) + bitangent * (radius * sin(angle)));
++        tangentFrame(shadowDirection, tangent, bitangent);
++        const float3 shadowOrigin = rayOrigin(position, normal);
++        // INDOORS THE ROOM'S LIGHT CASTS A CONTACT SHADOW (2026-09-24, the user in the Deku
++        // Tree: "in places that shadows dont exist from sun ... link seems shadowless",
++        // "add a simulated more subtle sunlight"). Under no sky the scene's directional light
++        // is the game's fill for the room, and traced to the horizon it shadowed the whole
++        // room against its own walls (patch 0006 turned it off). So indoors the shadow ray
++        // reaches only a few hundred units, the length of a figure's shadow on the floor
++        // beside it, and what it finds darkens by half as much as the sun would.
++        const bool indoors = indoorRoom;
++        const float reach = indoors ? IndoorShadowReach : 1.0e6f;
++
++        // THE RAYS PER PIXEL ARE A ROW, AND EVERY PIXEL GETS THE SAME COUNT (2026-09-24).
++        //
++        // The first answer to the windmill's painting was one ray on a still surface and four on
++        // a moving one, which left the moving EDGE of a shadow to resolve somewhere different
++        // every frame, and the user's recording showed exactly that: a narrow speckled band
++        // along the turning sails' edge and almost nothing elsewhere.
++        //
++        // The second answer tried to spend the rays only where they were needed: two probes on
++        // opposite sides of the sun's disc, and the full count only where they disagreed. That
++        // was worse, and the next recording showed why: the two probes straddle ONE axis of the
++        // disc, so a pixel whose penumbra varies across the other axis has both probes land on
++        // the blocker, is called fully shadowed, and the shadow grows a hard core wider than it
++        // should be with a second soft edge outside it (the user: "now it looks like almost
++        // doubled and interacts with other shadows wierd").
++        //
++        // So: no cleverness. Every pixel in the light takes the same number of samples over the
++        // disc, the Shadow rays row says how many, and a surface that moves takes twice that.
++        // The count is a person's to spend, since it buys quality with frame rate and only they
++        // can see both.
+         float hitDistance;
+-        visibility = traceVisibility(rayOrigin(position, normal), direction, 1.0e6f, hitDistance);
++        const bool moving = (gShadingNormal[launchIndex].w > 0.01f);
++        const uint rowSamples = max(uint(RtParams.tuneExperiment.z), 1u);
++        const uint samples = moving ? min(rowSamples * 2u, 16u) : rowSamples;
++        // A BLOCKER FADES WITH ITS OWN DISTANCE (2026-09-24, the user with the Shadows view of
++        // the Deku Tree: "still see this shadow along walls! and it looks harsh and should
++        // probably be very gradually faded instead"). The ray stops at the reach, so without this
++        // a floor point nearer a wall than that is shadowed and one a hair further is not, and
++        // the boundary is a hard line along the foot of every wall. What the ray finds is now
++        // weighed by HOW FAR AWAY it found it: close by it casts in full, out near the limit it
++        // casts nothing, eased between, which is also how a real contact shadow behaves. The hit
++        // distance comes back from the trace already, so this costs nothing.
++        //
++        // Outdoors the reach is a million units and a real blocker is a few hundred away, so the
++        // weight is one and the sun's shadow is exactly what it was.
++        const float fadeFrom = reach * 0.2f;
++        float occluded = 0.0f;
++        for (uint s = 0; s < samples; s++) {
++            const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + s * 29);
++            const float angle = 6.28318531f * noise.x;
++            const float radius = sqrt(noise.y) * angularRadius;
++            const float3 direction = normalize(shadowDirection + tangent * (radius * cos(angle)) + bitangent * (radius * sin(angle)));
++            const float sample = traceVisibility(shadowOrigin, direction, reach, hitDistance);
++            occluded += (1.0f - sample) * (1.0f - smoothstep(fadeFrom, reach, hitDistance));
++        }
++        visibility = 1.0f - (occluded / float(samples));
++        if (indoors) {
++            // THE ROW IS THE STRENGTH FOR EVERY INDOOR PLACE, not only for one that has no light
++            // of its own (2026-09-24, the user: "changing rhe stting in the menu literally makes
++            // the shadow no more or less intense"). It was consulted only where the room's own
++            // settings carried no directional light, and most rooms, the Deku Tree included, have
++            // one, so the fixed weight was used there and the row did nothing whatever it said.
++            visibility = lerp(1.0f, visibility, indoorWeight);
++        }
+     }
+ 
+     const float occlusion = (RtParams.level >= 2) ? gOcclusion[launchIndex] : 1.0f;
+     const float3 local = (RtParams.level >= 2) ? gLocalLight[launchIndex].rgb : float3(0.0f, 0.0f, 0.0f);
+-    const float3 bounce = (RtParams.level >= 3) ? gIndirectLightAccum[launchIndex].rgb * BounceStrength : float3(0.0f, 0.0f, 0.0f);
+-    const float3 lit = ambient + sunColor * ndl;
+-    const float3 shaded = ambient * occlusion + sunColor * (ndl * visibility) + local + bounce;
++    // THE BOUNCE REPLACES A SHARE OF THE GAME'S AMBIENT RATHER THAN ADDING TO IT. The game's flat
++    // ambient is already its stand in for light bounced around the room; adding the traced
++    // bounce on top counted that light twice, and at the Full row the sweep's Shadows view was
++    // orange (a factor above one) over every wall in Kokiri (2026-09-24). The Bounced light row
++    // is now the share of the ambient the traced bounce stands in for: Off keeps the game's,
++    // Full is the trace alone, Original half and half.
++    // THE DARKNESS ROW (2026-09-24; the user: "navi and torches would also cause the same floor
++    // shadow like the sun or moon does ... realistic shadows not just glows", "replacing all
++    // lighting with skybox points would achieve this"). A local light was only ever ADDED, so
++    // where Link stood between a fairy and the floor the floor kept the game's own shading and
++    // nothing read as a shadow; a sun shadow reads because the sun's share is taken away. Here
++    // the game's own ambient is taken away, by the row's share, where no traced light arrives,
++    // and given back as traced light does: a torch lights a pool and what stands in it throws
++    // a shadow, and a room is dark but for its lights. Under a sky the sun is light that
++    // arrives; indoors the scene's directional light is the game's fill for the room, so it
++    // counts as ambient and is taken away with it, and only the local lights give the room
++    // back. Off by default (the row), since it changes every dark place's look.
++    const bool realSun = (RtParams.sunShadows == 1u);
++    const float3 lumWeights = float3(0.299f, 0.587f, 0.114f);
++    const float localLum = dot(local, lumWeights);
++    // A LOCAL LIGHT'S OWN SHADOW, AND A ROOM'S FILL YIELDING TO IT (2026-09-24, the user in the
++    // Deku Tree beside a torch: "i should have a shadow coming from the direction of the torch
++    // not only the simulated sun indoors ... instead of causing a second shadow, it removes the
++    // suns shadow when close enough"). What a light would give a surface were nothing in the
++    // way rides in the local light's spare channel (LightsRayGen); the part that does not
++    // arrive is that light's shadow, and the surface is darkened by it, by up to
++    // LocalShadowStrength, in full once the blocked light is worth LocalShadowLight. So the
++    // floor behind Link away from a torch reads darker than the floor the torch lights, with
++    // the Darkness row off or on. And indoors the contact shadow of the room's fill light
++    // fades wherever local light arrives, so beside a torch the torch's shadow is the shadow.
++    if (!realSun) {
++        visibility = lerp(visibility, 1.0f, saturate(localLum / DarknessRestore));
++    }
++    const float3 sunTerm = sunColor * (ndl * visibility);
++    const float darkness = saturate(RtParams.tuneExperiment.y);
++    float ambientScale = 1.0f;
++    if (darkness > 0.0f) {
++        const float3 arrivingLight = (realSun ? sunTerm : float3(0.0f, 0.0f, 0.0f)) + local;
++        const float arriving = dot(arrivingLight, lumWeights);
++        ambientScale = lerp(1.0f - darkness, 1.0f, saturate(arriving / DarknessRestore));
++    }
++    if (RtParams.level >= 2) {
++        const float localUnblockedLum = gLocalLight[launchIndex].a;
++        const float localBlocked = max(localUnblockedLum - localLum, 0.0f);
++        ambientScale *= 1.0f - LocalShadowStrength * saturate(localBlocked / LocalShadowLight);
++    }
++    // THE INDOOR LIGHT'S SHADOW. The room has no light of its own to shade with, so its shadow is
++    // taken off the ambient here, and only where the trace above found something within the short
++    // reach: a surface with nothing over it keeps exactly the shade it had, which is what makes
++    // this a shadow and not a dimmer.
++    if (indoorOwnLight) {
++        ambientScale *= lerp(1.0f, visibility, shadowNdl);
++    }
++    const float3 ambientTerm = ambient * occlusion * ambientScale;
++    const float3 sunTermShaded = realSun ? sunTerm : sunTerm * ambientScale;
++    const float3 bounceTerm = (RtParams.level >= 3) ? lerp(ambientTerm, gIndirectLightAccum[launchIndex].rgb, saturate(RtParams.tuneBounce.x)) : ambientTerm;
++    // THE CONSOLE'S CLAMP. The game's shade is the ambient plus the lights, saturated to one per
++    // channel before it meets the texture, so no surface is ever brighter than its texture at
++    // full shade; the numerator is held to the same bound, and the ratio is held to four so a
++    // surface the game lit dimly cannot be multiplied without limit. The compose applies the
++    // ratio to the unfogged part of the pixel only (below, and ComposePS.hlsl).
++    // THE CAP IS TWICE THE CONSOLE'S. Held to one, a local light on a surface the game already
++    // lit in full (Kokiri's ground at noon) landed and changed nothing, which is the console's
++    // arithmetic and what the user saw as "navi still has no affect on anything but link"
++    // (2026-09-24). Twice lets a light show on a lit surface as light does, brightening the
++    // texture toward white; the Experiment row's Console clamp puts one back to compare.
++    const float shadeCap = (RtParams.tuneExperiment.x == 5.0f) ? 1.0f : 2.0f;
++    const float3 lit = min(ambient + sunColor * ndl, 1.0f);
++    // A SOFT KNEE ABOVE THE GAME'S OWN FULL LIGHT (2026-09-24, the user in the Lost Woods
++    // tunnel: "inside of a shadow caused by sun ... her glow does NOT affect anything the suns
++    // shadow trumps all light and shadows she gives"). A local light is an absolute addition,
++    // the same in sun and in shade, and the sun is worth about seven tenths of a lit surface;
++    // so a fairy set to a tenth of the sun is a faint ring on a sunlit wall and nothing on a
++    // wall the sun does not reach, and set to half the sun she lights the tunnel but a sunlit
++    // wall blows out toward white through the cap and the composite's clamp, which is why the
++    // strength row had been left low. Below the game's full light the sum is kept as it is (a
++    // light in the shade adds every bit of itself); the EXCESS above it is compressed, one over
++    // one plus itself, so a strong light on a sunlit wall reads as a glow and never as white.
++    // The same knee holds the bounce and the sun's own overshoot.
++    const float3 shadedRaw = bounceTerm + sunTermShaded + local;
++    const float3 excess = max(shadedRaw - lit, 0.0f);
++    const float3 shaded = min(min(shadedRaw, lit) + excess / (1.0f + excess), shadeCap);
+     float3 factor;
+     factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;
+     factor.y = (lit.y > 1.0e-4f) ? (shaded.y / lit.y) : 1.0f;
+     factor.z = (lit.z > 1.0e-4f) ? (shaded.z / lit.z) : 1.0f;
++    factor = min(factor, 4.0f);
++    if (RtParams.tuneExperiment.x == 1.0f) {   // the Experiment row: 1 holds surfaces at one, as before
++        factor = min(factor, 1.0f);
++    }
+ 
+     // Water (patch 0007): the reflection pass adds what the surface reflects, so what it lets
+     // through is dimmed by the same Fresnel weight, and the two make one surface.
+@@ -420,10 +881,66 @@ void DirectRayGen() {
+         if (primaryRay(launchIndex, origin, direction)) {
+             const float cosTheta = saturate(dot(-direction, normalize(water.xyz)));
+             const float fresnel = 0.02f + 0.98f * pow(1.0f - cosTheta, 5.0f);
+-            factor *= 1.0f - fresnel * ReflectionStrength;
++            factor *= 1.0f - fresnel * RtParams.tuneReflection.x;
+         }
+     }
+ 
++    // The game's fog on the lighting (patch 0008). The frame fades a far surface into the fog
++    // color by the draw's RSP fog, and a shadow multiplied onto a fogged surface stayed at full
++    // contrast to the horizon: a hard dark line along a distant wall's foot, blotches on the flat
++    // fog. So the factor fades to one by the same fog at the point, computed as the vertex shader
++    // computes it, and by nothing else: the user (2026-09-24) would "rather remove all fake
++    // simulated falloff and just use real lighting everywhere", so there is no invented fade
++    // over the distance, and the traced shadows, occlusion and bounce hold wherever the game's
++    // own picture still holds its contrast.
++    // Both are the person's to switch (the falloff controls of the lighting menu): the fog fade
++    // is on by the design, the distance fade off.
++    //
++    // EXACTLY, SINCE 2026-09-24 ~12:00. The frame's pixel is lerp(texture * shade, fogColor, fog)
++    // in the game's own numbers, and only the first term is the surface's light to relight: the
++    // fog's share stays. The first version faded the factor toward one by the fog instead, which
++    // still multiplied the fog's share by part of the factor, and with a local light on a fogged
++    // wall (a factor above one) that share went white at the middle distance ("the ground and
++    // link are visible while distance is white", the user). So this pass writes the fog's share
++    // of the pixel, fog * fogColor, into the refraction slot (nothing refracts yet), and the
++    // compose applies the factor to the pixel less that share. The distance fade, when the person
++    // switched it on, still fades the factor itself.
++    {
++        float fade = 0.0f;
++        float3 fogColor = 0.0f;
++        const uint instanceIndex = instanceRenderIndices[uint(gInstanceId[launchIndex])].instanceIndex;
++        if (RtParams.tuneFade.x > 0.0f) {
++            const uint faceStart = instanceRenderIndices[uint(gInstanceId[launchIndex])].faceIndicesStart;
++            const uint vertexIndex = indexBuffer.Load(faceStart * 4);
++            const uint fogIndex = srcFogIndices.Load(vertexIndex * 4);
++            if (fogIndex > 0) {
++                const RSPFog rspFog = RSPFogVector[fogIndex - 1];
++                const float4 clip = mul(RtParams.viewProj, float4(position, 1.0f));
++                fade = saturate(((max(clip.z, 0.0f) / max(clip.w, 1.0e-6f)) * rspFog.mul + rspFog.offset) / 255.0f) * RtParams.tuneFade.x;
++                fogColor = instanceRDPParams[instanceIndex].fogColor.rgb;
++            }
++        }
++        if (RtParams.tuneExperiment.x == 2.0f) {   // the Experiment row: 2 is the old fade toward one
++            factor = lerp(factor, float3(1.0f, 1.0f, 1.0f), fade);
++            gRefraction[launchIndex] = 0.0f;
++        }
++        else {
++            gRefraction[launchIndex] = float4(fogColor * fade, 0.0f);
++        }
++        if (RtParams.tuneFade.y > 0.0f) {
++            const float end = RtParams.tuneFade.y * RtParams.farDist;
++            const float distance = length(position - eyePosition());
++            factor = lerp(factor, float3(1.0f, 1.0f, 1.0f), smoothstep(end * 0.25f, end, distance));
++        }
++    }
++
++    // The RAW factor of this frame. The history is blended in afterward by RtTemporalCS, which
++    // clamps it to this frame's neighborhood first (patch 0008: the trails behind movement), so
++    // nothing here reads the previous frame.
++    // Weighted by how much of the pixel the surface covers (the primary pass, the position's
++    // spare component): a far cutout that is half sky in this pixel takes half its shading, and a
++    // light's own body none.
++    factor = lerp(float3(1.0f, 1.0f, 1.0f), factor, saturate(gShadingPosition[launchIndex].w));
+     gDirectLightAccum[launchIndex] = float4(factor, 1.0f);
+ }
+ 
+@@ -439,7 +956,7 @@ void IndirectRayGen() {
+         return;
+     }
+ 
+-    if (RtParams.level < 3) {
++    if ((RtParams.level < 3) || (RtParams.tuneBounce.x <= 0.0f)) {
+         gIndirectLightAccum[launchIndex] = 0.0f;
+         return;
+     }
+@@ -452,13 +969,15 @@ void IndirectRayGen() {
+     ray.Origin = rayOrigin(position, normal);
+     ray.Direction = direction;
+     ray.TMin = 0.0f;
+-    ray.TMax = BounceRange;
++    ray.TMax = max(RtParams.tuneBounce.y, 1.0f);
+ 
+     SurfacePayload payload;
+     payload.hitDistance = 0.0f;
+     payload.instanceId = -1;
+     payload.hitNormal = 0.0f;
+     payload.shadedColor = 0.0f;
++    payload.hitVelocity = 0.0f;
++    payload.coverage = 1.0f;
+     TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
+ 
+     // A ray that leaves the scene brings nothing: the sky's light is what the game's ambient
+@@ -478,7 +997,7 @@ void IndirectRayGen() {
+ void ReflectionRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+     const float4 water = gShadingSpecular[launchIndex];
+-    if ((RtParams.level < 3) || (water.w <= 0.0f)) {
++    if ((RtParams.level < 3) || (water.w <= 0.0f) || (RtParams.tuneReflection.x <= 0.0f)) {
+         gReflection[launchIndex] = 0.0f;
+         return;
+     }
+@@ -498,13 +1017,18 @@ void ReflectionRayGen() {
+     ray.Origin = surface + normal * ShadowBiasBase;
+     ray.Direction = reflected;
+     ray.TMin = 0.0f;
+-    ray.TMax = ReflectionRange;
++    // As far as the frame itself sees, at least: a range shorter than the lake made a line
++    // across the water where the far bank's reflection gave way to the sky's, and the line
++    // moved with the camera (the user, 2026-09-24).
++    ray.TMax = max(ReflectionRange, RtParams.farDist * 2.0f) * max(RtParams.tuneReflection.y, 0.05f);
+ 
+     SurfacePayload payload;
+     payload.hitDistance = 0.0f;
+     payload.instanceId = -1;
+     payload.hitNormal = 0.0f;
+     payload.shadedColor = 0.0f;
++    payload.hitVelocity = 0.0f;
++    payload.coverage = 1.0f;
+     TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
+ 
+     float3 radiance;
+@@ -513,10 +1037,18 @@ void ReflectionRayGen() {
+     }
+     else {
+         // The sky: the frame's own where the reflected direction meets a pixel the frame shows
+-        // sky in, else the pixel's fog color, the game's horizon.
+-        int2 skyPixel;
+-        if (viewportPixel(surface + reflected * RtParams.farDist, skyPixel) && (gInstanceId[skyPixel] < 0)) {
+-            radiance = SrgbToLinear(gBackgroundColor.Load(int3(skyPixel, 0)).rgb);
++        // sky in. Where it meets a pixel that shows a surface, or a point off the frame (the
++        // usual case at the frame's edges, since the game culls what is out of view and the ray
++        // missed what it should have hit), the frame's color at the nearest pixel within it: a
++        // stretched bank at the edge reads as water, while the fog color there drew a gray
++        // wedge (the user, 2026-09-24: "still reflecting issue where it cuts near edge of view").
++        const float4 farClip = mul(RtParams.viewProj, float4(surface + reflected * RtParams.farDist, 1.0f));
++        if (farClip.w > 0.0f) {
++            const float2 ndc = farClip.xy / farClip.w;
++            const float2 viewportOrigin = RtParams.viewport.xy;
++            const float2 viewportSize = RtParams.viewport.zw;
++            const float2 inViewport = clamp(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * viewportSize, 0.0f, viewportSize - 1.0f);
++            radiance = SrgbToLinear(gBackgroundColor.Load(int3(int2(viewportOrigin + inViewport), 0)).rgb);
+         }
+         else {
+             radiance = fogColorOf(gInstanceId[launchIndex]);
+@@ -525,7 +1057,7 @@ void ReflectionRayGen() {
+ 
+     const float cosTheta = saturate(dot(-direction, normal));
+     const float fresnel = 0.02f + 0.98f * pow(1.0f - cosTheta, 5.0f);
+-    gReflection[launchIndex] = float4(radiance * (fresnel * ReflectionStrength), 1.0f);
++    gReflection[launchIndex] = float4(radiance * (fresnel * RtParams.tuneReflection.x), 1.0f);
+ }
+ 
+ [shader("raygeneration")]
+@@ -539,8 +1071,20 @@ void RefractionRayGen() { }
+ // its own fog, and this is the air catching light, not a second fog.
+ static const uint ScatterSteps = 8;
+ static const float ScatterRange = 2500.0f;     // world units
+-static const float SunScatter = 0.000002f;     // per world unit of sunlit air: half a percent over the whole range
+-static const float LightScatter = 0.0004f;     // per world unit at a light's center
++// The air's light fades out with distance and is gone by ScatterFadeEnd: the game's own fog is
++// the distance's haze and fades far geometry INTO the sky, and a haze that grew with distance
++// instead stopped dead at the sky and at the trace range, a hard light line along the horizon.
++static const float ScatterFadeStart = 500.0f;
++static const float ScatterFadeEnd = 1400.0f;
++// The densities were first set against a composite that added the light in sRGB (ComposePS,
++// patch 0008 says why that was several times too strong); these are for the linear addition.
++// The sun's haze is OFF (2026-09-24): a haze that is a function of the distance from the eye is
++// a band that moves with the camera, and its far edge read as "a harsh fog falloff as the camera
++// moves" in the Lake Hylia and Kakariko arrivals whatever its fade. The sun's shafts belong to a
++// later pass that adds the DIFFERENCE between shadowed and open air, anchored to the occluders,
++// not a haze anchored to the eye. The lights' glow stays: it is anchored to the lights.
++static const float SunScatter = 0.0f;          // per world unit of sunlit air
++static const float LightScatter = 0.002f;      // per world unit at a light's center
+ 
+ [shader("raygeneration")]
+ void ScatterRayGen() {
+@@ -565,32 +1109,65 @@ void ScatterRayGen() {
+         return;
+     }
+ 
+-    const float end = min(ScatterRange, length(gShadingPosition[launchIndex].xyz - origin));
++    // The controls (patch 0008): the lights' glow density, the sun's haze density (off by the
++    // design), where the air's light is gone, and the lights' reach.
++    const float lightGlow = RtParams.tuneScatter.x;
++    const float sunHaze = RtParams.tuneScatter.y;
++    const float fadeEnd = max(RtParams.tuneScatter.z, 10.0f);
++    const float fadeStart = fadeEnd * 0.35f;
++    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f)) {
++        gScatter[launchIndex] = 0.0f;
++        return;
++    }
++
++    const float end = min(max(ScatterRange, fadeEnd), length(gShadingPosition[launchIndex].xyz - origin));
+ 
+-    const bool sun = (RtParams.sunShadows != 0) && any(RtParams.sunColor.rgb > 0.0f);
++    const bool sun = (RtParams.sunShadows == 1u) && any(RtParams.sunColor.rgb > 0.0f) && (sunHaze > 0.0f);   // the haze is the sun's alone, not a room's fill
+     const uint lights = min(RtParams.lightsCount, RtParams.maxLights);
+     const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 41);
+     const float step = end / float(ScatterSteps);
+     float3 sum = 0.0f;
+     for (uint s = 0; s < ScatterSteps; s++) {
+-        const float3 p = origin + direction * ((float(s) + noise.x) * step);
++        const float t = (float(s) + noise.x) * step;
++        const float3 p = origin + direction * t;
++        const float fade = 1.0f - smoothstep(fadeStart, fadeEnd, t);
++        if (fade <= 0.0f) {
++            break;
++        }
++
+         if (sun) {
+             float hitDistance;
+             const float visibility = traceVisibility(p, RtParams.sunDirection.xyz, 1.0e6f, hitDistance);
+-            sum += RtParams.sunColor.rgb * (visibility * SunScatter * step);
++            sum += RtParams.sunColor.rgb * (visibility * sunHaze * step * fade);
+         }
+ 
+-        for (uint i = 0; i < lights; i++) {
+-            const PointLight light = SceneLights[i];
+-            const float3 toLight = light.position - p;
+-            const float distance2 = dot(toLight, toLight);
+-            const float radius2 = light.attenuationRadius * light.attenuationRadius;
+-            if (distance2 < radius2) {
+-                sum += light.diffuseColor * ((1.0f - distance2 / radius2) * LightScatter * step);
++        if ((lightGlow > 0.0f) && (RtParams.tuneExperiment.x != 4.0f)) {   // the Experiment row: 4 is the glow off
++            for (uint i = 0; i < lights; i++) {
++                const PointLight light = SceneLights[i];
++                const float3 toLight = light.position - p;
++                const float distance2 = dot(toLight, toLight);
++                // THE GLOW'S OWN SIZE (2026-09-24, the user: "control the reach and the actual
++                // radius visibility of a light and its opacity all that independent"): the Glow
++                // size row scales the game's own radius for the glow alone, apart from the reach
++                // (tuneScatter.w, which is the light on surfaces), and the density below is the
++                // Glow density row alone, no longer scaled by the strength, so a strong light
++                // that reaches far can carry a small, faint glow.
++                const float glowScale = max(RtParams.tuneBounce.z, 0.01f);
++                const float radius = light.attenuationRadius * glowScale;
++                const float radius2 = radius * radius;
++                if (distance2 < radius2) {
++                    const float core = light.attenuationExponent * glowScale;
++                    const float core2 = core * core;
++                    // The Light strength row scales the glow with the light (14:35: at 0% strength a
++                    // pool of glow still followed Navi over the wall, and read as the light).
++                    sum += light.diffuseColor * (lightFalloff(distance2, radius2, core2) * lightGlow * step * fade);
++                }
+             }
+         }
+     }
+ 
++    // No history here (patch 0008): the glow is smooth on its own and follows a moving light
++    // (Navi), and a history of it painted a trail behind her.
+     gScatter[launchIndex] = float4(sum, 1.0f);
+ }
+ 
+@@ -623,11 +1200,173 @@ void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersect
+     const float4 c2 = asfloat(shadedColBuffer.Load4(indices.z * 16));
+     const float2 b = attributes.barycentrics;
+     payload.shadedColor = (c0 * (1.0f - b.x - b.y) + c1 * b.x + c2 * b.y).rgb;
++
++    // The hit's motion over the game frame (patch 0008): the world velocity the renderer keeps
++    // per vertex for its interpolation (RSPWorldCS: the world position less the previous one,
++    // a float4 each), interpolated the same way. The history keeps nothing on a surface that
++    // moved.
++    const float3 v0 = asfloat(velBuffer.Load3(indices.x * 16));
++    const float3 v1 = asfloat(velBuffer.Load3(indices.y * 16));
++    const float3 v2 = asfloat(velBuffer.Load3(indices.z * 16));
++    payload.hitVelocity = v0 * (1.0f - b.x - b.y) + v1 * b.x + v2 * b.y;
++    // THE SHADING NORMAL IS THE GAME'S OWN SMOOTH ONE (14:58). The triangle's flat normal made the
++    // lit to shadow turn on a face step from facet to facet ("the shadows are super polygonal",
++    // the user, asking for more polygons); the vertex processor writes the game's vertex normals
++    // in world space (a float4 each), and interpolated at the hit they round the turn the way the
++    // game's own shading does. A vertex without one is zero and keeps the flat normal, and a
++    // smooth normal facing away from the flat one (a hard edge's other side) is not used.
++    const float3 n0 = asfloat(normBuffer.Load3(indices.x * 16));
++    const float3 n1 = asfloat(normBuffer.Load3(indices.y * 16));
++    const float3 n2 = asfloat(normBuffer.Load3(indices.z * 16));
++    const float3 smooth = n0 * (1.0f - b.x - b.y) + n1 * b.x + n2 * b.y;
++    const float smooth2 = dot(smooth, smooth);
++    if (smooth2 > 1.0e-4f) {
++        const float3 smoothNormal = smooth * rsqrt(smooth2);
++        if (dot(smoothNormal, payload.hitNormal) > 0.2f) {
++            payload.hitNormal = smoothNormal;
++        }
++    }
++    // How much of the pixel this surface covers (1 unless it is a cutout far away); computed
++    // here, on the hit that won, rather than kept from an any hit that may have run for another
++    // candidate last.
++    payload.coverage = alphaCoverage(InstanceID(), PrimitiveIndex(), attributes.barycentrics, true);
++}
++
++// THE ALPHA TEST AT THE HIT (patch 0008). The game draws its tree lines, cliff tops, vines,
++// fences and grass as quads whose texture is transparent where there is nothing, and rejects
++// those texels with the RDP's alpha compare against the blend color's alpha. The rays saw the
++// whole quad as solid: a band of light above every ridge (fixed since by comparing with the
++// game's depth, which cannot help a shadow ray), a shadow the shape of the quad, and hard cut
++// edges on the vines and the balcony's fence (the user, 2026-09-24). So a hit on such a draw
++// samples its first texture at the hit's own texture coordinate, exactly as the raster path
++// does (TextureSampler.hlsli, at the first mip and without filtering), and ignores the hit where
++// the texel's alpha is under the threshold. Only draws with the alpha compare on pay for it.
++// primary: the eye's own ray, whose footprint on the surface is a pixel's; a shadow ray has no
++// pixel and always tests the texel.
++// Returns how much of the pixel the surface covers here: 1 for a solid draw or a covered texel,
++// 0 for a cut one, and a fraction far away where several texels fall in the pixel (below).
++float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, bool primary) {
++    const RenderIndices ri = instanceRenderIndices[instanceId];
++    const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
++    const OtherMode otherMode = { rp.omL, rp.omH };
++    const uint alphaCompare = otherMode.alphaCompare();
++    // THIS GAME CUTS ITS EDGES WITH COVERAGE, NOT THE ALPHA COMPARE. Its edge textured setups
++    // (the TEX_EDGE render modes in z_rcp.c: fences, ladders, vines, grass, tree lines) run with
++    // G_AC_NONE and CVG_X_ALPHA, so the coverage is scaled by the alpha and the raster drops a
++    // texel whose scaled coverage is under one count (RasterPS.hlsl, CoverageThreshold): an
++    // alpha under an eighth. The first version of this test honored the two compare modes
++    // only and so never ran on them ("fences ladders, vines etc still not working", the user,
++    // 2026-09-24).
++    const bool coverageCut = otherMode.cvgXAlpha();
++    if ((alphaCompare != G_AC_THRESHOLD) && (alphaCompare != G_AC_DITHER) && !coverageCut) {
++        return 1.0f;
++    }
++    if (!renderFlagUsesTexture0(rp.flags)) {
++        return 1.0f;
++    }
++
++    const uint3 indices = indexBuffer.Load3((ri.faceIndicesStart + primitiveIndex * 3) * 4);
++    const float2 uv0 = asfloat(genTexCoordBuffer.Load2(indices.x * 8));
++    const float2 uv1 = asfloat(genTexCoordBuffer.Load2(indices.y * 8));
++    const float2 uv2 = asfloat(genTexCoordBuffer.Load2(indices.z * 8));
++    const float2 uv = uv0 * (1.0f - barycentrics.x - barycentrics.y) + uv1 * barycentrics.x + uv2 * barycentrics.y;
++
++    // FAR AWAY THE RASTER SHOWS A BLEND, NOT HOLES. Its mip chain and coverage average a fence's
++    // texels once several fall in one pixel, while a single texel read here made a hole or a
++    // slat pixel by pixel: black and white speckle over a distant fence (the user, 2026-09-24).
++    // The footprint of the pixel's ray on the surface, in texels, is the hit's distance times
++    // the pixel's angle times the texels per world unit of this triangle. The first answer took
++    // the surface whole past one texel per pixel, and a ladder at the middle distance became a
++    // slab with dark blocks for holes ("ladder and vine fix work but only up close", the user);
++    // now the coverage over the footprint is estimated from five texel taps and cut at half.
++    float footprint = 0.0f;
++    if (primary) {
++        const float3 p0 = asfloat(posBuffer.Load3(indices.x * 16));
++        const float3 p1 = asfloat(posBuffer.Load3(indices.y * 16));
++        const float3 p2 = asfloat(posBuffer.Load3(indices.z * 16));
++        const float worldArea2 = length(cross(p1 - p0, p2 - p0));
++        const float2 e1 = uv1 - uv0;
++        const float2 e2 = uv2 - uv0;
++        const float uvArea2 = abs(e1.x * e2.y - e1.y * e2.x);
++        const float texelsPerUnit = sqrt(uvArea2 / max(worldArea2, 1.0e-6f));
++        const float pixelAngle = 2.0f * length(RtParams.cameraV.xyz) / (max(length(RtParams.cameraW.xyz), 1.0e-6f) * max(RtParams.viewport.w, 1.0f));
++        footprint = RayTCurrent() * pixelAngle * texelsPerUnit;
++    }
++
++    RDPTile rdpTile = RDPTiles[ri.rdpTileIndex];
++    if (!renderFlagDynamicTiles(rp.flags)) {
++        rdpTile.cms = renderCMS0(rp.flags);
++        rdpTile.cmt = renderCMT0(rp.flags);
++        rdpTile.nativeSampler = renderFlagNativeSampler0(rp.flags);
++    }
++    const GPUTile gpuTile = GPUTiles[ri.rdpTileIndex];
++    const float4 texel = sampleTextureLevel(rdpTile, gpuTile, false, false, false, uv, otherMode.textLUT(),
++                                            renderFlagCanDecodeTMEM(rp.flags), 0, renderFlagUsesHDR(rp.flags));
++    // The threshold is the blend color's alpha for the compare, the middle for the dithered
++    // compare (random per pixel on the console), and an eighth for the coverage cut; a draw
++    // with both takes the higher.
++    float threshold = coverageCut ? 0.125f : 0.0f;
++    if (alphaCompare == G_AC_THRESHOLD) {
++        threshold = max(threshold, instanceRDPParams[ri.instanceIndex].blendColor.a);
++    }
++    else if (alphaCompare == G_AC_DITHER) {
++        threshold = max(threshold, 0.5f);
++    }
++    const bool centerCovered = (texel.a >= threshold);
++    if (footprint <= 1.0f) {
++        return centerCovered ? 1.0f : 0.0f;
++    }
++
++    // THE PIXEL'S OWN TEXEL DECIDES WHETHER IT IS COVERED (the user, 2026-09-28, with the Hits
++    // view of Hyrule Field: every tree and the exterior fence stood in DARK green, which is a hit
++    // whose coverage is near zero, so the factor was pulled to one and they took no lighting at
++    // all. That is the cut-out he had been reporting all evening, on trees, on a fence, on a
++    // lattice gate, on shrubbery: "lots of objects and textures still have no interaction with
++    // point lights or lights in general".
++    //
++    // Why the average was wrong for them. Five binary taps spread over the footprint means a
++    // slat, a leaf cluster or a branch whose neighbors are gaps reads as a fifth covered,
++    // however solidly the RASTER drew it: this game cuts these edges with coverage (CVG_X_ALPHA)
++    // and the raster either keeps a pixel whole or discards it, so a kept pixel shows that
++    // surface at full strength and is owed its full shading. The average was measuring the
++    // texture's sparseness and spending it as darkness.
++    //
++    // What the average was FOR is still served: the ragged edge where a far tree line is half
++    // sky, which is the pixel whose own texel was CUT and whose neighbors were not. It keeps the
++    // hit there, weighted, exactly as before (2026-09-24, "a dark broken band along every distant
++    // cliff top"). And the case both were really standing in for, a traced hit the picture does
++    // not show, now has its own guard: the raster depth compare walks the ray on to the surface
++    // the frame actually shows (patch 0008, the primary ray).
++    //
++    // The Experiment row's 7 puts the old average back, for comparing the two in place.
++    if (centerCovered && (RtParams.tuneExperiment.x != 7.0f)) {
++        return 1.0f;
++    }
++
++    // Several texels to the pixel: the center and four taps spread over the footprint, each
++    // passed or cut on its own, and the share covered is the answer. The direct pass weights
++    // its factor by it, so a far tree line that is half leaves and half sky in a pixel takes
++    // half its shading: the raster shows that pixel as a blend, and giving it the leaves' full
++    // shadow drew a dark broken band along every distant cliff top (the user, 2026-09-24,
++    // "distant objects still have harsh blowout and harsh edge").
++    const float spread = min(footprint, 64.0f) * 0.35f;
++    float covered = (texel.a >= threshold) ? 1.0f : 0.0f;
++    const float2 taps[4] = { float2(-spread, -spread), float2(spread, -spread), float2(-spread, spread), float2(spread, spread) };
++    for (uint t = 0; t < 4; t++) {
++        const float4 tap = sampleTextureLevel(rdpTile, gpuTile, false, false, false, uv + taps[t], otherMode.textLUT(),
++                                              renderFlagCanDecodeTMEM(rp.flags), 0, renderFlagUsesHDR(rp.flags));
++        covered += (tap.a >= threshold) ? 1.0f : 0.0f;
++    }
++    return covered * 0.2f;
+ }
+ 
+ [shader("anyhit")]
+ void SurfaceAnyHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
+-    // Every surface is solid until the alpha test arrives with the shading (phase 54).
++    // Nothing of the surface in this pixel: the ray goes on. Anything of it: the hit stands, and
++    // the closest hit records how much (a partial cover far away weights the shading).
++    if (alphaCoverage(InstanceID(), PrimitiveIndex(), attributes.barycentrics, true) <= 0.0f) {
++        IgnoreHit();
++    }
+ }
+ 
+ [shader("miss")]
+@@ -636,10 +1348,17 @@ void SurfaceMiss(inout SurfacePayload payload) {
+     payload.instanceId = -1;
+     payload.hitNormal = 0.0f;
+     payload.shadedColor = 0.0f;
++    payload.hitVelocity = 0.0f;
++    payload.coverage = 1.0f;
+ }
+ 
+ [shader("anyhit")]
+ void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    // A transparent texel casts no shadow (patch 0008): a tree line's quad shadowed as a slab.
++    if (alphaCoverage(InstanceID(), PrimitiveIndex(), attributes.barycentrics, false) <= 0.0f) {
++        IgnoreHit();
++        return;
++    }
+     payload.visibility = 0.0f;
+     payload.hitDistance = RayTCurrent();
+     AcceptHitAndEndSearch();
+diff --git a/src/shaders/RtDepthResolveCS.hlsl b/src/shaders/RtDepthResolveCS.hlsl
+new file mode 100644
+index 0000000..90c8903
+--- /dev/null
++++ b/src/shaders/RtDepthResolveCS.hlsl
+@@ -0,0 +1,49 @@
++//
++// RT64, the renderer's patch series (OoT: Recompiled), patch 0008.
++//
++// The game's own rasterized depth, one sample per pixel, for the traced passes. The primary ray
++// compares each hit against it: a hit the raster does not show at that pixel is the cut-out part
++// of an alpha-tested quad (a tree line, a cliff's ragged top), which the rays treat as solid until
++// the material work arrives, and lighting it painted a band on the sky behind. The depth target
++// is multisampled when antialiasing is on, so this is built twice, and either way the passes read
++// one plain texture.
++//
++
++#if defined(MULTISAMPLING)
++Texture2DMS<float> gDepth : register(t1);
++#else
++Texture2D<float> gDepth : register(t1);
++#endif
++
++RWTexture2D<float> gOutput : register(u2);
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 pixel : SV_DispatchThreadID) {
++    uint width;
++    uint height;
++    gOutput.GetDimensions(width, height);
++    if ((pixel.x >= width) || (pixel.y >= height)) {
++        return;
++    }
++
++#if defined(MULTISAMPLING)
++    // The NEAREST sample: a pixel on a figure's edge holds the figure in some samples and the
++    // ground behind in the rest, and the first sample alone was the ground often enough that
++    // the rays' hit on the figure was dropped along a one pixel rim, which kept the game's own
++    // color beside the shaded figure: a white line following Link's contour as he walked (the
++    // user, 2026-09-24). A cut-out quad's transparent part holds the background in every
++    // sample, so the nearest is still behind the hit and the compare still drops it.
++    uint width2;
++    uint height2;
++    uint samples;
++    gDepth.GetDimensions(width2, height2, samples);
++    float depth = gDepth.Load(int2(pixel), 0);
++    for (uint s = 1; s < samples; s++) {
++        depth = min(depth, gDepth.Load(int2(pixel), int(s)));
++    }
++
++    gOutput[pixel] = depth;
++#else
++    gOutput[pixel] = gDepth.Load(int3(pixel, 0));
++#endif
++}
+diff --git a/src/shaders/RtFilterCS.hlsl b/src/shaders/RtFilterCS.hlsl
+new file mode 100644
+index 0000000..909b89f
+--- /dev/null
++++ b/src/shaders/RtFilterCS.hlsl
+@@ -0,0 +1,82 @@
++//
++// RT64, the renderer's patch series (OoT: Recompiled), patch 0008.
++//
++// The spatial filter over the direct light factor (phase 57): what the history cannot cover,
++// since every pass is one noisy sample per pixel per frame and the history reaches only where
++// the previous frame saw the same point. One step of an a trous filter: a 5 by 5 kernel whose
++// taps sit STEP pixels apart, weighted by how alike the tap's surface is to the pixel's (its
++// normal, whether it lies on the pixel's tangent plane) and by how alike the two factors are, so
++// a shadow's edge and a wall's edge both stay where they are while the grain between them
++// averages out. Built twice, STEP 1 then STEP 2, run in that order; the user asked for the
++// grain to go ("ray reconstruction", 2026-09-24), and this is the part of it every GPU has.
++//
++
++#ifndef STEP
++#define STEP 1
++#endif
++
++RWTexture2D<float4> gInput : register(u1);
++RWTexture2D<float4> gPosition : register(u2);
++RWTexture2D<float4> gNormal : register(u3);
++RWTexture2D<int> gInstance : register(u4);
++RWTexture2D<float4> gOutput : register(u5);
++
++static const float Kernel[5] = { 1.0f / 16.0f, 1.0f / 4.0f, 3.0f / 8.0f, 1.0f / 4.0f, 1.0f / 16.0f };
++static const float NormalPower = 64.0f;   // how sharply the weight falls as the normals part
++static const float PlaneSlope = 4.0f;     // a tap off the tangent plane by a quarter of its distance weighs nothing
++static const float FactorSigma = 0.25f;   // the factor difference that halves a tap's weight, about
++
++float luminance(float3 c) {
++    return dot(c, float3(0.299f, 0.587f, 0.114f));
++}
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 pixel : SV_DispatchThreadID) {
++    uint width;
++    uint height;
++    gOutput.GetDimensions(width, height);
++    if ((pixel.x >= width) || (pixel.y >= height)) {
++        return;
++    }
++
++    const float4 center = gInput[pixel];
++    if (gInstance[pixel] < 0) {
++        gOutput[pixel] = center;
++        return;
++    }
++
++    const float3 normal = gNormal[pixel].xyz;
++    const float3 position = gPosition[pixel].xyz;
++    const float centerLuma = luminance(center.rgb);
++    float3 sum = 0.0f;
++    float weightSum = 0.0f;
++    for (int j = -2; j <= 2; j++) {
++        for (int i = -2; i <= 2; i++) {
++            const int2 tap = int2(pixel) + int2(i, j) * STEP;
++            if ((tap.x < 0) || (tap.y < 0) || (tap.x >= int(width)) || (tap.y >= int(height))) {
++                continue;
++            }
++
++            if (gInstance[tap] < 0) {
++                continue;
++            }
++
++            float weight = Kernel[i + 2] * Kernel[j + 2];
++            const float3 tapNormal = gNormal[tap].xyz;
++            weight *= pow(saturate(dot(normal, tapNormal)), NormalPower);
++
++            const float3 offset = gPosition[tap].xyz - position;
++            const float distance = length(offset);
++            if (distance > 0.0f) {
++                weight *= saturate(1.0f - PlaneSlope * abs(dot(normal, offset)) / distance);
++            }
++
++            const float4 value = gInput[tap];
++            weight *= exp(-abs(luminance(value.rgb) - centerLuma) / FactorSigma);
++            sum += value.rgb * weight;
++            weightSum += weight;
++        }
++    }
++
++    gOutput[pixel] = (weightSum > 0.0f) ? float4(sum / weightSum, center.a) : center;
++}
+diff --git a/src/shaders/RtTemporalCS.hlsl b/src/shaders/RtTemporalCS.hlsl
+new file mode 100644
+index 0000000..84ed7b7
+--- /dev/null
++++ b/src/shaders/RtTemporalCS.hlsl
+@@ -0,0 +1,173 @@
++//
++// RT64, the renderer's patch series (OoT: Recompiled), patch 0008.
++//
++// The history of the direct light factor, with TEMPORAL CLAMPING. The direct pass writes one raw
++// sample per pixel per frame; this step reprojects the pixel's surface point into the previous
++// frame, takes the factor accumulated there when the previous frame saw the same surface (its
++// normal and its depth agree), CLAMPS that history to the range of raw factors in the pixel's 3
++// by 3 neighborhood this frame, and blends the new sample in at the smoothing control's share.
++//
++// The clamp is the whole point. A shadow or a bounced color cast BY something that moves onto a
++// surface that did not reprojects as valid (the surface is still there), so the old value stayed
++// and faded at the blend rate: "trailing shadows and colors that seem to paint behind movement
++// and fade over time" (the user, 2026-09-24, two recordings). A history the present frame's
++// neighborhood cannot support is a stale one and is pulled into range in a single frame, while
++// a noisy penumbra, whose neighborhood spans lit and shadowed, still accumulates.
++//
++
++#include "shared/rt64_raytracing_params.h"
++
++ConstantBuffer<RaytracingParams> RtParams : register(b0);
++RWTexture2D<float4> gRaw : register(u1);         // this frame's raw factor
++RWTexture2D<float4> gPrev : register(u2);        // the previous frame's accumulated factor
++RWTexture2D<float4> gPosition : register(u3);
++RWTexture2D<float4> gNormal : register(u4);
++RWTexture2D<int> gInstance : register(u5);
++RWTexture2D<float> gPrevDepth : register(u6);
++RWTexture2D<float4> gPrevNormal : register(u7);
++RWTexture2D<float4> gOutput : register(u8);      // the accumulated factor for this frame
++RWBuffer<uint> gStats : register(u9);            // [0] accepted, [1] traced, on one pixel in 64
++RWTexture2D<float4> gVelocity : register(u10);   // the hit's motion since the previous presented frame (xyz) where w is 0; water otherwise
++
++static const float ClampMargin = 0.02f;
++// World units per game frame. The still world's velocity is exactly zero (the same matrix both
++// frames), so the bar sits just above rounding: half a unit let Link's idle animation through,
++// and the shadows of his own hat and arms painted over his face as they crept (the user,
++// 2026-09-24, "the painting on links shadows ... now on his model").
++static const float MovingThreshold = 0.01f;
++// How far the clamp may move a history before the pixel is taken as crossed by a shadow that
++// moves over ground that does not (above the neighborhood's own spread), and over how much
++// more of a move the history is given up entirely. In the factor's own units, where 1 is the
++// surface at its full light.
++static const float RejectMargin = 0.05f;
++static const float RejectRange = 0.25f;
++
++// The same test the passes used to make themselves (Raytracing.hlsl, reprojectHistory).
++bool reprojectHistory(float3 position, float3 normal, out int2 previousPixel) {
++    previousPixel = int2(0, 0);
++    if (RtParams.reprojectValid == 0) {
++        return false;
++    }
++
++    const float4 clip = mul(RtParams.prevViewProj, float4(position, 1.0f));
++    if (clip.w <= 0.0f) {
++        return false;
++    }
++
++    const float2 ndc = clip.xy / clip.w;
++    const float2 viewportOrigin = RtParams.viewport.xy;
++    const float2 viewportSize = RtParams.viewport.zw;
++    const float2 inViewport = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * viewportSize;
++    if (any(inViewport < 0.0f) || any(inViewport >= viewportSize)) {
++        return false;
++    }
++
++    previousPixel = int2(viewportOrigin + inViewport);
++    const float3 previousNormal = gPrevNormal[previousPixel].xyz;
++    if (dot(previousNormal, normal) < 0.8f) {
++        return false;
++    }
++
++    const float expectedDepth = sqrt(saturate(length(position - RtParams.prevEye.xyz) / RtParams.farDist));
++    const float previousDepth = gPrevDepth[previousPixel];
++    return abs(previousDepth - expectedDepth) < (0.01f + 0.03f * expectedDepth);
++}
++
++[numthreads(8, 8, 1)]
++void CSMain(uint2 pixel : SV_DispatchThreadID) {
++    uint width;
++    uint height;
++    gOutput.GetDimensions(width, height);
++    if ((pixel.x >= width) || (pixel.y >= height)) {
++        return;
++    }
++
++    const float4 raw = gRaw[pixel];
++    if (gInstance[pixel] < 0) {
++        gOutput[pixel] = raw;
++        return;
++    }
++
++    const float blend = RtParams.tuneFade.w;   // the smoothing control: 1 is no history
++    // A SURFACE THAT MOVED IS REPROJECTED BY ITS MOTION. The hit's position less how far it moved
++    // since the previous presented frame is where the same point of the surface was, and that
++    // is what goes through the previous camera; the still world's motion is zero and nothing
++    // changes for it. Before this (2026-09-24) a moving surface kept no history at all, first
++    // because the current position reprojected onto another part of Link and his self shadow
++    // smeared over his face, then because the cure left him one sample a frame and grainy. The
++    // normal and depth tests still refuse a limb that turned; the clamp still pulls a stale
++    // shadow into this frame's range. The motion rides in the specular slot where the surface
++    // is not water (w is zero); water's slot holds its normal and does not move.
++    const float4 motion = gVelocity[pixel];
++    const float3 velocity = (motion.w > 0.0f) ? float3(0.0f, 0.0f, 0.0f) : motion.xyz;
++    float3 result = raw.rgb;
++    bool accepted = false;
++    // The factor's spare channel carries how many presented frames of history the pixel holds
++    // (1 when it took this frame's sample alone), for the History view of the Inspect row; the
++    // filter passes it through and the compose never reads it.
++    float age = 1.0f;
++    if (blend < 1.0f) {
++        int2 previousPixel;
++        accepted = reprojectHistory(gPosition[pixel].xyz - velocity, gNormal[pixel].xyz, previousPixel);
++        if (accepted) {
++            // The range this frame can support: the mean of the 3 by 3 neighborhood's raw factors
++            // plus or minus one deviation (surfaces only). The min and max of the nine were the
++            // first range, and with a soft sun disc the nine span lit to shadowed almost anywhere
++            // near an edge, which let a stale shadow ride along behind a moving one (the user,
++            // 14:28: "paint trail on movement is still a huge issue"); the deviation is tighter.
++            float3 mean = 0.0f;
++            float3 square = 0.0f;
++            float taps = 0.0f;
++            for (int j = -1; j <= 1; j++) {
++                for (int i = -1; i <= 1; i++) {
++                    const int2 tap = int2(pixel) + int2(i, j);
++                    if ((tap.x < 0) || (tap.y < 0) || (tap.x >= int(width)) || (tap.y >= int(height))) {
++                        continue;
++                    }
++                    if (gInstance[tap] < 0) {
++                        continue;
++                    }
++                    const float3 v = gRaw[tap].rgb;
++                    mean += v;
++                    square += v * v;
++                    taps += 1.0f;
++                }
++            }
++            mean /= max(taps, 1.0f);
++            const float3 deviation = sqrt(max(square / max(taps, 1.0f) - mean * mean, 0.0f));
++            const float3 low = mean - deviation;
++            const float3 high = mean + deviation;
++
++            const float4 previous = gPrev[previousPixel];
++            const float3 history = clamp(previous.rgb, low - ClampMargin, high + ClampMargin);
++
++            // A SHADOW THAT MOVES OVER GROUND THAT DOES NOT (2026-09-24, the user on the
++            // windmill: "a painting issue with the windmill shadow edge fade and animation as it
++            // is rotating"). The sails turn, so their shadow sweeps a floor whose own pixels
++            // never move: the history is accepted, the clamp drags the old value most of the way
++            // to the new one, and what is left behind the edge is the painting. How far the
++            // clamp had to move the history says it happened, and a pixel the edge has crossed
++            // starts again instead, taking this frame's sample whole; the spatial filter after
++            // this pass is what then smooths it. A still pixel is untouched, since its history
++            // sits inside the band and nothing is moved.
++            const float3 moved3 = abs(previous.rgb - history);
++            const float moved = max(max(moved3.r, moved3.g), moved3.b);
++            const float spread = max(max(deviation.r, deviation.g), deviation.b);
++            const float reject = saturate((moved - (spread + RejectMargin)) / RejectRange);
++            const float weight = lerp(blend, 1.0f, reject);
++
++            result = lerp(history, raw.rgb, weight);
++            age = lerp(min(previous.a + 1.0f, 64.0f), 1.0f, reject);
++        }
++    }
++
++    if (((pixel.x & 7) == 0) && ((pixel.y & 7) == 0)) {
++        uint previous;
++        if (accepted) {
++            InterlockedAdd(gStats[0], 1u, previous);
++        }
++        InterlockedAdd(gStats[1], 1u, previous);
++    }
++
++    gOutput[pixel] = float4(result, age);
++}
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+index 4aece46..0799fec 100644
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -30,6 +30,8 @@ namespace interop {
+         AmbientOcclusion,   // patch 0006
+         LocalLight,         // patch 0006
+         Scatter,            // patch 0007
++        History,            // patch 0008: how many presented frames each pixel's direct light history holds
++        Hits,               // patch 0008: what the primary ray made of each pixel (a hit, a hit the depth compare dropped, a miss)
+         Count
+     };
+ 
+@@ -86,6 +88,24 @@ namespace interop {
+         float4 sunDirection;
+         float4 sunColor;
+ 
++        // The history (patch 0008): the previous presented frame's eye, for the depth test of
++        // a reprojected point, and whether the history may be used at all (zero after a cut,
++        // a warp, a resize or on the first frames). Three words of padding keep the block's
++        // end on the shader's alignment.
++        float4 prevEye;
++        uint reprojectValid;
++        uint rasterDepthValid;   // the game's rasterized depth is there to compare a primary hit with
++        float depthScale;        // the RSP viewport's depth mapping for the traced projection, to put a hit's depth beside the depth image
++        float depthTranslate;
++        // The lighting controls (patch 0008), each group four wide and 16 byte aligned on both
++        // sides: the four words above fill the slot after prevEye.
++        float4 tuneOcclusion;    // x strength (0 off), y radius in world units, z the shadows' switch, w the local lights' switch
++        float4 tuneBounce;       // x strength (0 off), y range in world units
++        float4 tuneReflection;   // x strength (0 off), y a scale on twice the far plane
++        float4 tuneScatter;      // x the lights' glow density, y the sun's haze density, z the haze's end, w a scale on the lights' reach
++        float4 tuneFade;         // x 1 fades the lighting with the game's fog, y the distance fade as a fraction of the far plane (0 off), z the shadows' softness, w the history blend
++        float4 tuneExperiment;   // x the Experiment row of the lighting menu (0 off): a numbered variant of a disputed sum, for the person to cycle in play
++
+ #   ifdef HLSL_CPU
+         RaytracingParams() {
+             view = FLOAT4X4_IDENTITY;
