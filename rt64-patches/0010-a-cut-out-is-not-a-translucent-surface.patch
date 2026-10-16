@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 17:10:00 +0100
+Subject: [PATCH] A cut-out is not a translucent surface
+
+Patch 0010 of the renderer series (OoT: Recompiled).
+
+Patch 0006 gave every draw in the microcode's translucent z mode a query mask that no ray
+carries, so that a flame's billboard does not shadow its own torch. That rule is right for a
+billboard and wrong for a CUT-OUT: a draw whose texels are either written whole or discarded is
+opaque wherever it is drawn, whatever its z mode says, and this game hangs its trees, vines,
+ladders and fences on exactly that.
+
+The consequence had three faces, which is why it was reported three times as three things. Such
+a surface was traced by nothing, so it took no light at any distance and no shadow. It was
+sorted into the raster scene that runs AFTER the composite, so it took no fog share and no
+relight. And being drawn after the composite, it covered whatever had been drawn in front of it,
+which is why a fairy's glow disappeared behind a tree she was standing in front of.
+
+The user, 2026-09-30: "trees still do not allow navi or light or fog in front of it", with the
+note that the same shape of fault had been fixed before on dark doorways and on the sun's
+shadows over a glow. It had, and both of those were the same thing: a draw landing on the wrong
+side of the composite.
+
+A cut-out is now recognized by the coverage cut or the alpha compare, the two ways the microcode
+says "whole or not at all", and takes the depth mask like any wall. The primary ray sees it so it
+takes light, the shadow rays see it so it casts one, and it rasterizes before the composite so it
+takes the fog and the relight with the surface it hangs on. Its holes are the alpha test at the
+hit, as they already are for every cut-out the game draws in the opaque z mode.
+
+The Experiment row's "Cut-outs translucent" puts patch 0006's rule back, so the two can be put
+side by side the way the last several lighting questions were settled.
+
+With the ray tracing row Off none of this code runs: the classification sits inside the traced
+projection's branch, so the Off-is-identical rule is untouched.
+---
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1782,8 +1782,40 @@ namespace RT64 {
+                         raytracing.cullDisable = !call.shaderDesc.flags.culling;
+ 
+                         const interop::OtherMode &otherMode = call.callDesc.otherMode;
++                        // A CUT-OUT IS NOT A TRANSLUCENT SURFACE (patch 0010). A draw whose
++                        // texels are either drawn whole or not at all, which is what the
++                        // coverage cut and the alpha compare both say, is opaque wherever it IS
++                        // drawn, however its z mode reads. This game hangs its trees, vines,
++                        // ladders and fences on that and draws them in the translucent z mode,
++                        // where patch 0006's rule gave them a mask no ray carries: traced by
++                        // nothing, so lit by nothing at any distance; and sorted into the raster
++                        // scene that runs AFTER the composite, so they take no fog share and
++                        // cover whatever was drawn in front of them.
++                        //
++                        // That is the whole of the user's report of 2026-09-30, "trees still do
++                        // not allow navi or light or fog in front of it", and of the two cases
++                        // he remembered being fixed before it (the dark doorways, the sun's
++                        // shadows over a glow): all of them are a draw landing on the wrong side
++                        // of the composite.
++                        //
++                        // With this, a cut-out takes the depth mask like any wall: the primary
++                        // ray sees it so it takes light, the shadow rays see it so it casts, and
++                        // it rasterizes BEFORE the composite so it takes the fog and the relight
++                        // with the surface it hangs on. Its holes stay the alpha test at the
++                        // hit, as they already are for every cut-out the game draws in the
++                        // opaque z mode.
++                        //
++                        // WHY THIS IS A PATCH OF ITS OWN AND NOT A CORRECTION TO 0008: the rule
++                        // it replaces is patch 0006's, the series is a history, and this is the
++                        // change that has to be easy to find again if a cut-out ever needs to go
++                        // back. The Experiment row's "Cut-outs translucent" puts 0006's rule
++                        // back for a side by side, which is how the last few lighting questions
++                        // were settled.
++                        const uint32_t acMode = otherMode.alphaCompare();
++                        const bool cutoutDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER);
++                        const bool cutoutTranslucent = (float(rtResources->rtParams.tuneExperiment.x) == 8.0f);
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+-                        if (otherMode.zMode() == ZMODE_XLU) {
++                        if ((otherMode.zMode() == ZMODE_XLU) && !(cutoutDraw && !cutoutTranslucent)) {
+                             raytracing.queryMask = TranslucentRayQueryMask;
+                         }
+                         else {

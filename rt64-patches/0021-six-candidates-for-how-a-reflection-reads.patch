@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 21:00:00 +0100
+Subject: [PATCH] Six candidates for how a reflection reads
+
+Patch 0021 of the renderer series (OoT: Recompiled).
+
+The reflections came back and brought three complaints, each a different question, and the user's
+instruction was "dont guess, add rungs to test". So each gets a candidate rather than an answer.
+
+  31  the frame color is taken as the COMPOSITE will show it, not as the raster holds it
+  32  the whole reflection is dimmed by the light falling on the water itself
+  33  the frame is never used; the surface's own lit color stands in everywhere
+  34  the ESTIMATE is never used. It is a lit vertex color times a constant standing in for a
+      texture's average, so a BLACK surface comes back pale, which is the shape of "black turns
+      white in reflections no matter the time of day" and needs no inversion to produce
+  35  a point the frame cannot show takes the FOG's color rather than the nearest edge pixel.
+      The clamp is what smears one pixel into "a stretching trail ... stretching endlessly"; the
+      comment in that branch says the fog was tried and rejected for drawing a gray wedge, and
+      that trade is now his to judge rather than mine to assume
+  36  THE PRIMARY HIT ITSELF IS THE PLANE when it is water
+
+36 is the one that stops the three wants pulling apart. Every rung before it had to choose between
+water as a traced surface, so a fairy's glow can light it, and water NOT being the opaque hit, so
+the probe can find something in front of it. They are the same question answered two ways. The way
+out is to stop asking the probe for a surface in front: where the hit the frame already shows is a
+horizontal face of a depthless translucent draw, it IS the water, it is lit like any other
+surface, and the reflection has its plane without a second trace.
+
+All six classify exactly as rung 30 does, so anything that changes is the candidate's doing.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -70,6 +70,9 @@ bool hitWritesDepth(int instanceId);
+ // translucent, both reading depth, neither writing it, both plenty of triangles. They differ in
+ // their NORMAL, which is not known when an instance is classified and is known here.
+ bool hitIsWaterLike(uint instanceId, uint primitiveIndex);
++// The same question asked of the INSTANCE alone, for the raygen, which has a normal in the
++// payload but no primitive index to take one from.
++bool instanceIsDepthlessTranslucent(int instanceId);
+ 
+ // IS A LADDER RUNG BELOW `rung` SELECTED (patch 0017)? The foliage work was settled on the
+ // Experiment row and then made the DEFAULT, because a fix nobody can find is not shipped: that
+@@ -318,6 +321,17 @@ void PrimaryRayGen() {
+         if ((water.instanceId >= 0) && (water.hitNormal.y > 0.9f)) {
+             gShadingSpecular[launchIndex] = float4(water.hitNormal, water.hitDistance);
+         }
++        // F (rung 36): THE PRIMARY HIT ITSELF IS THE PLANE when it is water. Every rung
++        // before this one had to choose: water as a traced surface so a fairy can light it,
++        // or water NOT the opaque hit so this probe can find something in front of it. They
++        // are the same question answered two ways, and the way out is to stop asking the
++        // probe for a surface in FRONT. The payload already carries the normal and the
++        // distance of the hit the frame shows; where that hit is a horizontal face of a
++        // depthless translucent draw, it IS the water, and it is lit like any other surface.
++        if ((RtParams.tuneExperiment.x == 36.0f) && (payload.instanceId >= 0) &&
++            (payload.hitNormal.y > 0.9f) && instanceIsDepthlessTranslucent(payload.instanceId)) {
++            gShadingSpecular[launchIndex] = float4(payload.hitNormal, payload.hitDistance);
++        }
+     }
+     if (payload.instanceId >= 0) {
+         // A hit is lit by the passes: the diffuse alpha is what the composite reads to apply the
+@@ -715,11 +729,27 @@ float3 radianceFrom(float3 hitPosition, float3 shadedColor, bool hit, int pixelI
+             const float frameLuma = dot(frame, float3(0.299f, 0.587f, 0.114f));
+             const float estimateLuma = dot(estimate, float3(0.299f, 0.587f, 0.114f));
+             if (frameLuma <= estimateLuma * OverlayRatio + 0.02f) {
+-                return frame;
++                // A (31): this frame is the game's RASTER, before the composite multiplies
++                // it by the light, so a reflection of a dark scene comes back undarkened.
++                if (RtParams.tuneExperiment.x == 31.0f) {
++                    return frame * gDirectLightAccum[pixel].rgb;
++                }
++                // C (33): the frame is not used at all; the surface's own lit color stands
++                // in everywhere, which is what this already falls back to.
++                if (RtParams.tuneExperiment.x != 33.0f) {
++                    return frame;
++                }
+             }
+         }
+     }
+ 
++    // D (34): the estimate is the surface's lit VERTEX color times a constant standing in
++    // for its texture's average, so for a BLACK surface it hands back a pale color. That is
++    // the shape of "black turns white in reflections no matter the time of day", and it
++    // needs no inversion to produce. Here the fog's color stands in instead.
++    if (RtParams.tuneExperiment.x == 34.0f) {
++        return fogColorOf(pixelInstance);
++    }
+     return estimate;
+ }
+ 
+@@ -1152,7 +1182,16 @@ void ReflectionRayGen() {
+             const float2 viewportOrigin = RtParams.viewport.xy;
+             const float2 viewportSize = RtParams.viewport.zw;
+             const float2 inViewport = clamp(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * viewportSize, 0.0f, viewportSize - 1.0f);
+-            radiance = SrgbToLinear(gBackgroundColor.Load(int3(int2(viewportOrigin + inViewport), 0)).rgb);
++            // E (35): the clamp to the viewport's edge smears one pixel along the whole
++            // reflection, which is the stretching trail he sees. The comment above says the
++            // fog color was tried and rejected for drawing a gray wedge; both are now
++            // visible so the trade can be judged rather than assumed.
++            if (RtParams.tuneExperiment.x == 35.0f) {
++                radiance = fogColorOf(gInstanceId[launchIndex]);
++            }
++            else {
++                radiance = SrgbToLinear(gBackgroundColor.Load(int3(int2(viewportOrigin + inViewport), 0)).rgb);
++            }
+         }
+         else {
+             radiance = fogColorOf(gInstanceId[launchIndex]);
+@@ -1161,7 +1200,13 @@ void ReflectionRayGen() {
+ 
+     const float cosTheta = saturate(dot(-direction, normal));
+     const float fresnel = 0.02f + 0.98f * pow(1.0f - cosTheta, 5.0f);
+-    gReflection[launchIndex] = float4(radiance * (fresnel * RtParams.tuneReflection.x), 1.0f);
++    // B (32): the whole reflection is dimmed by the light falling on the WATER itself, so a
++    // reflection lying in shadow is dark even when the thing it reflects is lit.
++    float3 reflectionOut = radiance * (fresnel * RtParams.tuneReflection.x);
++    if (RtParams.tuneExperiment.x == 32.0f) {
++        reflectionOut *= gDirectLightAccum[launchIndex].rgb;
++    }
++    gReflection[launchIndex] = float4(reflectionOut, 1.0f);
+ }
+ 
+ [shader("raygeneration")]
+@@ -1387,6 +1432,16 @@ bool hitWritesDepth(int instanceId) {
+     return true;
+ }
+ 
++bool instanceIsDepthlessTranslucent(int instanceId) {
++    if (instanceId < 0) {
++        return false;
++    }
++    const RenderIndices ri = instanceRenderIndices[instanceId];
++    const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
++    const OtherMode otherMode = { rp.omL, rp.omH };
++    return (otherMode.zMode() == ZMODE_XLU) && !otherMode.zUpd();
++}
++
+ bool hitIsWaterLike(uint instanceId, uint primitiveIndex) {
+     const RenderIndices ri = instanceRenderIndices[instanceId];
+     const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
+@@ -1563,7 +1618,7 @@ void SurfaceAnyHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionA
+     // it was before the foliage work, so the primary reaches the bed, the shadow lands on the bed,
+     // and the probe finds the water in front of it. A vertical one is foliage and is unaffected.
+     if ((payload.coverage >= 0.0f) && hitIsWaterLike(InstanceID(), PrimitiveIndex()) &&
+-        (RtParams.tuneExperiment.x == 30.0f)) {
++        (RtParams.tuneExperiment.x >= 30.0f) && (RtParams.tuneExperiment.x < 36.0f)) {
+         IgnoreHit();
+         return;
+     }
+@@ -1588,7 +1643,8 @@ void SurfaceMiss(inout SurfacePayload payload) {
+ void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
+     // Water casts nothing either (patch 0019, rung 30), for the same reason and so that the two
+     // rays agree about what water is.
+-    if (hitIsWaterLike(InstanceID(), PrimitiveIndex()) && (RtParams.tuneExperiment.x == 30.0f)) {
++    if (hitIsWaterLike(InstanceID(), PrimitiveIndex()) && (RtParams.tuneExperiment.x >= 30.0f) &&
++        (RtParams.tuneExperiment.x < 36.0f)) {
+         IgnoreHit();
+         return;
+     }
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1932,6 +1932,20 @@ namespace RT64 {
+                             // did before the foliage work, the probe finds it again, and foliage
+                             // is untouched.
+                             case 30: solidDraw = otherMode.zCmp() && manyTriangles; break;
++                            // 31 to 35 are rung 30 with one candidate each for how the
++                            // REFLECTION reads, which is a different question from which rays
++                            // see what and is answered in the shader. Classified identically, so
++                            // only the reflection differs between them.
++                            case 31:
++                            case 32:
++                            case 33:
++                            case 34:
++                            case 35:
++                            // 36 is the one that stops the three wants pulling apart: water is
++                            // a traced surface again, so a fairy lights it, and the reflection
++                            // takes the primary hit itself as its plane rather than probing for
++                            // one in front of it.
++                            case 36: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             // THE DEFAULT IS NOW THE RULE THAT WON (patch 0017), which is rung 25:
+                             // a draw in the translucent z mode that READS depth and is more than a
+                             // sprite is solid, and it casts. The user, 2026-09-30, on that rung:
+@@ -1972,7 +1986,7 @@ namespace RT64 {
+                         // all the fixes for trees back"). Reading the code did not explain how, so
+                         // it is offered as something to observe rather than as a fix.
+                         if ((wasTranslucent && solidDraw) &&
+-                            ((cutoutRule == 27) || (cutoutRule == 29) || (cutoutRule == 30))) {
++                            ((cutoutRule == 27) || (cutoutRule == 29) || (cutoutRule >= 30))) {
+                             raytracing.queryMask |= TranslucentRayQueryMask;
+                         }
+                         if (drawData.extraParams[call.callDesc.callIndex].shadowCatcherFactor > 0.0f) {

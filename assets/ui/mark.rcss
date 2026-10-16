@@ -1,0 +1,18 @@
+/* The mark: three stacked triangles, ours, in the decision's brass, with the gleam crossing them
+ * every few seconds exactly as the decision's snapshots draw it. It is drawn by the mark's pixel
+ * shader (src/ui/shaders/ui.hlsl, PSMark) through RmlUi's shader decorator, because the shape is
+ * a mask over a sliding gradient and the renderer draws masks in a shader or not at all. The box
+ * is sized here; the shader fits and centers the mark inside it. Tokens only, as every component
+ * sheet.
+ *
+ * Markup, in every lid and in the hint:
+ *
+ *     <div class="mark"></div>
+ */
+
+.mark
+{
+	width: var(--mark-w);
+	height: var(--mark-h);
+	decorator: shader(mark);
+}

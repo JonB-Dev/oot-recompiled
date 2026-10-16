@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 7 Oct 2026 17:28:19 -0400
+Subject: [PATCH] The texture detail row works on a DDS pack
+
+Patch 0026 of the renderer series (OoT: Recompiled).
+
+Patch 0025 read a DDS replacement as made, with a note that skipping its top levels would wait for
+a DDS pack to test with. The user asked on 2026-10-07 for his pack to be converted to BC7 DDS, so
+that pack now exists, and without this the Texture detail row would do nothing for it: a row that
+does nothing is the defect this project's notes keep naming.
+
+A DDS file already carries its own smaller versions. Half the size is the mip chain started one
+level down, a quarter two levels down: setDDS takes the number of levels to skip, sizes the texture
+from the first level kept and reads every level kept from its own place in the file. Nothing is
+resized and nothing is decoded; the top levels are simply not uploaded. A texture 64 texels or
+smaller on its longest side is read as made, the same rule as a PNG, and at least one level is
+always kept.
+
+A share between those steps has no level of its own and reads as made, which is why the program's
+row became Full, Half and Quarter in the same change: the same three steps mean the same thing for
+both formats.
+
+At 100, the default, setDDS skips nothing and does what it did before.
+---
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -735,7 +735,7 @@ namespace RT64 {
+         }
+     }
+ 
+-    bool TextureCache::setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool, std::mutex *uploadResourcePoolMutex) {
++    bool TextureCache::setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool, std::mutex *uploadResourcePoolMutex, uint32_t skipMips) {
+         assert(dstTexture != nullptr);
+         assert(device != nullptr);
+         assert(commandList != nullptr);
+@@ -753,13 +753,24 @@ namespace RT64 {
+         uint32_t blockWidth, blockHeight;
+         ddspp::get_block_size(ddsDescriptor.format, blockWidth, blockHeight);
+ 
++        // THE TEXTURE DETAIL ROW ON A DDS (patch 0026, OoT: Recompiled). The file already holds its
++        // own smaller versions, so half the size is the chain started one level down and a quarter
++        // two levels down: nothing is resized and nothing is decoded, the top levels are simply
++        // not uploaded. Each level kept is read from its own place in the file. A texture 64
++        // texels or smaller on its longest side is read as made, the same rule as a PNG, and at
++        // least one level is always kept.
++        uint32_t skip = 0;
++        if ((skipMips > 0) && (ddsDescriptor.numMips > 1) && (std::max(ddsDescriptor.width, ddsDescriptor.height) > 64)) {
++            skip = std::min(skipMips, ddsDescriptor.numMips - 1);
++        }
++
+         RenderTextureDesc desc;
+         desc.dimension = toRenderDimension(ddsDescriptor.type);
+-        desc.width = nextSizeAlignedTo(ddsDescriptor.width, blockWidth);
+-        desc.height = nextSizeAlignedTo(ddsDescriptor.height, blockHeight);
++        desc.width = nextSizeAlignedTo(std::max(ddsDescriptor.width >> skip, 1U), blockWidth);
++        desc.height = nextSizeAlignedTo(std::max(ddsDescriptor.height >> skip, 1U), blockHeight);
+         desc.depth = 1;
+         desc.arraySize = 1;
+-        desc.mipLevels = ddsDescriptor.numMips;
++        desc.mipLevels = ddsDescriptor.numMips - skip;
+         desc.format = toRenderFormat(ddsDescriptor.format);
+ 
+         dstTexture->texture = device->createTexture(desc);
+@@ -780,7 +791,7 @@ namespace RT64 {
+             mipmapOffsets.emplace_back(totalSize);
+ 
+             uint32_t mipHeight = std::max(desc.height >> mip, 1U);
+-            uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip);
++            uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip + skip);
+             uint32_t alignedRowPitch = nextSizeAlignedTo(ddsRowPitch, TextureDataPitchAlignment);
+             uint32_t rowCount = (mipHeight + blockWidth - 1) / blockWidth;
+             totalSize += alignedRowPitch * rowCount;
+@@ -803,8 +814,8 @@ namespace RT64 {
+         for (uint32_t mip = 0; mip < desc.mipLevels; mip++) {
+             uint32_t mipOffset = mipmapOffsets[mip];
+             uint32_t mipHeight = std::max(desc.height >> mip, 1U);
+-            uint32_t ddsOffset = ddspp::get_offset(ddsDescriptor, mip, 0);
+-            uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip);
++            uint32_t ddsOffset = ddspp::get_offset(ddsDescriptor, mip + skip, 0);
++            uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip + skip);
+             uint32_t alignedRowPitch = nextSizeAlignedTo(ddsRowPitch, TextureDataPitchAlignment);
+             uint32_t rowCount = (mipHeight + blockWidth - 1) / blockWidth;
+             memcpyRows(&dstData[mipOffset], alignedRowPitch, &imageData[ddsOffset], ddsRowPitch, rowCount);
+@@ -818,7 +829,7 @@ namespace RT64 {
+             uint32_t offset = mipmapOffsets[mip];
+             uint32_t mipWidth = std::max(desc.width >> mip, 1U);
+             uint32_t mipHeight = std::max(desc.height >> mip, 1U);
+-            uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip);
++            uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip + skip);
+             uint32_t alignedRowWidth = ((nextSizeAlignedTo(ddsRowPitch, TextureDataPitchAlignment) + formatSize - 1) / formatSize) * blockWidth;
+             commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(dstTexture->texture.get(), mip), RenderTextureCopyLocation::PlacedFootprint(dstUploadResource.get(), desc.format, mipWidth, mipHeight, 1, alignedRowWidth, offset));
+         }
+@@ -938,9 +949,16 @@ namespace RT64 {
+         uint32_t magicNumber = *reinterpret_cast<const uint32_t *>(fileBytes.data());
+         bool loadedTexture = false;
+         switch (magicNumber) {
+-        case ddspp::DDS_MAGIC:
+-            loadedTexture = TextureCache::setDDS(replacementTexture, device, commandList, fileBytes.data(), fileBytes.size(), dstUploadResource, resourcePool, uploadResourcePoolMutex);
++        case ddspp::DDS_MAGIC: {
++            // The Texture detail row as whole mip levels (patch 0026): half is one level down, a
++            // quarter two. A share between those has no level of its own and reads as made.
++            uint32_t skipMips = 0;
++            for (uint32_t share = detailPercent; (share <= 50) && (skipMips < 16); share *= 2) {
++                skipMips++;
++            }
++            loadedTexture = TextureCache::setDDS(replacementTexture, device, commandList, fileBytes.data(), fileBytes.size(), dstUploadResource, resourcePool, uploadResourcePoolMutex, skipMips);
+             break;
++        }
+         case PNG_MAGIC: {
+             int width, height;
+             stbi_uc *data = stbi_load_from_memory(fileBytes.data(), fileBytes.size(), &width, &height, nullptr, 4);
+@@ -958,8 +976,8 @@ namespace RT64 {
+                 //
+                 // A texture 64 texels or smaller on its longest side is read as made: it costs
+                 // nothing worth saving, and the game's own texture under it is often that small,
+-                // so shrinking it would read worse than the original. A DDS replacement is read as
+-                // made too: it carries its own mipmaps and is already a quarter of a PNG's size.
++                // so shrinking it would read worse than the original. A DDS replacement skips its
++                // top mip levels instead (patch 0026, in setDDS).
+                 std::vector<uint8_t> reduced;
+                 const uint8_t *pixels = data;
+                 uint32_t outWidth = uint32_t(width);
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -23,8 +23,8 @@
+ #include "rt64_texture.h"
+ 
+ // Patch 0025 (OoT: Recompiled): the texture cache can read a pack's PNG textures at a share of
+-// their own size. Defined so the program can tell a renderer built with the series from one
+-// built without it.
++// their own size, and since patch 0026 a DDS pack's by skipping top mip levels. Defined so the
++// program can tell a renderer built with the series from one built without it.
+ #define RT64_REPLACEMENT_DETAIL 1
+ 
+ namespace interop {
+@@ -271,7 +271,7 @@ namespace RT64 {
+         void getReplacementPoolStats(uint64_t &usedSize, uint64_t &cachedSize, uint64_t &maxSize);
+         Texture *getTexture(uint32_t textureIndex);
+         static void setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+-        static bool setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
++        static bool setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr, uint32_t skipMips = 0);
+         static bool setLowMipCache(RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, std::unordered_map<std::string, LowMipCacheTexture> &dstTextureMap, uint64_t &totalMemory);
+         static Texture *loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr, uint32_t detailPercent = 100);
+     };

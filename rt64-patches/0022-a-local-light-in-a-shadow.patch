@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 21:30:00 +0100
+Subject: [PATCH] A local light in a shadow
+
+Patch 0022 of the renderer series (OoT: Recompiled).
+
+A fairy's glow does not lift the bridge's shadow where it lies on the water. That is the same
+complaint that began this work on 2026-09-28, on a different surface, and it is worth being clear
+that the arithmetic behind it is not a bug.
+
+The factor this pass writes is the light that REACHES a surface over the light the game already
+gave it, and the denominator is the UNSHADOWED full light. In a sunlit scene that denominator
+carries the whole sun, so a local light worth a fraction of the sun moves the ratio very little,
+and the knee above the game's own full light then compresses whatever it does add. A light in
+shade is therefore quiet by construction, which is right for a candle and wrong for the thing the
+user keeps describing as a torch in a tunnel.
+
+Two parts of that can be loosened and they are different, so they are separate rungs rather than
+one tuning:
+
+  31  the local light is added AFTER the knee, so it is never compressed
+  32  the local light counts for more where the sun is BLOCKED, in proportion to how much of the
+      sun is missing at that surface: nothing in full sun, double in full shadow
+  33  both
+
+Offered as rungs because the user's standing instruction for this area is "dont guess, add rungs
+to test", and because which of these looks right is a judgment about the game's look rather than
+something the code can settle.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -994,9 +994,38 @@ void DirectRayGen() {
+     // light in the shade adds every bit of itself); the EXCESS above it is compressed, one over
+     // one plus itself, so a strong light on a sunlit wall reads as a glow and never as white.
+     // The same knee holds the bounce and the sun's own overshoot.
+-    const float3 shadedRaw = bounceTerm + sunTermShaded + local;
++    // A LOCAL LIGHT IN A SHADOW (rungs 31 to 33, the user 2026-09-30: a fairy's glow does not
++    // lift the bridge's shadow where it lies on the water, which is the same complaint that
++    // began this work on 2026-09-28 on a different surface).
++    //
++    // The arithmetic is why, and it is not a bug: the factor is the light that REACHES a surface
++    // over the light the game already gave it, and `lit` is the UNSHADOWED full light. In a
++    // sunlit scene that denominator carries the whole sun, so a fairy worth a fraction of the sun
++    // moves the ratio very little, and the knee then compresses whatever she adds above `lit`.
++    // Two things can be loosened and they are different, so they are separate rungs.
++    //
++    //   31  her light is added AFTER the knee, so it is never compressed
++    //   32  her light counts for more where the sun is BLOCKED, in proportion to how much of the
++    //       sun is missing, which is what makes a torch read as a torch in a tunnel
++    //   33  both
++    const float rung = RtParams.tuneExperiment.x;
++    const bool localAfterKnee = (rung == 31.0f) || (rung == 33.0f);
++    const bool localLiftsShade = (rung == 32.0f) || (rung == 33.0f);
++    float3 localTerm = local;
++    if (localLiftsShade) {
++        // How much of the sun this surface is missing, per channel, as a share of the sun it
++        // would have had. Nothing in full sun, everything in full shadow.
++        const float3 sunFull = max(sunColor * ndl, 0.0f);
++        const float3 missing = max(sunFull - sunTermShaded, 0.0f);
++        const float3 share = saturate(missing / max(sunFull, 1.0e-4f));
++        localTerm = local * (1.0f + share);
++    }
++    const float3 shadedRaw = bounceTerm + sunTermShaded + (localAfterKnee ? float3(0.0f, 0.0f, 0.0f) : localTerm);
+     const float3 excess = max(shadedRaw - lit, 0.0f);
+-    const float3 shaded = min(min(shadedRaw, lit) + excess / (1.0f + excess), shadeCap);
++    float3 shaded = min(min(shadedRaw, lit) + excess / (1.0f + excess), shadeCap);
++    if (localAfterKnee) {
++        shaded = min(shaded + localTerm, shadeCap);
++    }
+     float3 factor;
+     factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;
+     factor.y = (lit.y > 1.0e-4f) ? (shaded.y / lit.y) : 1.0f;

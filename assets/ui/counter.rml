@@ -1,0 +1,18 @@
+<rml>
+<head>
+    <title>Counter</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+</head>
+<body class="overlay">
+    <!-- The frame rate counter (the user's ask of 2026-09-19): a small plate at the top right
+         of the picture, beside the game's own interface, the frames presented per second. The
+         shell fills the number twice a second and shows the document while the row is on. -->
+    <div class="counter" id="counter">
+        <div class="mark"></div>
+        <span class="counter-value" id="counter-value">0</span>
+        <span class="counter-unit">fps</span>
+    </div>
+</body>
+</rml>

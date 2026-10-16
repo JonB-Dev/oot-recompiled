@@ -1,0 +1,117 @@
+<rml>
+<head>
+    <title>Menu</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="medallion.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+    <link type="text/rcss" href="cut.rcss"/>
+    <link type="text/rcss" href="shell.rcss"/>
+    <link type="text/rcss" href="prompts.rcss"/>
+</head>
+<!-- THE ONE MENU (the menus plan, phase 96): the launcher before Play and the in-game menu after
+     it are this document. It draws what is around the page: the head with the logo, the dial of
+     section medallions, the current section's name, the prompts, the held badge. The page itself
+     is the section's own document, laid into the box #sh-host leaves for it (src/ui/ui_shell.cpp,
+     place_page), until each section moves in. The data model "shell" (src/ui/models/
+     shell_model.h) carries the router's answer; the placement is a class on the body.
+
+     The dial and the prompts are for the pointer and the shoulders only: data-nav="pointer"
+     keeps them out of the directions, which move within the page (nav_rml.h). -->
+<body class="shell" data-model="shell"
+      data-class-launcher="placement == 'launcher'" data-class-left="placement == 'left'"
+      data-class-right="placement == 'right'" data-class-center="placement == 'center'">
+
+    <div class="sh-scrim"></div>
+
+    <div class="sh-panel" id="sh-panel">
+        <div class="sh-ground"><div class="survey"></div></div>
+        <div class="cut-edge sh-cut"></div>
+        <div class="cut-edge mirror sh-cut-mirror"></div>
+
+        <!-- The head: the logo, and in the launcher's own window its buttons and the version. The
+             band is the window's drag area (main/launch.cpp), its buttons excepted. -->
+        <div class="sh-mast" id="sh-mast">
+            <div class="logo">
+                <div class="logo-slab"></div>
+                <div class="md logo-md">
+                    <div class="ly shadows"></div>
+                    <div class="ly leaf-l-o1"></div><div class="ly leaf-l-o2"></div><div class="ly leaf-l-i1"></div><div class="ly leaf-l-i2"></div><div class="ly leaf-l-c"></div>
+                    <div class="ly leaf-r-o1"></div><div class="ly leaf-r-o2"></div><div class="ly leaf-r-i1"></div><div class="ly leaf-r-i2"></div><div class="ly leaf-r-c"></div>
+                    <div class="ly rim"></div>
+                    <div class="mark logo-mark"></div>
+                </div>
+            </div>
+            <div class="sh-side">
+                <div class="sh-win">
+                    <div class="sh-wb" id="win-min" data-nav="pointer"><svg class="win-ic" src="../icons/minus.svg"/></div>
+                    <div class="sh-wb" id="win-max" data-nav="pointer"><svg class="win-ic" src="../icons/square.svg"/></div>
+                    <div class="sh-wb sh-close" id="win-close" data-nav="pointer"><svg class="win-ic" src="../icons/x.svg"/></div>
+                </div>
+                <span class="sh-ver">{{version}}</span>
+            </div>
+        </div>
+
+        <!-- The dial: every section as a medallion; the current one large and lit, two either side,
+             the rest off the dial until it turns. In the centered placement it is the rail, every
+             section listed with its name. -->
+        <div class="sh-dial" id="sh-dial">
+            <div class="sec" data-for="s : sections" data-nav="pointer" data-attr-id="'sec-' + s.id"
+                 data-class-slot-l2="s.slot == -2" data-class-slot-l1="s.slot == -1" data-class-slot-c="s.slot == 0"
+                 data-class-slot-r1="s.slot == 1" data-class-slot-r2="s.slot == 2" data-class-slot-off="s.slot == 99"
+                 data-class-cur="s.current">
+                <div class="md" data-class-is-f="s.current">
+                    <div class="ly shadows"></div>
+                    <div class="ly leaf-l-o1"></div><div class="ly leaf-l-o2"></div><div class="ly leaf-l-i1"></div><div class="ly leaf-l-i2"></div><div class="ly leaf-l-c"></div>
+                    <div class="ly leaf-r-o1"></div><div class="ly leaf-r-o2"></div><div class="ly leaf-r-i1"></div><div class="ly leaf-r-i2"></div><div class="ly leaf-r-c"></div>
+                    <div class="ly rim"></div>
+                    <div class="ly glint"></div>
+                    <svg class="glyph" data-attr-src="'../icons/' + s.glyph + '.svg'"/>
+                </div>
+                <span class="sec-name">{{s.name}}</span>
+            </div>
+            <div class="sh-name" id="sh-name">{{title}}</div>
+        </div>
+
+        <!-- The page's box. Nothing is drawn here: the section's document is laid into it. -->
+        <div class="sh-host" id="sh-host"></div>
+
+        <!-- The prompts: what the device in use does here, each a click for the mouse. -->
+        <div class="sh-prompts" id="sh-prompts">
+            <div class="pr" data-for="p : prompts" data-nav="pointer" data-attr-id="'prompt-' + p.action"
+                 data-class-pr-empty="p.kind == ''"
+                 data-class-t-xa="p.tint == 'xbox-a'" data-class-t-xb="p.tint == 'xbox-b'"
+                 data-class-t-xx="p.tint == 'xbox-x'" data-class-t-xy="p.tint == 'xbox-y'"
+                 data-class-t-pc="p.tint == 'ps-cross'" data-class-t-po="p.tint == 'ps-circle'"
+                 data-class-t-ps="p.tint == 'ps-square'" data-class-t-pt="p.tint == 'ps-triangle'">
+                <div class="md pr-md" data-if="p.kind == 'face' || p.kind == 'medal'">
+                    <div class="ly shadows"></div>
+                    <div class="ly leaf-l-o1"></div><div class="ly leaf-l-o2"></div><div class="ly leaf-l-i1"></div><div class="ly leaf-l-i2"></div><div class="ly leaf-l-c"></div>
+                    <div class="ly leaf-r-o1"></div><div class="ly leaf-r-o2"></div><div class="ly leaf-r-i1"></div><div class="ly leaf-r-i2"></div><div class="ly leaf-r-c"></div>
+                    <div class="ly rim"></div>
+                    <svg class="pr-shape" data-if="p.shape != ''" data-class-pr-drawn="p.kind == 'medal'" data-attr-src="'prompts/' + p.shape + '.svg'"/>
+                    <span class="pr-letter" data-if="p.shape == ''"><span>{{p.key}}</span></span>
+                </div>
+                <div class="pr-plate" data-if="p.kind == 'plate'"><span class="pl-l"></span><span class="pl-m"><span class="pr-word">{{p.key}}</span></span><span class="pl-r"></span></div>
+                <div class="pr-pad" data-if="p.kind == 'pad'"></div>
+                <svg class="pr-art" data-if="p.kind == 'art'" data-attr-src="'prompts/' + p.shape + '.svg'"/>
+                <span class="pr-label" data-if="p.label != ''">{{p.label}}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- The game is paused while the menu is open (phase 97). The real medallion, the dial's own
+         layers, with a pause glyph in its face and the word under it (the user, 2026-10-13: "change
+         held to Paused and use the real medallion graphic"). -->
+    <div class="sh-held" data-if="held">
+        <div class="md held-md">
+            <div class="ly shadows"></div>
+            <div class="ly leaf-l-o1"></div><div class="ly leaf-l-o2"></div><div class="ly leaf-l-i1"></div><div class="ly leaf-l-i2"></div><div class="ly leaf-l-c"></div>
+            <div class="ly leaf-r-o1"></div><div class="ly leaf-r-o2"></div><div class="ly leaf-r-i1"></div><div class="ly leaf-r-i2"></div><div class="ly leaf-r-c"></div>
+            <div class="ly rim"></div>
+            <svg class="glyph" src="../icons/pause.svg"/>
+        </div>
+        <span class="held-word">Paused</span>
+    </div>
+</body>
+</rml>

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 17:20:00 +0100
+Subject: [PATCH] Every candidate rule for a solid draw, on the Experiment row
+
+Patch 0011 of the renderer series (OoT: Recompiled).
+
+Patch 0010 said a cut-out is not a translucent surface and picked one way to recognize one: the
+coverage cut or the alpha compare. On the user's trees that changed nothing in either position,
+which is itself a result: those draws do not declare themselves that way.
+
+Rather than guess a second discriminator and ship another build to find out, every candidate the
+microcode actually offers goes on the Experiment row and the picture answers. The user asked for
+exactly this: "possible to add every possibily of fixes as settings to cycle through so that i
+can cycle through and see which one yields best results or fixes the issue?"
+
+The last option is not a candidate fix. It treats every translucent draw as solid, which is
+wrong for water and for every glow in the game, and it is there as a control: if the trees take
+light under it and under nothing else, the mechanism is confirmed and only the discriminator is
+wrong; if they do not take light even under it, the cause is not the classification at all and
+the search moves to the raster order and the depth mask.
+
+With the ray tracing row Off none of this runs: the classification sits inside the traced
+projection's branch.
+---
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1811,11 +1811,45 @@ namespace RT64 {
+                         // back. The Experiment row's "Cut-outs translucent" puts 0006's rule
+                         // back for a side by side, which is how the last few lighting questions
+                         // were settled.
++                        // WHICH RULE DECIDES THAT AN XLU DRAW IS REALLY SOLID GEOMETRY (patch
++                        // 0011, the user's ask of 2026-09-30: "possible to add every possibily of
++                        // fixes as settings to cycle through so that i can cycle through and see
++                        // which one yields best results ... brainstorm every possible edge case").
++                        //
++                        // Patch 0010 picked one discriminator, the coverage cut or the alpha
++                        // compare, and on his trees it changed nothing either way, which means
++                        // those draws do not declare themselves that way. Rather than guess a
++                        // second time, every candidate the microcode actually offers is on the
++                        // Experiment row and he cycles until the picture answers. Each is a real
++                        // statement a draw makes about itself:
++                        //
++                        //   default  the coverage cut or the alpha compare: whole texel or none
++                        //   8        nothing is solid, which is patch 0006 exactly as it was
++                        //   9        it WRITES depth, so it occludes, so it is not a glow
++                        //   10       it READS depth, the weaker half of the same idea
++                        //   11       coverage stands in for alpha, the other whole-or-none form
++                        //   12       the blend is not FORCED, so it is not really a blend
++                        //   13       everything, which is not a candidate fix but the CONTROL:
++                        //            if the trees light under this and under nothing else the
++                        //            mechanism is confirmed and only the discriminator is wrong,
++                        //            and if they do not light even under this then the cause is
++                        //            not the classification at all and the search moves to the
++                        //            raster order and the depth mask. It will be wrong for water
++                        //            and for every glow, which is the point: it is a probe.
+                         const uint32_t acMode = otherMode.alphaCompare();
+-                        const bool cutoutDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER);
+-                        const bool cutoutTranslucent = (float(rtResources->rtParams.tuneExperiment.x) == 8.0f);
++                        const int cutoutRule = int(rtResources->rtParams.tuneExperiment.x);
++                        bool solidDraw;
++                        switch (cutoutRule) {
++                            case 8:  solidDraw = false; break;
++                            case 9:  solidDraw = otherMode.zUpd(); break;
++                            case 10: solidDraw = otherMode.zCmp(); break;
++                            case 11: solidDraw = otherMode.alphaCvgSel(); break;
++                            case 12: solidDraw = !otherMode.forceBlend(); break;
++                            case 13: solidDraw = true; break;
++                            default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
++                        }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+-                        if ((otherMode.zMode() == ZMODE_XLU) && !(cutoutDraw && !cutoutTranslucent)) {
++                        if ((otherMode.zMode() == ZMODE_XLU) && !solidDraw) {
+                             raytracing.queryMask = TranslucentRayQueryMask;
+                         }
+                         else {

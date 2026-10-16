@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 20:20:00 +0100
+Subject: [PATCH] Three ways to get the reflections back
+
+Patch 0018 of the renderer series (OoT: Recompiled).
+
+The foliage rule took the reflections with it. They are cast off whatever the water probe finds,
+and that probe is the only ray tracing the translucent instance mask; water here is a large
+surface in the translucent z mode that reads depth and never writes it, with plenty of triangles,
+which is the foliage signature exactly. Once the rule became the default, water stopped carrying
+the bit the probe looks for.
+
+The obvious answer, giving a reclassified draw both bits, was tried in the default and cost the
+trees: "you just regressed all the fixes for trees back". Reading the shipped code did not explain
+how, so it was reverted rather than defended.
+
+So the candidates go on rungs, at the user's word: "keep my build as the working one that all tree
+fixes were done and live and then add more options to test the fixes for reflections so i can
+cycle them to see which retain tree work and allow refleections". The default is untouched and
+stays where he confirmed it.
+
+  27  the instance keeps both bits, which is the reverted attempt, offered to be observed
+  28  the PROBE looks wider instead: no instance mask changes, so the trees cannot regress by
+      construction, and water is found again through the depth bit it now carries
+  29  both
+
+28 is the one worth trying first, and it came out of writing down why 27 was risky rather than out
+of patching forward. Its own risk is the opposite one: everything opaque carries the depth mask,
+so the probe can now meet a horizontal floor, and the test that rejects anything not horizontal
+and seen from above is all that stands between it and a reflective field.
+
+All three classify exactly as the default does, so anything that changes in the trees is the
+candidate's doing and nothing else's.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -281,7 +281,20 @@ void PrimaryRayGen() {
+         water.shadedColor = 0.0f;
+         water.hitVelocity = 0.0f;
+         water.coverage = 1.0f;
+-        TraceRay(SceneBVH, RAY_FLAG_NONE, TranslucentRayQueryMask, 0, 0, 0, probe, water);
++        // REFLECTION CANDIDATE B (patch 0018, rungs 28 and 29): the PROBE looks wider, rather than
++        // any instance's mask changing. Water carries the depth mask now that the foliage rule
++        // classifies it as solid, so a probe that also traces depth finds it again, and no tree's
++        // mask is touched, which means the tree work cannot regress by construction. That is the
++        // whole argument for it over candidate A, which was tried in the default and cost the
++        // trees for reasons the code did not explain.
++        //
++        // The risk is the opposite one and is why this is a rung too: everything opaque carries
++        // the depth mask, so the probe can now meet a horizontal FLOOR and the test below would
++        // call it water. The test is the only thing standing between this and a reflective field.
++        const uint probeMask = ((RtParams.tuneExperiment.x == 28.0f) || (RtParams.tuneExperiment.x == 29.0f))
++                                   ? (TranslucentRayQueryMask | DepthRayQueryMask)
++                                   : TranslucentRayQueryMask;
++        TraceRay(SceneBVH, RAY_FLAG_NONE, probeMask, 0, 0, 0, probe, water);
+         // Water is a horizontal translucent surface seen from ABOVE (the hit normal faces the
+         // ray, so it points up): a translucent surface seen from below (Death Mountain's ring
+         // of smoke over Kakariko, a ceiling's haze) is not water, and the reflection pass drew
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1918,6 +1918,14 @@ namespace RT64 {
+                             // matched one of this game's trees. Kept as a rung rather than as the
+                             // fallback, so the thing the ladder disproved can still be seen.
+                             case 26: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
++                            // 27 to 29 are the DEFAULT's classification exactly, so the only
++                            // thing that differs between them and Off is the reflection
++                            // candidate each one turns on (above, and in the water probe).
++                            // That is what makes them a fair test: anything he sees change in
++                            // the trees is the candidate's doing and nothing else's.
++                            case 27:
++                            case 28:
++                            case 29: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             // THE DEFAULT IS NOW THE RULE THAT WON (patch 0017), which is rung 25:
+                             // a draw in the translucent z mode that READS depth and is more than a
+                             // sprite is solid, and it casts. The user, 2026-09-30, on that rung:
+@@ -1944,6 +1952,23 @@ namespace RT64 {
+                         else {
+                             raytracing.queryMask = (otherMode.zCmp() || otherMode.zUpd()) ? DepthRayQueryMask : NoDepthRayQueryMask;
+                         }
++                        // REFLECTION CANDIDATE A (patch 0018, rungs 27 and 29). The reflections
++                        // are cast off whatever the water probe finds, and that probe is the only
++                        // ray tracing the translucent mask. Water here is a large surface in the
++                        // translucent z mode that reads depth and never writes it, with plenty of
++                        // triangles, which is the foliage signature exactly: once the foliage rule
++                        // became the default, water stopped carrying the bit the probe looks for
++                        // and every reflection went with it.
++                        //
++                        // Giving a reclassified draw BOTH bits is the obvious answer and it is on
++                        // a rung rather than in the default, because it was tried in the default
++                        // and the trees came back wrong (the user, 2026-09-30: "you just regressed
++                        // all the fixes for trees back"). Reading the code did not explain how, so
++                        // it is offered as something to observe rather than as a fix.
++                        if ((wasTranslucent && solidDraw) &&
++                            ((cutoutRule == 27) || (cutoutRule == 29))) {
++                            raytracing.queryMask |= TranslucentRayQueryMask;
++                        }
+                         if (drawData.extraParams[call.callDesc.callIndex].shadowCatcherFactor > 0.0f) {
+                             raytracing.queryMask |= ShadowCatcherRayQueryMask;
+                         }

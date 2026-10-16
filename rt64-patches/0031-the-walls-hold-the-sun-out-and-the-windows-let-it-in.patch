@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 13:40:52 -0400
+Subject: [PATCH] The walls hold the sun out and the windows let it in
+
+Patch 0031 of the renderer series (OoT: Recompiled).
+
+The user's first test of patches 0029 and 0030 in the Temple of Time, 2026-10-08: each window
+lit its own patch from its own slope, so the patch sat apart from the drawn pedestal shaft; the
+shaft lit the floor as a light of its own besides; and the windows' shadow was only a harsh
+rectangle round each patch, "as if the window object itself is casting its own shadow". Their
+direction: "making the walls of the temple all cast the shadow and then only allow lighting
+through the actual cutouts of the windows themselves", and the light should bounce so the Light
+bounce rows can lift the hall.
+
+So one sun now falls through every window of a place. Its direction is the drawn shaft's that,
+followed up past its top, meets one of the windows' glass (the Temple of Time's pedestal beam
+comes through the tall window on the far wall), kept while the place lasts so it holds when the
+shaft is out of view, and the largest window's own slope until a shaft has been seen. That shaft
+stops being a light of its own; a shaft from anything else, a song's cylinder, still is. The
+first window carries the sun's share everywhere, blocked or not, so whatever the sun does not
+reach through glass is the walls' shadow, and the whole hall darkens by the local lights' shadow
+rule with the windows' light cut out of it. Link and everything else in that light are lit from
+its direction.
+
+The bounce pass reads what its rays meet from the frame, which holds none of the traced light,
+so where a bounce ray meets a surface the windows' sun reaches, that light is added, at one ray
+to the glass, times what the surface gives back. The Bounced light row then carries the windows'
+light onto the walls, and the Bounce range row says how far.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2878,6 +2878,111 @@ namespace RT64 {
+ #   if RT_ENABLED
+         checkRtScene(rtScene);
+ 
++        // THE WALLS HOLD THE SUN OUT AND THE WINDOWS LET IT IN (patch 0031, the user, 2026-10-08,
++        // after testing 0030 in the Temple of Time: "making the walls of the temple all cast the
++        // shadow and then only allow lighting through the actual cutouts of the windows
++        // themselves"). Each window lit its own patch from its own slope, so the patch sat apart
++        // from the drawn shaft, and its shadow was only a rectangle round the patch. Now one sun
++        // falls through every window of the place: its direction is the drawn shaft's that comes
++        // through one of them (the Temple of Time's pedestal beam comes through the tall window
++        // on the far wall), so the lit floor lines up with the shaft; the shaft itself stops
++        // being a light of its own there ("remove the beam lighting on the floor itself and
++        // instead just have the realistic lighting show"); and the shader counts that sun as
++        // blocked everywhere it does not come through glass, so the whole hall lies in the
++        // walls' shadow with the windows' light cut out of it.
++        if (!rtExternalEnvironment.windowLights) {
++            rtWindowSunKnown = false;
++        }
++
++        bool anyWindow = false;
++        for (const interop::PointLight &light : beamLights) {
++            anyWindow = anyWindow || ((light.groupBits & WindowLightBit) != 0u);
++        }
++
++        if (anyWindow) {
++            // A shaft that, followed up past its top, meets a window's glass gives the direction.
++            const interop::PointLight *throughWindow = nullptr;
++            for (const interop::PointLight &beam : beamLights) {
++                if ((beam.groupBits & BeamLightBit) == 0u) {
++                    continue;
++                }
++
++                const hlslpp::float3 top = beam.position;
++                const hlslpp::float3 falls = beam.direction;
++                for (const interop::PointLight &window : beamLights) {
++                    if ((window.groupBits & WindowLightBit) == 0u) {
++                        continue;
++                    }
++
++                    const hlslpp::float3 center = window.position;
++                    const hlslpp::float3 inward = window.specularColor;
++                    const float approach = float(hlslpp::dot(falls, inward));
++                    if (approach <= 0.0f) {
++                        continue;
++                    }
++
++                    // Up the shaft from its top by `back` reaches the glass's plane.
++                    const float back = float(hlslpp::dot(top - center, inward)) / approach;
++                    if (back < 0.0f) {
++                        continue;
++                    }
++
++                    const hlslpp::float3 onGlass = top - falls * back;
++                    const hlslpp::float3 across = hlslpp::normalize(hlslpp::cross(hlslpp::float3(0.0f, 1.0f, 0.0f), inward));
++                    const float acrossOffset = std::abs(float(hlslpp::dot(onGlass - center, across)));
++                    const float upOffset = std::abs(float(onGlass.y) - float(center.y));
++                    if ((acrossOffset <= (window.pointRadius * 1.25f)) && (upOffset <= (window.spotMaxCosine * 1.25f))) {
++                        throughWindow = &beam;
++                        break;
++                    }
++                }
++
++                if (throughWindow != nullptr) {
++                    break;
++                }
++            }
++
++            if (throughWindow != nullptr) {
++                rtWindowSunDirection = throughWindow->direction;
++                rtWindowSunKnown = true;
++            }
++
++            // Never seen a shaft here yet: the largest window's own slope.
++            hlslpp::float3 sunFalls = rtWindowSunDirection;
++            if (!rtWindowSunKnown) {
++                float largest = -1.0f;
++                for (const interop::PointLight &window : beamLights) {
++                    if (((window.groupBits & WindowLightBit) != 0u) && ((window.pointRadius * window.spotMaxCosine) > largest)) {
++                        largest = window.pointRadius * window.spotMaxCosine;
++                        sunFalls = window.direction;
++                    }
++                }
++            }
++
++            // The shaft that came through a window is the sun's light, not a light of its own; a
++            // shaft from anything else (a song's cylinder) still is.
++            std::vector<interop::PointLight> placeLights;
++            bool first = true;
++            for (const interop::PointLight &light : beamLights) {
++                if (&light == throughWindow) {
++                    continue;
++                }
++
++                interop::PointLight kept = light;
++                if ((kept.groupBits & WindowLightBit) != 0u) {
++                    kept.direction = interop::float3(sunFalls);
++                    // The first window carries the sun's share everywhere, blocked or not, so the
++                    // walls' shadow is counted once however many windows there are.
++                    kept.flickerIntensity = first ? 1.0f : 0.0f;
++                    first = false;
++                }
++
++                placeLights.push_back(kept);
++            }
++
++            beamLights = std::move(placeLights);
++        }
++
+         // The beams join the scene's lights after the game's own (patch 0029). The traced scene
+         // took the game's list at its first call, before any shaft was drawn, so its list is
+         // copied with the beams after it into storage that lives until the frame's lights are
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -182,6 +182,12 @@ namespace RT64 {
+         void setRaytracingEnvironment(const RaytracingEnvironment &environment);   // patch 0008
+         RaytracingEnvironment rtExternalEnvironment;
+ 
++        // The way the sun falls through a place's windows (patch 0031): taken from a drawn shaft
++        // that comes through one of them, and kept while the place lasts, so it holds when the
++        // shaft is out of view.
++        hlslpp::float3 rtWindowSunDirection = hlslpp::float3(0.0f, -1.0f, 0.0f);
++        bool rtWindowSunKnown = false;
++
+         // The game's point lights for the traced scene (patch 0006), set every frame by the
+         // workload queue from what the program published; taken before the projection's own.
+         std::vector<interop::PointLight> rtExternalLights;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -610,6 +610,15 @@ void beamLight(PointLight light, float3 position, float3 normal, float biasBase,
+ // surface is lit where the light, followed back up its direction, comes through the glass; its
+ // shadow rays go back out the same way, so a pillar between a window and the floor shadows the
+ // floor in the window's own shape.
++//
++// THE SUN BEHIND THEM ALL (patch 0031). Every window of a place now carries the same direction,
++// the drawn shaft's that comes through one of them, and the first carries the sun's share
++// EVERYWHERE (flickerIntensity, set on the CPU): what would arrive were the walls not there. What
++// does not come through glass is then the walls' shadow, darkening the whole hall by the local
++// lights' shadow rule (DirectRayGen, LocalShadowStrength), with the windows' light cut out of it.
++// The user, 2026-10-08: "making the walls of the temple all cast the shadow and then only allow
++// lighting through the actual cutouts of the windows themselves". No fade with distance: it is
++// the sun.
+ static const uint WindowLightBit = 16u;
+ static const float WindowClearance = 12.0f;   // world units before the glass the shadow rays stop, so the wall the glass is painted on cannot block it
+ static const float WindowEdge = 0.02f;        // the edge of a window's light softens by this share of the distance it fell
+@@ -618,6 +627,16 @@ static const float WindowSpread = 0.015f;     // how far its shadow rays lean, s
+ void windowLight(PointLight light, float3 position, float3 normal, float biasBase, uint2 launchIndex, uint lightIndex, uint lightSamples,
+                  inout float3 sum, inout float3 sumUnblocked) {
+     const float3 falls = light.direction;
++    const float3 toLight = -falls;
++    const float ndl = saturate(dot(normal, toLight));
++    if (ndl <= 0.0f) {
++        return;
++    }
++
++    if (light.flickerIntensity > 0.5f) {
++        sumUnblocked += light.diffuseColor * ndl;
++    }
++
+     const float3 inward = light.specularColor;
+     const float inside = dot(position - light.position, inward);
+     if (inside <= 0.0f) {
+@@ -631,20 +650,13 @@ void windowLight(PointLight light, float3 position, float3 normal, float biasBas
+     }
+ 
+     const float travel = inside / approach;
+-    if (travel >= light.attenuationExponent) {
+-        return;
+-    }
+-
+     const float3 onGlass = position - falls * travel;
+     const float3 across = normalize(cross(float3(0.0f, 1.0f, 0.0f), inward));
+     const float3 offset = onGlass - light.position;
+     const float edge = WindowEdge * travel + 2.0f;
+     const float acrossShare = 1.0f - smoothstep(light.pointRadius - edge, light.pointRadius + edge, abs(dot(offset, across)));
+     const float upShare = 1.0f - smoothstep(light.spotMaxCosine - edge, light.spotMaxCosine + edge, abs(offset.y));
+-    const float3 toLight = -falls;
+-    const float ndl = saturate(dot(normal, toLight));
+-    const float fade = 1.0f - smoothstep(light.attenuationExponent * 0.7f, light.attenuationExponent, travel);
+-    const float weight = acrossShare * upShare * ndl * fade;
++    const float weight = acrossShare * upShare * ndl;
+     if (weight <= 0.0f) {
+         return;
+     }
+@@ -669,7 +681,6 @@ void windowLight(PointLight light, float3 position, float3 normal, float biasBas
+ 
+     const float visibility = 1.0f - (blocked / float(lightSamples));
+     sum += light.diffuseColor * (weight * visibility);
+-    sumUnblocked += light.diffuseColor * weight;
+ }
+ 
+ [shader("raygeneration")]
+@@ -1229,6 +1240,33 @@ void DirectRayGen() {
+ // from what it hits is the estimate of the light bounced onto the surface, which the direct pass
+ // adds to the game's ambient through the surface's own color at BounceStrength. Phase 57
+ // accumulates the frames.
++// THE SUN THROUGH THE WINDOWS BOUNCES (patch 0031, the user, 2026-10-08: "This would allow light
++// bouncing to be ... raised a little bit ... I can just adjust the light bouncing setting to
++// increase how far that light bounces onto walls"). What a bounce ray meets is read from the
++// frame, which holds the game's picture and none of the traced light; so where it meets a surface
++// the windows' sun reaches, that light is added, at one ray to the glass, times what the surface
++// gives back of it (its lit color times a texture's average, as radianceFrom estimates). The
++// Bounced light row then carries the windows' light onto the walls and up into the hall, and the
++// Bounce range row says how far.
++float3 windowSunBounce(float3 position, float3 normal, float3 shadedColor, uint2 launchIndex) {
++    const uint count = min(RtParams.lightsCount, RtParams.maxLights);
++    if ((RtParams.level < 2) || (count == 0) || (RtParams.tuneOcclusion.w <= 0.0f)) {
++        return float3(0.0f, 0.0f, 0.0f);
++    }
++
++    const float biasBase = ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition());
++    float3 arrived = 0.0f;
++    float3 unused = 0.0f;
++    for (uint i = 0; i < count; i++) {
++        const PointLight light = SceneLights[i];
++        if ((light.groupBits & WindowLightBit) != 0u) {
++            windowLight(light, position, normal, biasBase, launchIndex, i, 1u, arrived, unused);
++        }
++    }
++
++    return arrived * RtParams.tuneOcclusion.w * saturate(shadedColor) * TextureAverage;
++}
++
+ [shader("raygeneration")]
+ void IndirectRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+@@ -1265,7 +1303,9 @@ void IndirectRayGen() {
+     // already is, and adding the horizon's color again washed the open field out.
+     float3 radiance = 0.0f;
+     if (payload.instanceId >= 0) {
+-        radiance = radianceFrom(ray.Origin + direction * payload.hitDistance, payload.shadedColor, true, instance);
++        const float3 hitPosition = ray.Origin + direction * payload.hitDistance;
++        radiance = radianceFrom(hitPosition, payload.shadedColor, true, instance);
++        radiance += windowSunBounce(hitPosition, payload.hitNormal, payload.shadedColor, launchIndex);
+     }
+ 
+     gIndirectLightAccum[launchIndex] = float4(radiance, 1.0f);

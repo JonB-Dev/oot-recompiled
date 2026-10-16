@@ -1,0 +1,31 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build-cmake",
+  "cmake.configureOnOpen": false,
+  "cmake.useCMakePresets": "always",
+
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build-cmake/compile_commands.json",
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.cStandard": "c11",
+
+  "files.associations": {
+    "*.rml": "html",
+    "*.rcss": "css"
+  },
+
+  "search.exclude": {
+    "**/upstream/**": true,
+    "**/lib/**": true,
+    "**/RecompiledFuncs/**": true,
+    "**/RecompiledPatches/**": true,
+    "**/build-cmake/**": true,
+    "**/OoTRecompSyms/**": true
+  },
+
+  "files.watcherExclude": {
+    "**/upstream/**": true,
+    "**/lib/**": true,
+    "**/build-cmake/**": true,
+    "**/RecompiledFuncs/**": true
+  }
+}

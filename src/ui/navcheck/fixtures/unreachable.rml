@@ -1,0 +1,20 @@
+<rml>
+<head>
+    <title>navcheck unreachable</title>
+    <!-- The planted failure (ui_navcheck, phase 94): a button laid over the edge of another, so
+         no direction from anywhere lands on it. Listing this document in the check must fail the
+         build with "#orphan unreachable". It is not in the check's list; it is the proof that
+         the gate bites, run with ui_navcheck --also unreachable.rml. -->
+    <style>
+        body { display: block; padding: 24dp; font-family: Bricolage Grotesque; font-size: 16dp; color: #e8f0ee; }
+        button { display: block; position: absolute; width: 200dp; height: 40dp; background-color: #172126; }
+        .is-f { background-color: #c6ff3d; color: #0c1215; }
+        #first { left: 24dp; top: 24dp; }
+        #orphan { left: 124dp; top: 44dp; }
+    </style>
+</head>
+<body>
+    <button id="first">First</button>
+    <button id="orphan">Orphan</button>
+</body>
+</rml>

@@ -1,0 +1,558 @@
+/* THE SHELL (the menus plan, phase 96): what is drawn around the page, in four placements, from
+ * the design decision (.scaffold/menus/design/decision/, C Medallion, with its ADDENDUM):
+ *
+ *   launcher  the launcher's own window: the head, the dial, the page, the prompts, full width
+ *   left      the panel docked against the left edge, its right edge cut on a slant into the
+ *             picture with the gold lit line (cut.rcss)
+ *   right     the same panel mirrored against the right edge
+ *   center    the Ledger with medallions: a rail of every section down the left of a centered
+ *             panel over a scrim, the page beside it
+ *
+ * Tokens only (tools/check_tokens.py). Positions inside the dial are shares of its box, so the
+ * dial keeps its shape at every interface size. */
+
+body.shell
+{
+	font-family: var(--font-body);
+	font-weight: var(--weight-body);
+	font-size: var(--size-row);
+	color: var(--color-ink);
+	width: 100%;
+	height: 100%;
+}
+
+.sh-scrim
+{
+	display: none;
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	background-color: var(--color-scrim-full);
+}
+
+.center .sh-scrim
+{
+	display: block;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * The panel and its ground
+ */
+
+/* BORDER-BOX (the user, 2026-10-13: "the right border falls off ... as if the left border pushes it
+ * one pixel too far right"): the launcher's panel is the window's full width with an edge each
+ * side, and a width that left its edges out put the right one past the window. */
+.sh-panel
+{
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	width: var(--panel-width);
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+}
+
+.launcher .sh-panel
+{
+	width: 100%;
+	border: var(--rule) var(--color-line);
+}
+
+.right .sh-panel
+{
+	left: auto;
+	right: 0;
+}
+
+.center .sh-panel
+{
+	top: 7%;
+	bottom: 7%;
+	left: 9%;
+	width: 82%;
+	max-width: var(--ledger-width);
+	display: block;
+	border: var(--rule) var(--color-line);
+}
+
+/* The ground stops where the cut begins, so the slant is the panel's own edge. */
+.sh-ground
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	bottom: 0;
+	right: var(--cut-edge-width);
+	background-color: var(--color-slate);
+	overflow: hidden;
+}
+
+.right .sh-ground
+{
+	right: 0;
+	left: var(--cut-edge-width);
+}
+
+.launcher .sh-ground,
+.center .sh-ground
+{
+	right: 0;
+}
+
+.sh-cut,
+.sh-cut-mirror
+{
+	display: none;
+}
+
+.left .sh-cut,
+.right .sh-cut-mirror
+{
+	display: block;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * The head and the logo
+ */
+
+.sh-mast
+{
+	position: relative;
+	flex-shrink: 0;
+	height: var(--mast-height-docked);
+	margin-right: var(--cut-edge-width);
+	display: flex;
+	align-items: center;
+	/* Docked, the logo is centered (2026-10-13); the launcher and the rail keep it at the left. */
+	justify-content: center;
+	background-color: var(--color-slate-deep);
+	border-bottom: var(--rule) var(--color-line);
+}
+
+.right .sh-mast
+{
+	margin-right: 0;
+	margin-left: var(--cut-edge-width);
+}
+
+.launcher .sh-mast
+{
+	height: var(--mast-height);
+	margin-right: 0;
+	justify-content: space-between;
+	padding-left: var(--space-6);
+	align-items: stretch;
+}
+
+.center .sh-mast
+{
+	justify-content: space-between;
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: var(--rail-width);
+	height: var(--mast-height);
+	margin: 0;
+	padding-left: var(--space-4);
+	border-right: var(--rule) var(--color-line);
+}
+
+.logo
+{
+	position: relative;
+	width: var(--logo-width-docked);
+	height: var(--logo-height-docked);
+}
+
+.launcher .logo
+{
+	width: var(--logo-width);
+	height: var(--logo-height);
+	margin-top: auto;
+	margin-bottom: auto;
+}
+
+.center .logo
+{
+	width: var(--logo-width-rail);
+	height: var(--logo-height-rail);
+}
+
+.logo-slab
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	decorator: svg(brand/logo.svg);
+}
+
+/* The medallion over the slab's left end, in the lockup's own proportions: its 290 by 276 box
+ * at (30, 170) against the logo's crop of 896 by 237 at (55, 200). */
+.logo .logo-md
+{
+	position: absolute;
+	left: -2.79%;
+	top: -12.66%;
+	width: 32.37%;
+	height: 116.46%;
+}
+
+/* The mark in the disc, raised to sit optically centered (the user, 2026-10-12), in the
+ * medallion's 200 by 190 canvas: 64 by 53.3 at (68, 57.4). */
+.logo .logo-mark
+{
+	position: absolute;
+	left: 34%;
+	top: 30.21%;
+	width: 32%;
+	height: 28.05%;
+}
+
+.sh-side
+{
+	display: none;
+}
+
+.launcher .sh-side
+{
+	display: flex;
+	flex-direction: column;
+	justify-content: space-between;
+	align-items: flex-end;
+}
+
+.sh-win
+{
+	display: flex;
+}
+
+.sh-wb
+{
+	width: var(--window-btn-width);
+	height: var(--window-btn-height);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	transition: background-color var(--duration-fast) var(--ease);
+}
+
+.sh-wb:hover
+{
+	background-color: var(--color-slate-raised);
+}
+
+.sh-wb:hover .win-ic
+{
+	image-color: var(--color-ink);
+}
+
+.sh-close:hover
+{
+	background-color: var(--color-error);
+}
+
+.sh-close:hover .win-ic
+{
+	image-color: var(--color-on-lime);
+}
+
+.sh-ver
+{
+	font-family: var(--font-mono);
+	font-size: var(--size-label);
+	color: var(--color-faint);
+	padding: 0 var(--space-5) var(--space-4) 0;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * The dial
+ */
+
+.sh-dial
+{
+	position: relative;
+	flex-shrink: 0;
+	height: var(--shell-dial-height-docked);
+	margin-right: var(--cut-edge-width);
+	background-color: var(--color-slate-deep);
+	border-bottom: var(--rule) var(--color-line);
+}
+
+.right .sh-dial
+{
+	margin-right: 0;
+	margin-left: var(--cut-edge-width);
+}
+
+.launcher .sh-dial
+{
+	height: var(--shell-dial-height);
+	margin-right: 0;
+}
+
+.sec
+{
+	position: absolute;
+	transform: translateX(-50%);
+	transition: left var(--duration-base) var(--ease), top var(--duration-base) var(--ease);
+}
+
+.sec .md
+{
+	width: var(--md-dial-size);
+	height: var(--md-dial-height);
+}
+
+.sec.cur .md
+{
+	width: var(--md-current-size);
+	height: var(--md-current-height);
+}
+
+.sec:hover .md
+{
+	transform: translateY(-4%);
+}
+
+.sec-name
+{
+	display: none;
+}
+
+/* A SHALLOW ARC (the user, 2026-10-13: "don't offset the vertical positioning quite so much between the
+ * main selection and the outer two selections ... don't drop them as much. That would also reduce some
+ * of that space"): each step out from the current one drops less, so the dial needs less height. */
+.sec.slot-l2 { left: 12%; top: 32%; }
+.sec.slot-l1 { left: 31%; top: 16%; }
+.sec.slot-c  { left: 50%; top: 3%; }
+.sec.slot-r1 { left: 69%; top: 16%; }
+.sec.slot-r2 { left: 88%; top: 32%; }
+.sec.slot-off { display: none; }
+
+.launcher .sec.slot-l2 { left: 21%; top: 30%; }
+.launcher .sec.slot-l1 { left: 34%; top: 15%; }
+.launcher .sec.slot-r1 { left: 66%; top: 15%; }
+.launcher .sec.slot-r2 { left: 79%; top: 30%; }
+
+/* The current section's name, on a plate that hangs over the dial's lower line into the page. */
+.sh-name
+{
+	position: absolute;
+	left: 50%;
+	bottom: var(--name-drop-below);
+	transform: translateX(-50%);
+	padding: var(--space-1) var(--space-4);
+	font-family: var(--font-display);
+	font-weight: var(--weight-display-max);
+	font-size: var(--size-display);
+	text-transform: uppercase;
+	color: var(--color-ink);
+	background-color: var(--color-slate-deep);
+	border: var(--rule) var(--color-line);
+	white-space: nowrap;
+}
+
+/* The rail (centered): every section down the left, each a small medallion with its name; the
+ * current one lit. The dial's slots mean nothing here. */
+.center .sh-dial
+{
+	position: absolute;
+	left: 0;
+	top: var(--mast-height);
+	bottom: 0;
+	width: var(--rail-width);
+	height: auto;
+	margin: 0;
+	padding-top: var(--space-4);
+	border-bottom: 0;
+	border-right: var(--rule) var(--color-line);
+}
+
+.center .sec,
+.center .sec.slot-l2, .center .sec.slot-l1, .center .sec.slot-c,
+.center .sec.slot-r1, .center .sec.slot-r2, .center .sec.slot-off
+{
+	position: relative;
+	left: auto;
+	top: auto;
+	transform: none;
+	display: flex;
+	align-items: center;
+	height: var(--rail-item-height);
+	padding: 0 var(--space-4);
+}
+
+.center .sec .md,
+.center .sec.cur .md
+{
+	width: var(--md-row-size);
+	height: var(--md-row-height);
+}
+
+.center .sec-name
+{
+	display: block;
+	margin-left: var(--space-3);
+	font-family: var(--font-display);
+	font-weight: var(--weight-display);
+	font-size: var(--size-heading);
+	text-transform: uppercase;
+	color: var(--color-dim);
+}
+
+.center .sec.cur
+{
+	background-color: var(--color-plate-on);
+	border-left: var(--edge-focus) var(--color-lime);
+}
+
+.center .sec.cur .sec-name
+{
+	color: var(--color-ink);
+}
+
+.center .sh-name
+{
+	left: auto;
+	right: auto;
+	bottom: auto;
+	transform: none;
+	display: none;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * The page's box: the section's own document is laid into it.
+ */
+
+.sh-host
+{
+	flex: 1 1 auto;
+	margin: var(--host-top) var(--host-side-cut) var(--host-bottom) var(--host-side-docked);
+}
+
+.right .sh-host
+{
+	margin-left: var(--host-side-cut);
+	margin-right: var(--host-side-docked);
+}
+
+.launcher .sh-host
+{
+	margin-left: var(--host-side);
+	margin-right: var(--host-side);
+}
+
+.center .sh-host
+{
+	position: absolute;
+	left: var(--rail-width);
+	right: 0;
+	top: 0;
+	bottom: var(--prompts-height);
+	margin: var(--space-6) var(--space-8);
+}
+
+/* ------------------------------------------------------------------------------------------
+ * The prompts
+ */
+
+/* Positioned, like the head and the dial, so it paints over the panel's ground. */
+.sh-prompts
+{
+	position: relative;
+	flex-shrink: 0;
+	/* A narrow panel takes a second line rather than pressing the prompts into each other. */
+	min-height: var(--prompts-height);
+	margin-right: var(--cut-edge-width);
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	align-content: center;
+	padding: 0 var(--space-6) 0 var(--host-side-docked);
+	background-color: var(--color-slate-deep);
+	border-top: var(--rule) var(--color-line);
+	font-size: var(--pr-text);
+	color: var(--color-dim);
+}
+
+.right .sh-prompts
+{
+	margin-right: 0;
+	margin-left: var(--cut-edge-width);
+	padding-left: var(--space-8);
+}
+
+.launcher .sh-prompts
+{
+	margin-right: 0;
+	padding-left: var(--space-6);
+}
+
+.center .sh-prompts
+{
+	position: absolute;
+	left: var(--rail-width);
+	right: 0;
+	bottom: 0;
+	margin: 0;
+	padding-left: var(--space-8);
+}
+
+/* The prompts themselves, a button and what it does, are prompts.rcss: the button guide in photo
+ * mode draws them too (photo-guide.rml). */
+
+/* ------------------------------------------------------------------------------------------
+ * The paused badge, over the picture's far corner while the game is paused: the dial's own
+ * medallion at its own size, its rim gold and still (nothing to press, so never lime), a pause
+ * glyph in its face, and the word on a plate of the deep slate under it so it reads over any scene.
+ */
+
+.sh-held
+{
+	position: absolute;
+	right: var(--held-margin);
+	bottom: var(--held-margin);
+	width: var(--held-size);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+}
+
+.sh-held .held-md
+{
+	--md-size: var(--held-size);
+	--md-height: var(--held-md-height);
+}
+
+.held-word
+{
+	margin-top: var(--space-1);
+	padding: var(--space-1) var(--space-2);
+	background-color: var(--color-slate-deep);
+	font-family: var(--font-mono);
+	font-weight: var(--weight-mono-strong);
+	font-size: var(--size-label-sm);
+	letter-spacing: var(--tracking-badge);
+	text-transform: uppercase;
+	color: var(--color-ink);
+}
+
+.right .sh-held
+{
+	right: auto;
+	left: var(--held-margin);
+}
+
+/* Centered, the panel takes the middle of the picture; the badge goes to its top corner. */
+.center .sh-held
+{
+	top: var(--space-4);
+	bottom: auto;
+	right: var(--space-4);
+}

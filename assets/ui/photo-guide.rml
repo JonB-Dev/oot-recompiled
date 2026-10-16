@@ -1,0 +1,39 @@
+<rml>
+<head>
+    <title>Photo mode guide</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="medallion.rcss"/>
+    <link type="text/rcss" href="prompts.rcss"/>
+</head>
+<!-- PHOTO MODE'S BUTTON GUIDE (the user, 2026-10-13): what each control does while photo mode holds
+     the game, drawn as the menu's footer draws its prompts, on the device in use and as it is
+     bound (ui/prompts/photo_guide.h). The shell shows it while photo mode holds the game, no menu
+     is open and its binding has not hidden it. The list is the shell model's `guide`, a fixed
+     length with the unused slots empty and hidden, as the footer's is. -->
+<body class="overlay" data-model="shell">
+    <div class="pg">
+        <div class="pg-band" id="pg-band">
+            <div class="pr" data-for="p : guide" data-attr-id="'guide-' + p.action"
+                 data-class-pr-empty="p.kind == ''"
+                 data-class-t-xa="p.tint == 'xbox-a'" data-class-t-xb="p.tint == 'xbox-b'"
+                 data-class-t-xx="p.tint == 'xbox-x'" data-class-t-xy="p.tint == 'xbox-y'"
+                 data-class-t-pc="p.tint == 'ps-cross'" data-class-t-po="p.tint == 'ps-circle'"
+                 data-class-t-ps="p.tint == 'ps-square'" data-class-t-pt="p.tint == 'ps-triangle'">
+                <div class="md pr-md" data-if="p.kind == 'face' || p.kind == 'medal'">
+                    <div class="ly shadows"></div>
+                    <div class="ly leaf-l-o1"></div><div class="ly leaf-l-o2"></div><div class="ly leaf-l-i1"></div><div class="ly leaf-l-i2"></div><div class="ly leaf-l-c"></div>
+                    <div class="ly leaf-r-o1"></div><div class="ly leaf-r-o2"></div><div class="ly leaf-r-i1"></div><div class="ly leaf-r-i2"></div><div class="ly leaf-r-c"></div>
+                    <div class="ly rim"></div>
+                    <svg class="pr-shape" data-if="p.shape != ''" data-class-pr-drawn="p.kind == 'medal'" data-attr-src="'prompts/' + p.shape + '.svg'"/>
+                    <span class="pr-letter" data-if="p.shape == ''"><span>{{p.key}}</span></span>
+                </div>
+                <div class="pr-plate" data-if="p.kind == 'plate'"><span class="pl-l"></span><span class="pl-m"><span class="pr-word">{{p.key}}</span></span><span class="pl-r"></span></div>
+                <div class="pr-pad" data-if="p.kind == 'pad'"></div>
+                <svg class="pr-art" data-if="p.kind == 'art'" data-attr-src="'prompts/' + p.shape + '.svg'"/>
+                <span class="pr-label" data-if="p.label != ''">{{p.label}}</span>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>
