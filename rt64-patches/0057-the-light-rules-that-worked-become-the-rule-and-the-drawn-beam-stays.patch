@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Mon, 12 Oct 2026 16:13:32 -0400
+Subject: [PATCH] The light rules that worked become the rule, and the drawn beam stays
+
+Patch 0057 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-12, of the build carrying 0056 at its defaults: "same with the light beam
+fixes" (PERFECT). Under their standing rule a confirmed fix leaves the Debugging menu, so the two
+rules that were on are simply the rule: a see-through draw with a fading texture, or one added
+over what is behind it, is light, casts no shadow and takes none. The gray texture and long shape
+candidates, never needed, are gone, and tuneLightTest.z is unused again.
+
+And the game's drawn shaft is always drawn. 0034 and 0039 drew a slanted shaft as nothing in a
+place with windows while the local lights were traced, 0051's Drawn beam row could show it, and
+it defaulted to hidden, which is how the sword room's beam went ("i want to add that beam back
+in"). The hiding, the row's tuneShafts.z and RtConfig::drawnBeam are removed.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index f364fc6..7da53ec 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -490,24 +490,14 @@ namespace RT64 {
+     // way, so it blocks the windows' light and the beam lights that fall along it, and it is shaded
+     // like a wall before the composite, so the shadows it throws land on itself.
+     //
+-    // WHICH DRAWS ARE LIGHT is the open question, so each answer is its own switch on the Debugging
+-    // menu (the user's standing rule, 2026-10-12: "temporary debugs with all fix possibilities as
+-    // separate options so that i can enable or disable and mix and match"), one bit each in
+-    // tuneLightTest.z, any one of them enough:
+-    //   1  a fading texture: partial alpha nearly everywhere, the kind every beam, glow and haze
+-    //      has and a cut-out never does (the 2026-10-08 inventory found the two far apart)
+-    //   2  a gray texture (intensity, or intensity with alpha): its color comes from the draw's
+-    //      own colors, as light does, where a leaf or a vine is painted in its texture
+-    //   4  an added blend: what is behind is kept whole and the draw is added over it, which is
+-    //      light by definition
+-    //   8  a long shape: four times as long as it is across and at least 150 units, whatever its
+-    //      roundness or its lean, so a flat strip of rays counts as a shaft does
+-    // What passes is what 0039 makes a shaft: a see-through overlay no ray traces, drawn after the
+-    // composite in its own brightness. The lights 0029 and 0030 make are untouched.
+-    static const uint32_t LightFadingTexture = 1u;
+-    static const uint32_t LightGrayTexture = 2u;
+-    static const uint32_t LightAddedBlend = 4u;
+-    static const uint32_t LightLongShape = 8u;
++    // WHICH DRAWS ARE LIGHT (patch 0057, the user, 2026-10-12, having tried 0056's four switches at
++    // their defaults: "same with the light beam fixes", that is PERFECT): a fading texture, partial
++    // alpha nearly everywhere, the kind every beam, glow and haze has and a cut-out never does (the
++    // 2026-10-08 inventory found the two far apart); or an added blend, what is behind kept whole and
++    // the draw added over it, which is light by definition. 0056's other two candidates, a gray
++    // texture and a long shape, were never needed and are gone with their switches. What passes is
++    // what 0039 makes a shaft: a see-through overlay no ray traces, drawn after the composite in its
++    // own brightness. The lights 0029 and 0030 make are untouched.
+ 
+     // The blender's inputs for the cycle that writes the frame (the second in two cycle mode).
+     static bool addsOverWhatIsBehind(const interop::OtherMode &otherMode) {
+@@ -520,41 +510,8 @@ namespace RT64 {
+         return otherMode.forceBlend() && (memoryColor == clrMem) && (memoryWeight == one);
+     }
+ 
+-    static bool longFromDraw(const DrawData &drawData, const GameCall &call) {
+-        hlslpp::float3 points[MaxBeamTriangles * 3];
+-        uint32_t count = 0;
+-        hlslpp::float3 mean;
+-        hlslpp::float4 shade;
+-        if (!drawPoints(drawData, call, points, count, mean, shade)) {
+-            return false;
+-        }
+-
+-        float values[3];
+-        float vectors[3][3];
+-        drawAxes(points, count, mean, values, vectors);
+-        if ((values[0] <= 0.0f) || (values[0] < (BeamMinElongation * (values[1] + values[2])))) {
+-            return false;
+-        }
+-
+-        const hlslpp::float3 axis = hlslpp::normalize(hlslpp::float3(vectors[0][0], vectors[1][0], vectors[2][0]));
+-        float alongMin = 1e30f;
+-        float alongMax = -1e30f;
+-        for (uint32_t i = 0; i < count; i++) {
+-            const float along = float(hlslpp::dot(points[i] - mean, axis));
+-            alongMin = std::min(alongMin, along);
+-            alongMax = std::max(alongMax, along);
+-        }
+-
+-        return (alongMax - alongMin) >= BeamMinLength;
+-    }
+-
+-    static bool seeThroughIsLight(const DrawData &drawData, const GameCall &call, uint32_t rules) {
+-        if (rules == 0u) {
+-            return false;
+-        }
+-
+-        const interop::OtherMode &otherMode = call.callDesc.otherMode;
+-        if (((rules & LightAddedBlend) != 0u) && addsOverWhatIsBehind(otherMode)) {
++    static bool seeThroughIsLight(const DrawData &drawData, const GameCall &call) {
++        if (addsOverWhatIsBehind(call.callDesc.otherMode)) {
+             return true;
+         }
+ 
+@@ -563,24 +520,7 @@ namespace RT64 {
+         }
+ 
+         const DrawCallTile &tile = drawData.callTiles[call.callDesc.tileIndex];
+-        if (!tile.valid || tile.tileCopyUsed) {
+-            return false;
+-        }
+-
+-        const TextureAlphaKind alphaKind = textureAlphaKind(tile.tmemHashOrID);
+-        if (alphaKind == TextureAlphaKind::Cutout) {
+-            return false;   // a leaf, a vine, a fence: whole texels or none
+-        }
+-
+-        if (((rules & LightFadingTexture) != 0u) && (alphaKind == TextureAlphaKind::Fade)) {
+-            return true;
+-        }
+-
+-        if (((rules & LightGrayTexture) != 0u) && ((tile.loadTile.fmt == G_IM_FMT_I) || (tile.loadTile.fmt == G_IM_FMT_IA))) {
+-            return true;
+-        }
+-
+-        return ((rules & LightLongShape) != 0u) && longFromDraw(drawData, call);
++        return tile.valid && !tile.tileCopyUsed && (textureAlphaKind(tile.tmemHashOrID) == TextureAlphaKind::Fade);
+     }
+ 
+     // A LATTICE WINDOW IS A LIGHT (patch 0030). The Temple of Time's windows are glass painted on
+@@ -2629,7 +2569,6 @@ namespace RT64 {
+                 renderIndicesVector.push_back(renderIndices);
+ #           if RT_ENABLED
+                 tracedCall.type = InstanceDrawCall::Type::Unknown;   // set again only by a traced call (patch 0005)
+-                bool hideShaft = false;   // patch 0034: a drawn shaft the windows' light stands in for
+                 bool overlayDepthTest = false;   // patch 0046: an overlay hidden behind what is in front of it
+ #           endif
+ 
+@@ -3045,35 +2984,15 @@ namespace RT64 {
+                                 raytracing.queryMask = TranslucentRayQueryMask;
+                                 addBeam(beamLights, beam);
+ 
+-                                // THE SHAFT GOES WHERE ITS WINDOW'S LIGHT STANDS IN FOR IT (patch
+-                                // 0034, the user, 2026-10-08, in the Master Sword room: "only hide
+-                                // that beam and its floor brightness element when ray tracing is
+-                                // enabled and we're using proper ray tracing"). The drawn shaft lies
+-                                // on the floor as a hard bright patch that never matches where the
+-                                // traced light lands, so a shaft falling the way the shaft traced to
+-                                // a window fell is not drawn while that light is traced (the local
+-                                // lights running, Light strength above nothing, rung 37 not chosen).
+-                                // A shaft falling any other way (a song's upright cylinder) is.
+-                                const hlslpp::float3 falls = beam.direction;
+-                                const bool lightsTraced = (rtResources->rtParams.level >= 2) && (rtResources->rtParams.tuneOcclusion.w > 0.0f);
+-                                // EVERY SLANTED SHAFT, NOT ONLY THE ONE TRACED TO A WINDOW (patch
+-                                // 0039, the user, 2026-10-08: "fully remove the light, you know, the
+-                                // mimicked light from the Master Sword Room and instead replace it
+-                                // with the same brightness and lighting behavior that the windows in
+-                                // the main room are doing"). A shaft is only ever traced to a window
+-                                // drawn in the same frame, and the tall window and its shaft are not
+-                                // always both drawn, so the shaft stayed. In a place with windows a
+-                                // shaft leaning in from above is the game's stand-in for a window's
+-                                // light and goes; an upright one (a song's cylinder) stays.
+-                                const bool upright = (-float(falls.y)) > 0.97f;
+-                                // THE GAME'S OWN BEAM CAN BE SHOWN AGAIN (patch 0051, the user,
+-                                // 2026-10-09: "can you add the beam back in in the temple of time
+-                                // since we now aligned the light?"): the Debugging menu's Drawn
+-                                // beam row, beside the shafts of light the windows now make.
+-                                const bool drawnBeamShown = (rtResources->rtParams.tuneShafts.z != 0.0f);
+-                                if (rtExternalEnvironment.windowLights && lightsTraced && !upright && !drawnBeamShown) {
+-                                    hideShaft = true;
+-                                }
++                                // THE DRAWN SHAFT IS ALWAYS DRAWN (patch 0057, the user, 2026-10-12:
++                                // "we removed the light beam from window 1 in the master sword room
++                                // in template of time, i want to add that beam back in", and of the
++                                // build that did: "same with the light beam fixes", PERFECT). 0034 and
++                                // 0039 drew a slanted shaft as nothing in a place with windows while
++                                // the local lights were traced, and 0051's Drawn beam row could show
++                                // it again; it defaulted to hidden, so the sword room's beam was
++                                // gone. As a shaft it is already a see-through overlay no ray traces,
++                                // so it casts nothing, and the window's light still lands under it.
+                             }
+                         }
+ 
+@@ -3082,7 +3001,7 @@ namespace RT64 {
+                         // z mode, a decal excepted (a shadow under a figure is a decal).
+                         const bool blendedOver = otherMode.forceBlend() && !otherMode.zUpd() && (otherMode.zMode() != ZMODE_DEC);
+                         if ((wasTranslucent || blendedOver) && !depthlessOverlay && defaultFamily && (raytracing.queryMask != TranslucentRayQueryMask) &&
+-                            seeThroughIsLight(drawData, call, uint32_t(rtResources->rtParams.tuneLightTest.z))) {
++                            seeThroughIsLight(drawData, call)) {
+                             raytracing.queryMask = TranslucentRayQueryMask;
+                         }
+ 
+@@ -3150,11 +3069,6 @@ namespace RT64 {
+                         }
+                         
+                         triangles.faceCount = call.callDesc.triangleCount;
+-#                   if RT_ENABLED
+-                        if (hideShaft) {
+-                            triangles.faceCount = 0;   // patch 0034: drawn as nothing
+-                        }
+-#                   endif
+                         triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
+                         triangles.postBlendDitherNoise = false;
+ 
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index 8b9071f..1cde3ab 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -854,12 +854,9 @@ namespace RT64 {
+         rtParams.tuneWindowMove = hlslpp::float4(std::clamp(rtConfig.windowMoveX, -1000.0f, 1000.0f), std::clamp(rtConfig.windowMoveY, -1000.0f, 1000.0f),
+                                                  std::clamp(rtConfig.windowMoveZ, -1000.0f, 1000.0f), 0.0f);
+         // The candidates the Debugging menu cycles (patch 0049).
+-        // z the see-through draws that cast no shadow (patch 0056), as its bits, read on the CPU.
+-        rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), float(std::clamp(rtConfig.glowTest, 0, 3)),
+-                                                float(std::clamp(rtConfig.lightCastsNothing, 0, 15)), 0.0f);
++        rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), float(std::clamp(rtConfig.glowTest, 0, 3)), 0.0f, 0.0f);
+         // The windows' shafts (patch 0051).
+-        rtParams.tuneShafts = hlslpp::float4(std::clamp(rtConfig.shaftStrength, 0.0f, 1.0f), std::clamp(rtConfig.shaftLength, 0.05f, 4.0f),
+-                                             (rtConfig.drawnBeam != 0) ? 1.0f : 0.0f, 0.0f);
++        rtParams.tuneShafts = hlslpp::float4(std::clamp(rtConfig.shaftStrength, 0.0f, 1.0f), std::clamp(rtConfig.shaftLength, 0.05f, 4.0f), 0.0f, 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index bb8c2ec..5cbdf99 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -134,15 +134,10 @@ namespace RT64 {
+         // is hidden by what stands in front of it (rt64_framebuffer_renderer.cpp, overlayDepthTest).
+         int glowTest = 0;
+         // The windows' shafts (patch 0051): the air's brightness per world unit of beam crossed
+-        // (0 off), the distance from the glass over which a shaft fades to a third, and whether
+-        // the game's own drawn beam is shown again where the windows give light.
++        // (0 off) and the distance from the glass over which a shaft fades to a third. The game's
++        // own drawn beam is always shown since patch 0057.
+         float shaftStrength = 0.0f;
+         float shaftLength = 0.45f;        // patch 0052: a share of each window's own fall, no longer world units
+-        int drawnBeam = 0;
+-        // Patch 0056, the Debugging menu's candidates for which see-through draws are light and
+-        // so cast no shadow, one bit each: 1 a fading texture, 2 a gray texture, 4 an added blend,
+-        // 8 a long shape (rt64_framebuffer_renderer.cpp, seeThroughIsLight).
+-        int lightCastsNothing = 0;
+         int shadowRays = 4;              // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+index fee0e5b..93051b5 100644
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -113,8 +113,8 @@ namespace interop {
+         float4 tuneWindowAim;    // patch 0044, read on the CPU: x degrees steeper, y degrees turned, z the window aimed (0 every one), w 1 to start from the drawn shaft's direction
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+         float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w the dust's clock in displayed seconds (patch 0048)
+-        float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0); patch 0050, read on the CPU: y the Glow test row (see overlayDepthTest); patch 0056, read on the CPU: z the see-through draws that cast no shadow, as bits (see seeThroughIsLight)
+-        float4 tuneShafts;       // patch 0051: x the Window shafts row (the air's brightness per world unit of beam, 0 off), y the Shaft length row (patch 0052: the share of each window's own fall, from its glass to the first surface, over which the shaft fades to a third), z 1 to draw the game's own beam again (the Debugging menu's Drawn beam row, read on the CPU)
++        float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0); patch 0050, read on the CPU: y the Glow test row (see overlayDepthTest); z unused (patch 0056's switches, folded in by 0057)
++        float4 tuneShafts;       // patch 0051: x the Window shafts row (the air's brightness per world unit of beam, 0 off), y the Shaft length row (patch 0052: the share of each window's own fall, from its glass to the first surface, over which the shaft fades to a third); z unused (the Drawn beam row's, gone with patch 0057, which always draws the game's own beam)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

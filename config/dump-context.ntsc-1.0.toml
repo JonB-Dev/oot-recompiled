@@ -1,0 +1,61 @@
+# Context dump config: reads our ELF and writes the symbol tables.
+#
+# This config exists ONLY to run `N64Recomp --dump-context`. The real recompiler config
+# (ntsc-1.0.toml) consumes the symbol tables this produces, together with the uncompressed ROM, and
+# never reads the ELF again. Keeping the two apart matters: the recompiler refuses to dump a context
+# when it is given a symbols file, so one config cannot do both jobs.
+#
+# Paths are relative to this file.
+
+[input]
+# The ROM header's entrypoint, which the decomp's ELF exports as a function symbol named
+# `entrypoint`. Confirmed against the built ELF rather than taken from the header alone.
+entrypoint = 0x80000400
+
+elf_path = "../build/oot-ntsc-1.0.elf"
+
+# The 469 overlay sections, generated from this same ELF by tools/gen_overlay_list.py. Each one is
+# loaded at an address other than where it was linked, so its relocations are applied at load time.
+relocatable_sections_path = "overlays.ntsc-1.0.txt"
+
+# Every overlay section here has a matching `.bss` section.
+bss_section_suffix = ".bss"
+
+# Unused by the dump, but the config reader wants somewhere to put recompiled functions.
+output_func_path = "../RecompiledFuncs"
+
+# ---------------------------------------------------------------------------------------------
+# Function size corrections
+#
+# Where the elf gives a function a size that runs past its real end, the recompiler decodes
+# whatever follows as instructions. That is not a warning, it is a hard failure on the first word
+# that is not a valid instruction, and the message names the function rather than the data.
+#
+# These overrides only apply in elf mode, which is this config, so the fix belongs here and the
+# symbol tables are regenerated from it. Correcting the generated toml by hand would be undone by
+# the next dump, silently.
+
+[[input.function_sizes]]
+# The elf gives this 0xAE0, which runs 0xA48 bytes past the end of the function and straight into
+# low_codepoints_lookup_table, a 2632 byte data table that starts at 0x800AF828. The recompiler
+# reached the table and stopped at "Unhandled instruction: INVALID".
+#
+# 0x98 is measured, not guessed: the function's last `jr ra` is at 0x800AF820 with its delay slot
+# at 0x800AF824, and the table's own symbol begins at 0x800AF828. 0x800AF828 - 0x800AF790 = 0x98.
+name = "KanjiTex_CodepointToOffset"
+size = 0x98
+
+# The other two are the same shape, found by tools/check_func_sizes.py rather than one at a time by
+# rerunning the recompiler. All three of this elf's overruns are a function immediately followed by
+# its own lookup table, with the function's recorded size covering both, and all three are in the
+# kanji and 64DD library code.
+
+[[input.function_sizes]]
+# elf says 0xB00, which runs past kantbl at 0x801CF168. 0xB8 is the distance to it.
+name = "LeoGetKAdr"
+size = 0xB8
+
+[[input.function_sizes]]
+# elf says 0x2490, which runs past asc2tbl at 0x801CFC20. 0x70 is the distance to it.
+name = "LeoGetAAdr"
+size = 0x70

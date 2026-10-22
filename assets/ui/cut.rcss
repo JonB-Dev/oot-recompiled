@@ -1,0 +1,41 @@
+/* THE CUT (the menus plan, phase 88): the website's signature joint, carried into the menus as
+ * the docked panel's slanted edge with its gold lit line (the Medallion direction,
+ * .scaffold/menus/design/decision/). Not a shader: a linear gradient with hard stops. "to bottom
+ * right" sets its middle line exactly from the edge element's top right corner to its bottom left,
+ * so the slant follows the element's own box at any window height: the panel's ground up to the
+ * line, the gold line along it, nothing beyond. The ramp behind it is 1024 texels, so the gold
+ * stays within a pixel down a 1080 line window (src/ui/ui_gradient.h).
+ *
+ * .cut-edge sits against the panel's outer side, the panel's own ground carried into a wedge.
+ * Docked right, .mirror turns it to face the picture on the left. */
+
+.cut-edge
+{
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	right: 0;
+	width: var(--cut-edge-width);
+	decorator: linear-gradient(to bottom right, var(--cut-ground) 50%, var(--cut-light) 50%, var(--cut-light) 51.7%, transparent 51.7%);
+	pointer-events: none;
+}
+
+.cut-edge.mirror
+{
+	right: auto;
+	left: 0;
+	decorator: linear-gradient(to bottom left, var(--cut-ground) 50%, var(--cut-light) 50%, var(--cut-light) 51.7%, transparent 51.7%);
+}
+
+/* The contour survey: our own drawing of the site's contour lines, at the size of the largest
+ * panel (tools/generate_contours.py), laid under a panel's content and never over the picture. */
+.survey
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: var(--survey-width);
+	height: var(--survey-height);
+	decorator: svg(textures/contours.svg);
+	pointer-events: none;
+}

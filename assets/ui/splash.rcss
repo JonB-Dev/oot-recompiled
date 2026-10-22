@@ -1,0 +1,147 @@
+/* THE SPLASH (the menus plan, phase 99), option D of design-canvas://96729e1b, laid out in the
+ * launcher's own 960 by 620 window from the decision's numbers (tokens.rcss). Tokens only. */
+
+body.splash
+{
+	width: 100%;
+	height: 100%;
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	font-family: var(--font-body);
+	color: var(--color-dim);
+	decorator: radial-gradient(circle at 38% 46%, var(--splash-light) 0%, var(--color-slate) 50%, var(--splash-dark) 100%);
+	opacity: 1;
+	transition: opacity var(--splash-fade) var(--ease);
+	overflow: hidden;
+}
+
+/* The launcher's own size, centered in whatever the window is: it opens maximized (the user,
+ * 2026-10-13), and every part below is placed within this stage as the decision drew it. */
+.splash-stage
+{
+	position: relative;
+	flex: none;
+	width: var(--launcher-width);
+	height: var(--launcher-height);
+}
+
+/* Fading out as the launcher appears. */
+body.splash.gone
+{
+	opacity: 0;
+}
+
+.splash-slab,
+.splash-pour
+{
+	position: absolute;
+	left: var(--splash-slab-left);
+	top: var(--splash-slab-top);
+	width: var(--splash-slab-width);
+	height: var(--splash-slab-height);
+}
+
+.splash-slab
+{
+	decorator: svg(brand/splash-slab.svg);
+}
+
+/* THE POUR: the gold name, clipped by a box that opens from the left while the program loads.
+ * ITS WIDTH IS SET BY THE PROGRAM EVERY FRAME (ui_shell.cpp, poll_splash), measured along the name
+ * from --splash-name-from to --splash-name-to: to --splash-pour-pause-at over --splash-pour-first, held for
+ * --splash-pour-hold, then the rest over --splash-pour-rest, each on the easing token's curve. It was a transition on a
+ * class, and RmlUi never animated it: the gold appeared whole the moment the class landed (the
+ * user, 2026-10-13: "still not starting grey and filling"). */
+/* CLIP ALWAYS (the user, 2026-10-13: "the splash still starts fully filled gold rather than
+ * animating"). RmlUi clips an overflow: hidden box only when it counts content overflowing it, and
+ * the gold name is absolutely placed, which it does not count, so the box never clipped and the
+ * whole name showed at every width. clip: always makes it clip whatever it holds. */
+.splash-pour
+{
+	overflow: hidden;
+	clip: always;
+	width: 0%;
+}
+
+.splash-gold
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: var(--splash-slab-width);
+	height: var(--splash-slab-height);
+	decorator: svg(brand/splash-gold.svg);
+}
+
+.splash-md
+{
+	position: absolute;
+	left: var(--splash-emblem-left);
+	top: var(--splash-emblem-top);
+	width: var(--splash-emblem-width);
+	height: var(--splash-emblem-height);
+}
+
+/* The mark in the disc, raised to sit optically centered (the user, 2026-10-12): 64 by 53.3 at
+ * (68, 57.4) of the medallion's 200 by 190. */
+.splash-md .splash-mark
+{
+	position: absolute;
+	left: 34%;
+	top: 30.21%;
+	width: 32%;
+	height: 28.05%;
+}
+
+.splash-foot
+{
+	position: absolute;
+	left: var(--splash-foot-side);
+	right: var(--splash-foot-side);
+	bottom: var(--splash-foot-bottom);
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+}
+
+.splash-by
+{
+	font-weight: var(--weight-body-strong);
+	font-size: var(--size-note);
+}
+
+.splash-loading
+{
+	display: flex;
+	align-items: center;
+	font-family: var(--font-mono);
+	font-size: var(--size-label);
+	letter-spacing: var(--tracking-label);
+	text-transform: uppercase;
+}
+
+.splash-pip
+{
+	width: var(--splash-pip);
+	height: var(--splash-pip);
+	margin-right: var(--space-3);
+	background-color: var(--color-gold);
+	animation: var(--splash-pip-pulse) var(--ease) infinite alternate pip;
+}
+
+@keyframes pip
+{
+	from { opacity: 0.25; }
+	to { opacity: 1; }
+}
+
+/* The medallion moves as it does on the canvas, its rim gold (the logo's, not the focus's lime):
+ * the fan breathes and the glint runs round the rim, with medallion.rcss's own keyframes. */
+.splash-md .ly.leaf-l-o1, .splash-md .ly.leaf-l-o2 { animation: var(--fan-cycle) var(--ease) infinite fan-l; }
+.splash-md .ly.leaf-l-i1, .splash-md .ly.leaf-l-i2 { animation: var(--fan-cycle) var(--fan-step) var(--ease) infinite fan-l; }
+.splash-md .ly.leaf-l-c { animation: var(--fan-cycle) var(--fan-step-2) var(--ease) infinite fan-l; }
+.splash-md .ly.leaf-r-o1, .splash-md .ly.leaf-r-o2 { animation: var(--fan-cycle) var(--ease) infinite fan-r; }
+.splash-md .ly.leaf-r-i1, .splash-md .ly.leaf-r-i2 { animation: var(--fan-cycle) var(--fan-step) var(--ease) infinite fan-r; }
+.splash-md .ly.leaf-r-c { animation: var(--fan-cycle) var(--fan-step-2) var(--ease) infinite fan-r; }
+.splash-md .ly.glint { animation: var(--glint-cycle) var(--ease) infinite glint; }

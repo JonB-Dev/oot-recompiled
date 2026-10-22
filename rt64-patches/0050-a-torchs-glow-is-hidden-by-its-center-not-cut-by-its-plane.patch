@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 21:59:49 -0400
+Subject: [PATCH] A torch's glow is hidden by its center, not cut by its plane
+
+Patch 0050 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, in the Fire Temple: "the radial glows that are around ... things like torches
+or navi ... rotate. They're just a flat surface that rotates around to basically always face the
+camera. So they're not an actual 3D sphere ... at certain angles, that plane starts to get clipped
+by the geometry around it", and from the Inspect view of a torch in a recess: "you can see its that
+the outer glow is clipping behing the walls and ceiling geometry".
+
+Every point light's glow is Lights_DrawGlow's quad, turned to the eye and about 230 units across at
+a torch's radius, drawn with no depth test (G_RM_CLD_SURF) after the rooms. 0028 and 0040 take it as
+an overlay and 0046, made for Navi's core, depth tests every overlay against the world, so a flame
+in a recess showed its glow only through the opening, edged by the lintel and the jamb: a
+regression of 0.4.0. The console tested only whether the light's center was covered.
+patches/light_glow.c now draws each glow inside RT64's vertex Z test at the light's center (the
+reference project's technique), and a draw inside that test takes no depth test here.
+
+The Debugging menu's Glow test row chooses, in tuneLightTest.y, read on the CPU (the game patch
+reads the same row): 0 glows by their center, Navi's core still tested per pixel; 1 glows by their
+center, nothing tested per pixel; 2 every overlay tested per pixel and no center test, as 0.4.0;
+3 nothing tested at all, as 0.3.9.
+
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -113,7 +113,7 @@ namespace interop {
+         float4 tuneWindowAim;    // patch 0044, read on the CPU: x degrees steeper, y degrees turned, z the window aimed (0 every one), w 1 to start from the drawn shaft's direction
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+         float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w the dust's clock in displayed seconds (patch 0048)
+-        float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0)
++        float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0); patch 0050, read on the CPU: y the Glow test row (see overlayDepthTest)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -130,7 +130,10 @@ namespace RT64 {
+         // at the first surface it meets and so does its glow in the air, 1 the same but the glow
+         // unshadowed, 2 the 48 unit clearance as it was in 0.4.0.
+         int lightStone = 0;
+-        int shadowRays = 4;                 // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
++        // The Glow test row from the Debugging menu (patch 0050): how a glow laid over the picture
++        // is hidden by what stands in front of it (rt64_framebuffer_renderer.cpp, overlayDepthTest).
++        int glowTest = 0;
++        int shadowRays = 4;                // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+         float motionBlurStrength = 0.0f;
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -854,7 +854,7 @@ namespace RT64 {
+         rtParams.tuneWindowMove = hlslpp::float4(std::clamp(rtConfig.windowMoveX, -1000.0f, 1000.0f), std::clamp(rtConfig.windowMoveY, -1000.0f, 1000.0f),
+                                                  std::clamp(rtConfig.windowMoveZ, -1000.0f, 1000.0f), 0.0f);
+         // The candidates the Debugging menu cycles (patch 0049).
+-        rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), 0.0f, 0.0f, 0.0f);
++        rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), float(std::clamp(rtConfig.glowTest, 0, 3)), 0.0f, 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2810,7 +2810,32 @@ namespace RT64 {
+                         // is now drawn with a depth test against the world drawn before it (compare,
+                         // never write): still untouched by the lighting, but hidden where Link, a
+                         // character or a wall stands in front of it.
+-                        overlayDepthTest = depthlessOverlay;
++                        //
++                        // A TORCH'S GLOW IS NOT A FLAT CARD IN THE WALL (patch 0050, the user, 2026-10-08,
++                        // in the Fire Temple: "the radial glows that are around ... things like torches or
++                        // navi ... rotate. They're just a flat surface that rotates around to basically
++                        // always face the camera ... so at certain angles, that plane starts to get
++                        // clipped by the geometry around it"; "you can see its that the outer glow is
++                        // clipping behing the walls and ceiling geometry"). Every point light's glow
++                        // (Lights_DrawGlow: one quad turned to the eye, about 230 units across at a
++                        // torch's radius) is an overlay too, and the test above cut it wherever stone
++                        // stood in front of its plane: a recessed flame's glow showed only through the
++                        // recess opening, edged by the lintel and the jamb. The console never tested
++                        // it per pixel; the game asked once whether the light's center was covered.
++                        // patches/light_glow.c now asks the renderer the same question (the vertex Z
++                        // test, the reference project's way, at the real frame's width), so a draw
++                        // inside that test is hidden whole or drawn whole and takes no test here.
++                        //
++                        // As candidates on the Debugging menu's Glow test row (the user: "adds some
++                        // debugging options to cycle through ... which one fixes it without
++                        // regressions"), tuneLightTest.y, the patch reading the same row:
++                        //   0  glows by their center; Navi's core still tested here, as since 0046
++                        //   1  glows by their center; nothing tested here, Navi's core included
++                        //   2  every overlay tested here and no center test: 0.4.0
++                        //   3  nothing tested anywhere: 0.3.9
++                        const int glowTest = int(rtResources->rtParams.tuneLightTest.y);
++                        const bool insideCenterTest = (vertexTestZCallIndex >= 0);
++                        overlayDepthTest = depthlessOverlay && ((glowTest == 2) || ((glowTest == 0) && !insideCenterTest));
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+                         const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);
+                         if ((wasTranslucent && !solidDraw) || depthlessOverlay) {

@@ -1,0 +1,405 @@
+/* Design tokens. Every value our interface uses lives here and nowhere else.
+ *
+ * THE MENUS PLAN (.scaffold/menus/, phase 89). The palette, faces, accents and motion are the
+ * website's own, read from its BRAND.md and src/styles/global.css at f7d7eba ("must use curresnt
+ * site branding and accents", the user, 2026-10-12). The layout's measurements come from the
+ * design decision: design-canvas://724e75f1-4d27-4d69-96ec-f8e2032fe554 (C, Medallion, docked left
+ * and right and in the launcher) with its ADDENDUM (B, Ledger with medallions, centered), and the
+ * medallion from design-canvas://b3018d5b-976a-4f21-8c07-5a7a51142974 (A, Leaf fan, as first drawn).
+ *
+ * NO COMPONENT STYLESHEET MAY CONTAIN A LITERAL COLOR, SIZE, SPACING, RADIUS OR DURATION
+ * (tools/check_tokens.py fails the build). If a value is needed and is not here, it gets a token
+ * here first. tools/tokens_header.py writes the same values into a C++ header for the installer
+ * and the input layer, so nothing copies them by hand.
+ *
+ * Names describe MATERIAL AND ROLE, never the game.
+ */
+
+body
+{
+	/* ---------------------------------------------------------------------------------------
+	 * Color: the site's primitives, exactly.
+	 */
+	--color-slate-deep: #0c1215;
+	--color-slate: #10171a;
+	--color-slate-raised: #172126;
+	--color-plate-on: #1b2b22;
+	--color-line: #2b3a40;
+	--color-line-soft: #1d292e;
+	--color-ink: #e8f0ee;
+	--color-dim: #a7b8b5;
+	--color-faint: #8a9c98;
+	--color-lime: #c6ff3d;
+	--color-lime-bright: #dcff85;
+	--color-on-lime: #0b0d10;
+	--color-gold: #c9a227;
+	--color-gold-bright: #e2c24e;
+	--color-on-gold: #10171a;
+
+	/* The site's status colors (oklch there; converted once to sRGB). */
+	--color-success: #53be70;
+	--color-error: #f75e54;
+	--color-warning: #edb345;
+	--color-info: #50b1dc;
+
+	/* The site's soft mixes, as RGBA: lime at 35% (a focused row's wash is lighter still), gold at
+	 * 40%, slate-deep at 80% for a scrim, and the full scrim the centered menu lays over the
+	 * held picture. */
+	--color-accent-soft: #c6ff3d59;
+	--color-accent-wash: #c6ff3d1a;
+	--color-accent-hover: #c6ff3d0d;
+	--color-light-soft: #c9a22766;
+	--color-scrim: #0c1215cc;
+	--color-scrim-full: #0c1215bd;
+
+	/* The pad families' own button colors in prompts (the user, 20:35: "additional color"):
+	 * the lettered face buttons as printed. */
+	--color-pad-south: #53be70;
+	--color-pad-east: #f75e54;
+	--color-pad-west: #50b1dc;
+	--color-pad-north: #edb345;
+
+	/* Semantic */
+	--color-bg: var(--color-slate);
+	--color-bg-deep: var(--color-slate-deep);
+	--color-surface: var(--color-slate-raised);
+	--color-border: var(--color-line);
+	--color-text: var(--color-ink);
+	--color-text-muted: var(--color-dim);
+	--color-text-faint: var(--color-faint);
+	--color-accent: var(--color-lime);
+	--color-accent-strong: var(--color-lime-bright);
+	--color-on-accent: var(--color-on-lime);
+	--color-light: var(--color-gold);
+	--color-on-light: var(--color-on-gold);
+	--color-danger: var(--color-error);
+	--letterbox: #000000;
+
+	/* ---------------------------------------------------------------------------------------
+	 * Type: the site's three faces (src/ui/ui_fonts.h). One family per token: RCSS custom
+	 * properties take no list.
+	 */
+	--font-display: Big Shoulders Display;
+	--font-body: Bricolage Grotesque;
+	--font-mono: JetBrains Mono;
+
+	--weight-display: 800;
+	--weight-display-max: 900;
+	--weight-body: 400;
+	--weight-body-strong: 600;
+	--weight-mono: 400;
+	--weight-mono-strong: 700;
+
+	--size-display-xl: 44dp;
+	--size-display: 30dp;
+	--size-heading: 19dp;
+	--size-row: 17dp;
+	--size-value: 16dp;
+	--size-note: 14dp;
+	--size-label: 11.5dp;
+	--size-label-sm: 10.5dp;
+	--size-prompt: 13dp;
+
+	--tracking-label: 0.14em;
+	--tracking-badge: 0.14em;
+	--tracking-caption: 0.06em;
+
+	/* ---------------------------------------------------------------------------------------
+	 * Spacing: the site's scale.
+	 */
+	--space-1: 4dp;
+	--space-2: 8dp;
+	--space-3: 12dp;
+	--space-4: 16dp;
+	--space-5: 20dp;
+	--space-6: 24dp;
+	--space-8: 32dp;
+	--space-10: 40dp;
+	--space-12: 48dp;
+	--space-16: 64dp;
+
+	/* ---------------------------------------------------------------------------------------
+	 * Borders: square everywhere (the site: "Zero, everywhere").
+	 */
+	--radius: 0dp;
+	--rule: 1dp;
+	--edge-lit: 2dp;
+	--edge-focus: 3dp;
+	--outline-focus: 3dp;
+
+	/* ---------------------------------------------------------------------------------------
+	 * The Medallion layout (docked left and right, the launcher), from the decision's snapshot.
+	 */
+	--panel-width: 640dp;
+	--cut-ground: #10171a;
+	--cut-light: #c9a227;
+	--cut-edge-width: 60dp;
+	--survey-width: 1280dp;
+	--survey-height: 1080dp;
+	--dial-height: 250dp;
+	/* A little tighter (the user, 2026-10-13: "maybe slightly reduce item padding for all setting
+	 * lines too"): 62, 10 and 10 before. */
+	--plate-min-height: 54dp;
+	--plate-gap: 8dp;
+	--plate-pad-y: 7dp;
+	--plate-pad-x: 18dp;
+	--plate-icon: 44dp;
+	--plate-ring: 40dp;
+	--plate-glyph: 20dp;
+	--plate-pick-join: -1dp;
+	/* A list of files (the ROM browser): slimmer plates, so a short page shows several. */
+	--plate-list-min-height: 34dp;
+	--plate-list-gap: 4dp;
+	--plate-list-pad-y: 4dp;
+	--tick-width: 6dp;
+	--tick-height: 22dp;
+	--tick-gap: 4dp;
+	--value-width: 62dp;
+	--launcher-width: 960dp;
+	--launcher-height: 620dp;
+	--launcher-dial-height: 214dp;
+
+	/* The Ledger layout (centered), from the decision's B in game. */
+	--ledger-width: 1400dp;
+	--ledger-height: 820dp;
+	--rail-width: 268dp;
+	--preview-width: 420dp;
+	--preview-overlap: 26dp;
+	--ledger-label-width: 200dp;
+	--rail-item-height: 54dp;
+	--row-min-height: 50dp;
+
+	/* The medallions: the Leaf fan at each size it is drawn (200 by 190, so height is 0.95 of
+	 * width). medallion.rcss reads --md-size and --md-height; a size class sets the pair. */
+	--md-size: 44dp;
+	--md-height: 41.8dp;
+	--md-dial-size: 84dp;
+	--md-dial-height: 79.8dp;
+	--md-current-size: 150dp;
+	--md-current-height: 142.5dp;
+	--md-row-size: 44dp;
+	--md-row-height: 41.8dp;
+	--md-prompt-size: 40dp;
+	--md-prompt-height: 38dp;
+	--md-glyph: var(--color-ink);
+	--md-glyph-on: var(--color-lime);
+
+	/* ---------------------------------------------------------------------------------------
+	 * The shell (phase 96): the head with the logo, the dial, the page, the prompts. The logo is
+	 * the splash's lockup cropped to what it paints, 896 by 237 (assets/ui/brand/logo.svg), so
+	 * each width has its height at that ratio. Its placement is provisional until the user picks
+	 * on design-canvas://e2a4464a-6832-40eb-9792-60adc252cd25 (built as A, Masthead).
+	 */
+	--mast-height: 112dp;
+	--mast-height-docked: 100dp;
+	--logo-width: 330dp;
+	--logo-height: 87.3dp;
+	/* Docked in the game, centered and half the size it was (the user, 2026-10-13: "the logo is huge
+	 * at the top. It could be centered instead and ... probably half that current size"). */
+	--logo-width-docked: 292dp;
+	--logo-height-docked: 77.2dp;
+	--logo-width-rail: 236dp;
+	--logo-height-rail: 62.4dp;
+	--shell-dial-height: 186dp;
+	--shell-dial-height-docked: 190dp;
+	--name-drop-below: -18dp;
+	--prompts-height: 52dp;
+	--host-top: 44dp;
+	--host-side: 64dp;
+	--host-side-docked: 34dp;
+	--host-side-cut: 96dp;
+	--host-bottom: 18dp;
+	--window-btn-width: 44dp;
+	--window-btn-height: 38dp;
+	--held-size: 84dp;
+	/* The medallion's drawing is 200 by 190 (--md-size and --md-height), so 84 across is 79.8 tall. */
+	--held-md-height: 79.8dp;
+	--held-margin: 52dp;
+	--plate-pr-height: 42dp;
+	/* The plate's ends (88 of its drawing's 264): with the middle at its least, 58dp as before. */
+	--plate-cap-width: 19.3dp;
+	/* How far the middle runs under each end, so the three pieces never part: the ends are a
+	 * fraction of a pixel wide (19.3), each piece is drawn to whole pixels, and where they round
+	 * apart a seam showed (the user, 2026-10-13: "there is little 1px gaps"). */
+	--plate-seam: -1dp;
+	/* How far a word reaches into each end, where the rounded rectangle still runs flat. */
+	--plate-word-reach: -6dp;
+	--pad-pr-width: 62dp;
+	--plate-pr-overlap: -8dp;
+	--plate-text-lift: 2dp;
+	/* The footer's own text and gaps: the same numbers as --size-note, --space-6, --space-2 and
+	 * --size-label-sm, kept apart so the footer can hold its size (.prompts-full-size below). */
+	--pr-text: 14dp;
+	--pr-gap: 24dp;
+	--pr-label-gap: 8dp;
+	--pr-word-size: 10.5dp;
+	/* Photo mode's button guide (2026-10-13, prompts.rcss): how far above the picture's bottom. */
+	--pg-bottom: 24dp;
+
+	/* The on-screen keyboard (phase 110): a panel over the bottom of the window. */
+	--kb-width: 760dp;
+	--kb-key-height: 46dp;
+	--kb-key-gap: 6dp;
+	--kb-bottom: 72dp;
+	--kb-line-height: 44dp;
+
+	/* The setup window (phase 115, src/setup/setup.cpp reads these through ui_tokens.h). */
+	--setup-width: 560dp;
+	--setup-height: 400dp;
+	--setup-head-height: 56dp;
+	--setup-browse-width: 96dp;
+	--field-height: 32dp;
+
+	/* The splash (phase 99), design-canvas://96729e1b option D, in the launcher's 960 by 620: the
+	 * ground lit from behind the medallion, the slab's box (the logo's crop, 896 by 237 at 55, 200),
+	 * the medallion's (290 by 276 at 30, 170), the foot line 40 in from the sides and 30 up. The
+	 * pour runs over most of the time the splash is up; the splash is up for at least the minimum
+	 * the program waits (src/ui/ui_shell.cpp), and fades as the launcher appears. */
+	--splash-light: #19252a;
+	--splash-dark: #070b0d;
+	--splash-slab-left: 55dp;
+	--splash-slab-top: 200dp;
+	--splash-slab-width: 896dp;
+	--splash-slab-height: 237dp;
+	--splash-emblem-left: 30dp;
+	--splash-emblem-top: 170dp;
+	--splash-emblem-width: 290dp;
+	--splash-emblem-height: 276dp;
+	--splash-foot-side: 40dp;
+	--splash-foot-bottom: 30dp;
+	--splash-pip: 7dp;
+	/* THE POUR READS AS LOADING (the user, 2026-10-13: "make it slow and pause like 30 percent
+	 * through before fnsihing the rest"): a slow first stretch to the pause, a hold there, then the
+	 * rest; the splash stays a beat after it fills. */
+	--splash-pour-first: 1.3s;
+	--splash-pour-pause-at: 0.3;
+	--splash-pour-hold: 0.8s;
+	--splash-pour-rest: 1.5s;
+	--splash-pour-after: 0.35s;
+	/* A focused button's ring (the user, 2026-10-13): this far outside its edge, this thick. */
+	--focus-ring-out: -5dp;
+	--focus-ring-width: 2dp;
+	/* Where the gold name runs within the slab, from its left edge (measured from the gold art,
+	 * assets/ui/brand/splash-gold.svg: 251.5 to 782.1 of 896). The pour is measured along the
+	 * name, so its pause sits at that share OF THE NAME (the user, 2026-10-13: "it was more like a
+	 * 10th filled not 30%", when it was a share of the whole slab, whose left end the medallion
+	 * covers). */
+	--splash-name-from: 251dp;
+	--splash-name-to: 783dp;
+	--splash-fade: 0.6s;
+	--splash-pip-pulse: 1.2s;
+	/* The Leaf fan's breath and glint, as medallion.rcss runs them on a focused medallion. */
+	--fan-cycle: 2.6s;
+	--fan-step: 0.12s;
+	--fan-step-2: 0.24s;
+	--glint-cycle: 3.2s;
+
+	/* The face buttons' colors in prompts, pastel, coded as the controllers code them (the user,
+	 * 2026-10-12: "square is pink pastel, x on ps5 is blue, green triangle, slightly darker
+	 * pinkish red for circle"). */
+	--color-xbox-a: #9fdc9c;
+	--color-xbox-b: #f29393;
+	--color-xbox-x: #95c0f5;
+	--color-xbox-y: #f3d77f;
+	--color-ps-cross: #9ec5f8;
+	--color-ps-circle: #ef8a96;
+	--color-ps-square: #f4aad2;
+	--color-ps-triangle: #97dcb4;
+	/* An image-color that leaves a drawing in its own colors (the prompts' d-pad and sticks). */
+	--color-untinted: #ffffff;
+
+	/* ---------------------------------------------------------------------------------------
+	 * Layers, bottom to top.
+	 */
+	--layer-plates: 10;
+	--layer-shell: 20;
+	--layer-dialog: 30;
+	--layer-keyboard: 40;
+	--layer-toast: 50;
+	/* A document that must stay where it was put among the others (the menu's frame, behind its page).
+	   RmlUi raises a document whose z-index is auto to the front whenever anything in it takes focus,
+	   a click on empty space included; a number, even this zero, keeps the order and paints the same. */
+	--layer-document: 0;
+	/* Inside one prompt plate: its middle and word above its two ends, which the word reaches into. */
+	--layer-plate-word: 1;
+
+	/* ---------------------------------------------------------------------------------------
+	 * Motion: the site's durations. RmlUi has no cubic-bezier, so the site's emphasized curve,
+	 * a strong ease in and out, is its quartic tween.
+	 */
+	--duration-fast: 0.10s;
+	--duration-base: 0.20s;
+	--duration-slow: 0.60s;
+	--ease: quartic-in-out;
+
+	/* The music's level while a menu holds the game, in percent (the user, 2026-10-12: "20%"),
+	 * read by patches/menu_music.c through the program (the generated header). */
+	--menu-music-level: 20;
+
+	/* Navigation timing (ours; read by the input layer through the generated header). */
+	--repeat-delay: 0.38s;
+	--repeat-start: 0.11s;
+	--repeat-fastest: 0.045s;
+	/* A stick counts as a direction past this much of its travel, and stops counting below the
+	 * second, so a stick resting near the line does not chatter. */
+	--stick-threshold: 0.5;
+	--stick-release: 0.35;
+
+	/* ---------------------------------------------------------------------------------------
+	 * The surfaces' own measures: the files list, the moment slots and captures, the toast,
+	 * the action bar, the checks, the mark, the window's bar and buttons. (Until phase 116 these
+	 * sat among the old names, which are gone: every surface reads the names above.)
+	 */
+	--case-max-height: 78%;
+	--slot-width: 150dp;
+	--scroll: 6dp;
+	--thumb-width: 80dp;
+	--thumb-height: 60dp;
+	--capture-width: 360dp;
+	--toast-width: 330dp;
+	--act-height: 40dp;
+	--pad-act-side: 22dp;
+	--step-width: 30dp;
+	--check: 14dp;
+	--check-inset: 3dp;
+	--check-tick: 8dp;
+	--divider-tracking: 1dp;
+	--badge-drop: 3dp;
+	--files-label-width: 160dp;
+	--gold-peak: #fcf5e3;
+	--gold-deep: #967600;
+	--mark-w: 18dp;
+	--mark-h: 15dp;
+	--win-btn: 22dp;
+	--chrome-bar: 30dp;
+	--plate-top-under-bar: 41dp;
+	--dot: 9dp;
+	--mark-small-w: 14dp;
+	--mark-small-h: 12dp;
+}
+
+/* THE FOOTER'S PROMPTS NEVER SHRINK (the user, 2026-10-13: "the button controls in the footer of
+ * the launcher. Those are already relatively small, so maybe don't scale those down"). Below 100%
+ * on the Interface size row, the shell's document takes this class (shell_model::hold_prompt_size)
+ * and the footer's tokens are given again in px, which RmlUi never scales: the same numbers as
+ * their dp values above, so the prompts stay at exactly their 100% size while everything else
+ * shrinks. At 100% and above the class is off and they grow with the rest. tools/tokens_header.py
+ * reads the first definition of each token, so these never reach the native header. */
+.prompts-full-size
+{
+	--prompts-height: 52px;
+	--md-prompt-size: 40px;
+	--md-prompt-height: 38px;
+	--size-prompt: 13px;
+	--plate-pr-height: 42px;
+	--plate-cap-width: 19.3px;
+	--plate-seam: -1px;
+	--plate-word-reach: -6px;
+	--pad-pr-width: 62px;
+	--plate-pr-overlap: -8px;
+	--plate-text-lift: 2px;
+	--pr-text: 14px;
+	--pr-gap: 24px;
+	--pr-label-gap: 8px;
+	--pr-word-size: 10.5px;
+}

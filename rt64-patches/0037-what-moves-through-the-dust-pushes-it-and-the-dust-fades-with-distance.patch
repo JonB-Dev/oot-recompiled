@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:27:47 -0400
+Subject: [PATCH] What moves through the dust pushes it, and the dust fades
+ with distance
+
+Patch 0037 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, on the dust of patches 0035 and 0036: "as Link runs through it, it needs to
+... have realistic motion as the dust would be moving along with Link in that direction, like it
+would be pushed, and then air would kind of flow out behind Link and ... bellow out"; "all things
+that can receive a shadow or cast a shadow should also interact with the dust"; and "a distance
+setting on how far out the stuff renders ... a gradual fade out rather than a harsh cutoff ... This
+would control the end of the fade-off distance".
+
+The program hands over, after the game's lights, a trail of samples of every actor that moved
+(the game's own table of them, sampled a tenth of a second apart and kept for a second), each with
+group bit 32: a position, the motion in world units a second, a reach and the age. Every light
+loop passes them over. The air pass takes the few whose wake reaches the eye's ray and pushes
+each mote it passes: carried along with a young sample's motion, then, as the sample ages and its
+wake widens, spilled outward from the path and lifted a little, settling as the sample dies. A
+mote is pushed no further than its own cell allows, so the march still finds it.
+
+A new parameter group, tuneAmbience, carries where the ambience's fade with distance ends (the
+Ambience distance row). The dust fades from a fifth of that distance to all of it, measured from
+the eye: 0035 measured its fade to the surface behind a mote, so the motes in front of a near wall
+faded out, and that is corrected here. A long distance takes longer steps, at most 128 to a ray.
+
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -844,6 +844,8 @@ namespace RT64 {
+         const float windLength = std::sqrt(rtConfig.windX * rtConfig.windX + rtConfig.windZ * rtConfig.windZ);
+         rtParams.tuneWind = hlslpp::float4((windLength > 0.0f) ? (rtConfig.windX / windLength) : 0.0f, (windLength > 0.0f) ? (rtConfig.windZ / windLength) : 0.0f,
+                                            std::max(rtConfig.windSpeed, 0.0f), std::clamp(rtConfig.windGusts, 0.0f, 1.0f));
++        // Where the ambience's fade with distance ends (patch 0037).
++        rtParams.tuneAmbience = hlslpp::float4(std::clamp(rtConfig.ambienceDistance, 100.0f, 8000.0f), 0.0f, 0.0f, 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -108,6 +108,8 @@ namespace RT64 {
+         float windGusts = 0.0f;
+         float windX = 0.0f;
+         float windZ = 1.0f;
++        // The Ambience distance row (patch 0037): where the dust's long fade with distance ends.
++        float ambienceDistance = 1200.0f;
+         int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -543,6 +543,7 @@ static const float LocalBlockerSkip = 10.0f;   // world units; Link is about 60
+ // exponent, the radius at the top in the point radius and at the bottom in the spot's maximum,
+ // and the share of the radius its edge fades across in the spot's falloff.
+ static const uint BeamLightBit = 8u;
++static const uint AirMoverBit = 32u;   // patch 0037: a sample of something moving through the dust, not a light (see moverPush)
+ static const float BeamLandingReach = 1.3f;     // past its drawn end a shaft still lands, fading out by this share of its length
+ static const float BeamClearanceShare = 0.15f;  // the top of a shaft sits in the hole or the window it comes through; its last share is not traced
+ static const float BeamSpread = 0.04f;          // how far a beam's shadow rays lean from the shaft's axis, so its shadows soften
+@@ -759,6 +760,10 @@ void LightsRayGen() {
+     float3 sumUnblocked = 0.0f;
+     for (uint i = 0; i < count; i++) {
+         const PointLight light = SceneLights[i];
++        if ((light.groupBits & AirMoverBit) != 0u) {   // no light (patch 0037)
++            continue;
++        }
++
+         if ((light.groupBits & BeamLightBit) != 0u) {   // a shaft of light, not a point (patch 0029)
+             beamLight(light, position, normal, biasBase, launchIndex, i, lightSamples, sum, sumUnblocked);
+             continue;
+@@ -1462,15 +1467,56 @@ static const float LightScatter = 0.002f;      // per world unit at a light's ce
+ // shows as a soft speck one to three pixels across, and only where light actually reaches it: a
+ // window's or a shaft's light, the sun's under a sky, the game's own lights within their reach,
+ // each followed by a shadow ray. In shadow it is not there at all. Only motes in front of the
+-// surface the eye sees and within DustRange; the Dust in the light row says how bright
++// surface the eye sees and within the ambience's distance (patch 0037); the dust rows say how bright
+ // (tuneReflection.w, 0 off). The shadow rays are spent only on a mote the eye's ray actually
+ // passes, which is a few pixels in a hundred.
+ static const float DustCell = 40.0f;          // world units; at most one mote in each
+-static const float DustRange = 1000.0f;       // world units from the eye
+ static const float DustNear = 20.0f;          // no mote closer to the eye than this
+ static const float DustSize = 0.3f;           // a mote's own radius in world units, held between one and three pixels
+ static const float DustDrift = 0.3f;          // how far a mote wanders from its place, as a share of its cell
+ 
++// THE THINGS THAT MOVE THROUGH THE DUST (patch 0037, the user, 2026-10-08: "as Link runs through
++// it ... the dust would be moving along with Link in that direction, like it would be pushed, and
++// then air would kind of flow out behind Link and ... bellow out"; "all things that can receive a
++// shadow or cast a shadow should also interact with the dust"). The program hands over a trail of
++// samples of every actor that moved, in the light list with this group bit (no light, only a
++// position, the motion in world units a second, a reach, and the age in seconds), and every light
++// loop passes them over. A mote near a young sample is carried along with the motion; as the
++// sample ages its wake widens, and the air spills outward from the path and lifts a little, then
++// settles as the sample dies, so a figure running through dust pushes it ahead and leaves it
++// billowing behind. (AirMoverBit itself is declared beside the beams' bit, before the passes
++// that pass over it.)
++static const float MoverLife = 1.0f;          // seconds a trail sample pushes for
++static const float MoverSpreadRate = 1.5f;    // how much wider a wake grows each second, as a share of the reach
++static const float MoverCarry = 0.1f;         // seconds of the motion a mote at the heart of the push is carried
++static const float MoverSpill = 0.05f;        // how far out the air spills behind, per unit a second of the motion
++static const float MoverLift = 0.03f;         // how far up it billows, the same way
++static const float MoverTopSpeed = 400.0f;    // world units a second; anything faster pushes as hard as this
++
++float moverSpread(PointLight light) {
++    return light.attenuationRadius * (1.0f + light.flickerIntensity * MoverSpreadRate);
++}
++
++float3 moverPush(float3 mote, PointLight light) {
++    const float life = saturate(1.0f - light.flickerIntensity / MoverLife);
++    if (life <= 0.0f) {
++        return float3(0.0f, 0.0f, 0.0f);
++    }
++
++    const float spread = moverSpread(light);
++    const float3 r = mote - light.position;
++    const float weight = exp(-dot(r, r) / (spread * spread)) * life * life;
++    const float3 velocity = light.direction;
++    const float rawSpeed = length(velocity);
++    const float speed = min(rawSpeed, MoverTopSpeed);
++    const float3 carried = (rawSpeed > 1.0e-3f) ? (velocity * (speed / rawSpeed)) : float3(0.0f, 0.0f, 0.0f);
++    const float3 side = float3(r.x, 0.0f, r.z);
++    const float sideLength = length(side);
++    const float3 outward = (sideLength > 1.0e-3f) ? (side / sideLength) : float3(0.0f, 0.0f, 0.0f);
++    const float passed = saturate(light.flickerIntensity * 4.0f);   // the spill and the lift come once the mover has gone by
++    return weight * (carried * MoverCarry + outward * (speed * MoverSpill * passed) + float3(0.0f, speed * MoverLift * passed, 0.0f));
++}
++
+ uint4 dustHash(uint4 v) {
+     v = v * 1664525u + 1013904223u;
+     v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+@@ -1486,6 +1532,10 @@ float3 dustLightAt(float3 p, uint2 launchIndex) {
+     const uint count = min(RtParams.lightsCount, RtParams.maxLights);
+     for (uint i = 0; i < count; i++) {
+         const PointLight light = SceneLights[i];
++        if ((light.groupBits & AirMoverBit) != 0u) {   // no light (patch 0037)
++            continue;
++        }
++
+         if ((light.groupBits & WindowLightBit) != 0u) {
+             windowLight(light, p, -light.direction, 0.0f, launchIndex, i, 1u, local, unused);
+             continue;
+@@ -1539,11 +1589,42 @@ float3 windOffset(float seconds) {
+     return float3(RtParams.tuneWind.x, 0.0f, RtParams.tuneWind.y) * travelled;
+ }
+ 
++// THE AMBIENCE'S DISTANCE (patch 0037, the user, 2026-10-08: "a distance setting on how far out
++// the stuff renders and it needs to ... have a gradual fade out rather than a harsh cutoff ...
++// This would control the end of the fade-off distance. It still needs to be gradual regardless, and
++// it probably needs to span quite a ways"). The row sets where the fade ENDS; it begins at a fifth
++// of that, so the dust thins over most of its reach and is gone at the end. The fade is measured
++// from the eye, never from the surface behind a mote (0035 measured it to the surface, so the
++// motes in front of a near wall faded out). A long reach takes longer steps, at most 128 of them
++// to a ray; the far motes it then misses are the ones the fade has all but taken already.
++static const float AmbienceFadeStart = 0.2f;  // the share of the distance where the fade begins
++static const uint DustMaxSteps = 128;
++static const uint DustMaxMovers = 4;          // the movers near one ray that push the motes it passes
++
+ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, bool outdoors) {
+-    const float range = min(end, DustRange);
+-    const float stepLength = DustCell * 0.5f;
+-    const uint steps = min(uint(range / stepLength) + 1u, 64u);
++    const float fadeEnd = RtParams.tuneAmbience.x;
++    const float range = min(end, fadeEnd);
++    const float stepLength = max(DustCell * 0.5f, range / float(DustMaxSteps));
++    const uint steps = min(uint(range / stepLength) + 1u, DustMaxSteps);
+     const float pixelAngle = RtParams.fovRadians / max(RtParams.viewport.w, 1.0f);
++
++    // The movers whose wake reaches this ray at all (patch 0037).
++    uint movers[DustMaxMovers];
++    uint moverCount = 0;
++    const uint lightCount = min(RtParams.lightsCount, RtParams.maxLights);
++    for (uint m = 0; (m < lightCount) && (moverCount < DustMaxMovers); m++) {
++        const PointLight mover = SceneLights[m];
++        if ((mover.groupBits & AirMoverBit) == 0u) {
++            continue;
++        }
++
++        const float reach = moverSpread(mover) * 2.5f;
++        const float closest = clamp(dot(mover.position - origin, direction), 0.0f, range);
++        if (length(mover.position - (origin + direction * closest)) < reach) {
++            movers[moverCount] = m;
++            moverCount++;
++        }
++    }
+     const float seconds = float(FrParams.frameCount) * (1.0f / 60.0f);
+     // Where the field has travelled to, and how fast a mote wanders in it.
+     const float3 carried = outdoors ? windOffset(seconds) : float3(0.0f, 0.0f, 0.0f);
+@@ -1565,7 +1646,19 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+ 
+         const float3 phase = h.xyz * 6.28318531f;
+         const float3 drift = sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
+-        const float3 mote = (float3(cell) + 0.2f + h.xyz * 0.6f) * DustCell + drift + carried;
++        float3 mote = (float3(cell) + 0.2f + h.xyz * 0.6f) * DustCell + drift + carried;
++
++        // Pushed by whatever moves near it, never further than its own cell allows, so it is
++        // still found where the march looks for it.
++        float3 pushed = float3(0.0f, 0.0f, 0.0f);
++        for (uint k = 0; k < moverCount; k++) {
++            pushed += moverPush(mote, SceneLights[movers[k]]);
++        }
++
++        const float pushedLength = length(pushed);
++        const float pushLimit = DustCell * 0.45f;
++        mote += (pushedLength > pushLimit) ? (pushed * (pushLimit / pushedLength)) : pushed;
++
+         const float along = dot(mote - origin, direction);
+         if ((along <= DustNear) || (along >= range)) {
+             continue;
+@@ -1578,7 +1671,7 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+             continue;
+         }
+ 
+-        const float distanceFade = 1.0f - smoothstep(range * 0.6f, range, along);
++        const float distanceFade = 1.0f - smoothstep(fadeEnd * AmbienceFadeStart, fadeEnd, along);
+         const float twinkle = 0.5f + 0.5f * frac(h.w * 7.0f);
+         sum += dustLightAt(mote, launchIndex) * (cover * distanceFade * twinkle);
+     }
+@@ -1613,7 +1706,7 @@ void ScatterRayGen() {
+     const int instance = gInstanceId[launchIndex];
+     if (instance < 0) {
+         gScatter[launchIndex] = (dust && outdoors)
+-            ? float4(dustInLight(origin, direction, DustRange, launchIndex, dustDensity, dustVisibility, true), 1.0f)
++            ? float4(dustInLight(origin, direction, RtParams.tuneAmbience.x, launchIndex, dustDensity, dustVisibility, true), 1.0f)
+             : 0.0f;
+         return;
+     }
+@@ -1653,7 +1746,7 @@ void ScatterRayGen() {
+         if ((lightGlow > 0.0f) && (RtParams.tuneExperiment.x != 4.0f)) {   // the Experiment row: 4 is the glow off
+             for (uint i = 0; i < lights; i++) {
+                 const PointLight light = SceneLights[i];
+-                if ((light.groupBits & (BeamLightBit | WindowLightBit)) != 0u) {   // a beam's glow is the shaft the game draws (patch 0029); a window's is the glass (0030)
++                if ((light.groupBits & (BeamLightBit | WindowLightBit | AirMoverBit)) != 0u) {   // a beam's glow is the shaft the game draws (patch 0029); a window's is the glass (0030); a mover is no light (0037)
+                     continue;
+                 }
+ 
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -107,6 +107,7 @@ namespace interop {
+         float4 tuneExperiment;   // x the Experiment row of the lighting menu (0 off): a numbered variant of a disputed sum, for the person to cycle in play
+         float4 tuneDust;         // patch 0036: x the indoor dust's density (0 off), y its visibility, z the outdoor dust's density (0 off), w its visibility
+         float4 tuneWind;         // patch 0036: x and y the way the outdoor wind blows over the ground (world x and z), z its speed in world units a second, w its gusts (0 none)
++        float4 tuneAmbience;     // patch 0037: x where the ambience's long fade with distance ends, in world units; y to w spare
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

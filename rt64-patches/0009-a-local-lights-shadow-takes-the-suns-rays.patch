@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Fri, 25 Sep 2026 18:00:00 +0100
+Subject: [PATCH] A local light's shadow takes the sun's rays
+
+Patch 0009 of the renderer series (OoT: Recompiled).
+
+The sun's shadow of a figure takes the Shadow rays row's count over its disc, eight by default
+and sixteen on something that moves, each sample with its own blue noise. A local light's shadow
+took ONE ray, and one ray at one point on a six unit disc makes the ground under him either fully
+blocked or fully lit, per pixel, per frame, which is the largest variance a sample can have. One
+noise value was also fetched before the loop over the lights and reused for every one of them, so
+two lights at once sampled the same point on their discs and their grain moved together. And a
+fairy never stops moving, so her shadow's edge sweeps ground that does not, which is the one case
+the history's reject rule refuses to keep, leaving the grain nothing to average it.
+
+It now takes the same count, each sample from its own noise, with the index carrying the light as
+well as the sample. The cost is measured rather than guessed: the budget line puts this pass at
+0.034 ms against the sun's 0.68 and the occlusion's 1.5, so eight rays here are about a quarter
+of a millisecond.
+
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -479,7 +479,24 @@
+     const float3 normal = gShadingNormal[launchIndex].xyz;
+     const float3 origin = rayOrigin(position, normal);
+     const float biasBase = ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition());
+-    const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 17);
++    // A LOCAL LIGHT'S SHADOW GETS THE SAME RAYS AS THE SUN'S (2026-09-25, the user: every
++    // other shadow in the game is clean now and "navis light is still very very grainy ...
++    // her shadow under link").
++    //
++    // It had ONE ray. One ray at one point on a six unit disc makes the ground under him
++    // either fully blocked or fully lit, per pixel, per frame: the largest variance a sample
++    // can have, where the sun's shadow of the same figure takes eight and comes out smooth.
++    // Worse, ONE noise value was fetched before the loop and reused for every light in the
++    // list, so two lights at once sampled the same point on their discs and their grain moved
++    // together. Worst of all she never stops moving, so her shadow's edge sweeps ground that
++    // does not, which is the one case the history's reject rule deliberately refuses to keep,
++    // and the grain is left with nothing to average it.
++    //
++    // So: the Shadow rays row's count here too, each sample its own noise, and the index
++    // carries the light as well as the sample so two lights never share a point. The budget
++    // line puts this pass at 0.034 ms against the sun's 0.68 and the occlusion's 1.5, so
++    // eight rays here are about a quarter of a millisecond.
++    const uint lightSamples = max(uint(RtParams.tuneExperiment.z), 1u);
+     float3 sum = 0.0f;
+     // What the lights WOULD give this surface were nothing in the way, beside what they do give
+     // (2026-09-24, the user: "torches and navi and all light types must be making [shadows]"):
+@@ -506,16 +523,11 @@
+         float3 tangent;
+         float3 bitangent;
+         tangentFrame(direction, tangent, bitangent);
+-        const float angle = 6.28318531f * noise.x;
+-        const float spread = sqrt(noise.y) * light.pointRadius;
+-        const float3 target = light.position + tangent * (spread * cos(angle)) + bitangent * (spread * sin(angle));
+         // THE RAY LEAVES THE SURFACE FURTHER AT A GRAZING ANGLE (2026-09-24). Half a unit was
+         // enough while a wrong answer only cost a little added light; with a light's shadow
+         // darkening the surface, a floor lit from the side by a torch shadowed itself in
+         // stripes. The bias grows as the light nears the surface's plane.
+         const float3 shadowOrigin = position + normal * (biasBase * (1.0f + 2.0f / max(ndl, 0.25f)));
+-        const float3 toTarget = target - shadowOrigin;
+-        const float targetDistance = length(toTarget);
+         // The last stretch before the light is not traced: a flame sits in or on its holder (a
+         // sconce, a torch stand, a lantern), and traced to the point the holder shadowed every
+         // surface from its own light.
+@@ -531,10 +543,24 @@
+         const float clearance = ((light.groupBits & 4u) != 0u)
+             ? light.pointRadius
+             : max(light.pointRadius, LightClearance);
+-        const float tMax = max(targetDistance - clearance, 0.0f);
+-        const float visibility = (tMax > LocalBlockerSkip)
+-            ? traceVisibilityRange(shadowOrigin, toTarget / targetDistance, LocalBlockerSkip, tMax, hitDistance)
+-            : 1.0f;
++        // The disc sampled properly: one point per sample, each from its own blue noise, and
++        // the index carries the light as well as the sample so two lights never take the same
++        // point on their own discs.
++        float blocked = 0.0f;
++        for (uint ls = 0; ls < lightSamples; ls++) {
++            const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 17u + ls * 31u + i * 7u);
++            const float angle = 6.28318531f * noise.x;
++            const float spread = sqrt(noise.y) * light.pointRadius;
++            const float3 target = light.position + tangent * (spread * cos(angle)) + bitangent * (spread * sin(angle));
++            const float3 toTarget = target - shadowOrigin;
++            const float targetDistance = length(toTarget);
++            const float tMax = max(targetDistance - clearance, 0.0f);
++            const float sample = (tMax > LocalBlockerSkip)
++                ? traceVisibilityRange(shadowOrigin, toTarget / targetDistance, LocalBlockerSkip, tMax, hitDistance)
++                : 1.0f;
++            blocked += 1.0f - sample;
++        }
++        const float visibility = 1.0f - (blocked / float(lightSamples));
+         const float core2 = light.attenuationExponent * light.attenuationExponent;
+         const float falloff = lightFalloff(distance2, radius2, core2);
+         sum += light.diffuseColor * (falloff * ndl * visibility);
+-- 
+2.43.0
+

@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 21:39:18 -0400
+Subject: [PATCH] A light stops at the first thing it meets, as a row of candidates
+
+Patch 0049 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, in the Fire Temple, of the carved faces with a flame in each mouth: "the
+fires here ... cause some sort of polygonal cutouts from mainly front angles", and then the rule:
+"it should be just like link where point lights like torches or navi, hit an object but then never
+past it. pretty much all solid geometry like walls statues, enemies, trees etc, if the light hits
+hit the light must not pass through and instead cast shadows".
+
+The last 48 units before every light that was not white went untraced (LightClearance, so a sconce
+would not shadow its own flame). These flames' lights sit five to ten units from the stone of the
+mouth, so inside that ball the statue did not exist for them: their light went through it. 286
+flames are placed by the rooms; none sits inside stone and about eighty sit in a niche like these.
+
+A local light's shadow ray (the surface pass and the dust) now runs to the flame's own size for
+every light and skips a surface it meets from its outside, which faces away from the light
+(RAY_FLAG_CULL_FRONT_FACING_TRIANGLES: the game draws the outside, the cross of a triangle's first
+two edges, which DXR names the front). Anything between the surface and the light is left through a
+side facing the light and stops it; a niche lets its flame out of the opening only; a light inside a
+closed body (a Poe's lantern) is not swallowed by it; a draw shown from both sides blocks from both,
+the flag not applying to it. The glow in the air takes one such ray per light per pixel, from the
+point of the pixel's ray nearest the light.
+
+The user asked for candidates to cycle rather than one answer ("adds some debugging options to cycle
+through so I can test a bunch of different options to see which one fixes it without regressions"),
+so the Debugging menu's Light through stone row chooses, in tuneLightTest.x (a new parameter group):
+0 all of it, 1 the same with the glow in the air unshadowed, 2 the 48 unit clearance as in 0.4.0.
+Beams and windows (0029 to 0045) are untouched.
+
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -530,11 +530,86 @@ float lightFalloff(float distance2, float radius2, float core2) {
+     const float window = saturate(1.0f - ratio * ratio);
+     return inverse * window * window;
+ }
+-static const float LightClearance = 48.0f;   // world units around a light its holder may fill (a sconce's bracket)
++static const float LightClearance = 48.0f;   // world units around a light its holder may fill (a sconce's bracket); since patch 0049 only the Light through stone row's 0.4.0 candidate
+ // A local light's shadow ray starts this far along itself, so a floor cannot shadow itself at a
+ // grazing angle to a torch a few steps away (2026-09-24, the bands across the Deku Tree floor).
+ static const float LocalBlockerSkip = 10.0f;   // world units; Link is about 60
+ 
++// A LIGHT STOPS AT THE FIRST THING IT MEETS (patch 0049, the user, 2026-10-08, of the Fire Temple's
++// carved faces with a flame in each mouth: "the fires here ... cause some sort of polygonal cutouts",
++// and then the cause in their own words, "since its a sphere could it be because its nested in the
++// statues mouth and the spheres being cropped by geomety but the light is still travelling through
++// it and out the other side rather than stopping? ... pretty much all solid geometry like walls
++// statues, enemies, trees etc, if the light hits hit the light must not pass through and instead
++// cast shadows").
++//
++// They were right. The last 48 units before every light that was not white went untraced
++// (LightClearance), so a flame would not be shadowed by its own sconce. These flames (EnLight, its
++// light forty units up the flame) sit five to ten units from the stone of the mouth they burn in,
++// so inside that ball the statue did not exist for their light: it went through the stone and lit
++// what stood behind and beside the statue, while stone further out did stop it, and the line
++// between the two was the polygon. An inventory of every flame the rooms place (286, 2026-10-08)
++// found none inside stone and about eighty in a niche like these, all leaking the same way.
++//
++// What the clearance was for is kept a different way, by which SIDE of a surface the ray meets.
++// The game draws the outside of a thing (its triangles' outward side is the cross of their first
++// two edges, in the order the renderer keeps), and DXR names that side the front. A shadow ray runs
++// from the lit surface toward the light, so:
++//   - a wall, a statue, an enemy or a figure between the two is entered through its near side
++//     (front, skipped) and left through its far side, which faces the light and is met from
++//     behind (kept): it stops the light and casts its shadow;
++//   - a flame in a niche: the niche's walls face the light, and every ray from outside reaches
++//     one from behind, unless it comes through the opening: the light leaves by the mouth alone;
++//   - a light carried INSIDE a closed thing (a Poe's lantern, a glow in a body) meets only that
++//     thing's outer skin, from outside (front, skipped), so its own holder never swallows it;
++//   - a draw the game shows from both sides (leaves, cloth, a fence: culling off) has culling off
++//     in the traced scene too, the ray flag does not apply to it, and it blocks from either side.
++// So the only clearance left is the flame's own size, which every light gets, as Navi already did.
++//
++// AS CANDIDATES ON A ROW (the user, 2026-10-08: "adds some debugging options to cycle through so I
++// can test a bunch of different options to see which one fixes it without regressions"; and "my
++// current 4.0 is really good so i neevr want to accidentally regress"). The Debugging menu's Light
++// through stone row, tuneLightTest.x: 0 all of the above; 1 the same with the glow in the air left
++// unshadowed (glowThroughStone); 2 the 48 unit clearance and the untested sides, as in 0.4.0.
++bool lightsThroughStone() {
++    return RtParams.tuneLightTest.x == 2.0f;
++}
++
++bool glowThroughStone() {
++    return RtParams.tuneLightTest.x != 0.0f;
++}
++
++// How much of the ray's end, at the light, goes untraced.
++float lightClearance(PointLight light) {
++    if (lightsThroughStone() && ((light.groupBits & 4u) == 0u)) {
++        return max(light.pointRadius, LightClearance);
++    }
++
++    return light.pointRadius;
++}
++
++// A local light's shadow ray: traceVisibilityRange, but a surface met from its outside, which faces
++// away from the light, does not stop it.
++float traceLightVisibility(float3 origin, float3 direction, float tMin, float tMax, out float hitDistance) {
++    if (lightsThroughStone()) {
++        return traceVisibilityRange(origin, direction, tMin, tMax, hitDistance);
++    }
++
++    RayDesc ray;
++    ray.Origin = origin;
++    ray.Direction = direction;
++    ray.TMin = tMin;
++    ray.TMax = tMax;
++
++    ShadowPayload payload;
++    payload.visibility = 1.0f;
++    payload.hitDistance = 0.0f;
++    TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_CULL_FRONT_FACING_TRIANGLES,
++             DepthRayQueryMask, 1, 0, 1, ray, payload);
++    hitDistance = payload.hitDistance;
++    return payload.visibility;
++}
++
+ // A BEAM (patch 0029): a shaft of light the game draws, found by its shape on the CPU
+ // (rt64_framebuffer_renderer.cpp, beamFromDraw) and handed over in the light list with this group
+ // bit. It is not a point: it is a cylinder of light falling down its own axis, so it lights what
+@@ -809,10 +884,12 @@ void LightsRayGen() {
+         // through him (the user, 2026-09-24: "she only causes proper shadow when out to the side
+         // but directly on top it disapears"; "the light should never pass through an object to
+         // reach it"). She gets her own point radius instead, and every other light keeps the 48.
++        //
++        // SINCE PATCH 0049 EVERY LIGHT IS TRACED TO ITS FLAME (lightClearance): the 48 units let a
++        // flame in a niche shine through the stone around it, and its holder is now left out by
++        // the side of it the ray meets (traceLightVisibility) instead.
+         float hitDistance;
+-        const float clearance = ((light.groupBits & 4u) != 0u)
+-            ? light.pointRadius
+-            : max(light.pointRadius, LightClearance);
++        const float clearance = lightClearance(light);
+         // The disc sampled properly: one point per sample, each from its own blue noise, and
+         // the index carries the light as well as the sample so two lights never take the same
+         // point on their own discs.
+@@ -826,7 +903,7 @@ void LightsRayGen() {
+             const float targetDistance = length(toTarget);
+             const float tMax = max(targetDistance - clearance, 0.0f);
+             const float sample = (tMax > LocalBlockerSkip)
+-                ? traceVisibilityRange(shadowOrigin, toTarget / targetDistance, LocalBlockerSkip, tMax, hitDistance)
++                ? traceLightVisibility(shadowOrigin, toTarget / targetDistance, LocalBlockerSkip, tMax, hitDistance)
+                 : 1.0f;
+             blocked += 1.0f - sample;
+         }
+@@ -1553,10 +1630,9 @@ float3 dustLightAt(float3 p, uint2 launchIndex) {
+         }
+ 
+         const float distance = sqrt(distance2);
+-        const float clearance = ((light.groupBits & 4u) != 0u) ? light.pointRadius : max(light.pointRadius, LightClearance);
+-        const float tMax = max(distance - clearance, 0.0f);
++        const float tMax = max(distance - lightClearance(light), 0.0f);   // patch 0049
+         float hitDistance;
+-        const float visibility = (tMax > 1.0f) ? traceVisibilityRange(p, toLight / distance, 0.0f, tMax, hitDistance) : 1.0f;
++        const float visibility = (tMax > 1.0f) ? traceLightVisibility(p, toLight / distance, 0.0f, tMax, hitDistance) : 1.0f;
+         const float core2 = light.attenuationExponent * light.attenuationExponent;
+         local += light.diffuseColor * (lightFalloff(distance2, radius2, core2) * visibility);
+     }
+@@ -1817,6 +1893,38 @@ void ScatterRayGen() {
+     const uint lights = min(RtParams.lightsCount, RtParams.maxLights);
+     const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 41);
+     const float step = end / float(ScatterSteps);
++    // THE GLOW STOPS AT STONE TOO (patch 0049, the user's rule above traceLightVisibility). A
++    // light's glow was a ball of lit air with nothing in its way, so a flame in a statue's mouth
++    // hung its glow round the statue's sides and back, where its light cannot reach. One ray per
++    // light per pixel decides it, from the point of this pixel's ray nearest the light (where its
++    // glow is brightest) to the light: a ray for every step would put the shadow's edge in the air
++    // at a different place each frame, and the glow keeps no history to settle it. Lights past
++    // the thirty second are left as they were. The Light through stone row's first candidate only.
++    uint glowBlocked = 0u;
++    if ((lightGlow > 0.0f) && (RtParams.tuneExperiment.x != 4.0f) && !glowThroughStone()) {
++        const float glowScale = max(RtParams.tuneBounce.z, 0.01f);
++        for (uint i = 0; i < min(lights, 32u); i++) {
++            const PointLight light = SceneLights[i];
++            if ((light.groupBits & (BeamLightBit | WindowLightBit | AirMoverBit)) != 0u) {
++                continue;
++            }
++
++            const float tNearest = clamp(dot(light.position - origin, direction), 0.0f, end);
++            const float3 nearest = origin + direction * tNearest;
++            const float3 toLight = light.position - nearest;
++            const float distance = length(toLight);
++            const float tMax = distance - lightClearance(light);
++            if ((distance >= light.attenuationRadius * glowScale) || (tMax <= 1.0f)) {
++                continue;
++            }
++
++            float hitDistance;
++            if (traceLightVisibility(nearest, toLight / distance, 1.0f, tMax, hitDistance) < 0.5f) {
++                glowBlocked |= 1u << i;
++            }
++        }
++    }
++
+     float3 sum = 0.0f;
+     for (uint s = 0; s < ScatterSteps; s++) {
+         const float t = (float(s) + noise.x) * step;
+@@ -1839,6 +1947,10 @@ void ScatterRayGen() {
+                     continue;
+                 }
+ 
++                if ((i < 32u) && (((glowBlocked >> i) & 1u) != 0u)) {   // stone between it and this pixel's air (patch 0049)
++                    continue;
++                }
++
+                 const float3 toLight = light.position - p;
+                 const float distance2 = dot(toLight, toLight);
+                 // THE GLOW'S OWN SIZE (2026-09-24, the user: "control the reach and the actual
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -113,6 +113,7 @@ namespace interop {
+         float4 tuneWindowAim;    // patch 0044, read on the CPU: x degrees steeper, y degrees turned, z the window aimed (0 every one), w 1 to start from the drawn shaft's direction
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+         float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w the dust's clock in displayed seconds (patch 0048)
++        float4 tuneLightTest;    // patch 0049, two Debugging rows of candidates: x the Light through stone row (0 stops at the first surface, glow in the air too; 1 the same, glow unshadowed; 2 the 48 unit clearance, as 0.4.0)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -126,7 +126,11 @@ namespace RT64 {
+         float windowMoveX = 0.0f;
+         float windowMoveY = 0.0f;
+         float windowMoveZ = 0.0f;
+-        int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
++        // The Light through stone row from the Debugging menu (patch 0049): 0 a local light stops
++        // at the first surface it meets and so does its glow in the air, 1 the same but the glow
++        // unshadowed, 2 the 48 unit clearance as it was in 0.4.0.
++        int lightStone = 0;
++        int shadowRays = 4;                 // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+         float motionBlurStrength = 0.0f;
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -853,6 +853,8 @@ namespace RT64 {
+                                                 float(std::clamp(rtConfig.windowAim, 0, 16)), (rtConfig.windowAimFromShaft != 0) ? 1.0f : 0.0f);
+         rtParams.tuneWindowMove = hlslpp::float4(std::clamp(rtConfig.windowMoveX, -1000.0f, 1000.0f), std::clamp(rtConfig.windowMoveY, -1000.0f, 1000.0f),
+                                                  std::clamp(rtConfig.windowMoveZ, -1000.0f, 1000.0f), 0.0f);
++        // The candidates the Debugging menu cycles (patch 0049).
++        rtParams.tuneLightTest = hlslpp::float4(float(std::clamp(rtConfig.lightStone, 0, 2)), 0.0f, 0.0f, 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every

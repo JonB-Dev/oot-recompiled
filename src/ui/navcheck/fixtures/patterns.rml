@@ -1,0 +1,92 @@
+<rml>
+<head>
+    <title>navcheck patterns</title>
+    <!-- The navigation check's own document (ui_navcheck, phase 94): every layout the menus are
+         built from, in one place, so the gate has something to bite on before the first surface
+         moves onto the engine. A test document, never shipped, so its values are written here
+         rather than drawn from tokens.rcss. -->
+    <style>
+        body {
+            display: block;
+            padding: 24dp;
+            font-family: Bricolage Grotesque;
+            font-size: 16dp;
+            color: #e8f0ee;
+            background-color: #10171a;
+        }
+        button, .row {
+            display: block;
+            background-color: #172126;
+            border-width: 1dp;
+            border-color: #2b3a40;
+        }
+        .is-f {
+            background-color: #c6ff3d;
+            color: #0c1215;
+        }
+
+        /* A strip of sections that wraps, as the medallion dial. */
+        #strip { display: flex; flex-direction: row; }
+        #strip button { width: 96dp; height: 96dp; margin-right: 16dp; }
+
+        /* A scrolling list of rows, longer than its view, with value rows and a disabled row,
+           beside a two by two grid of buttons: its hidden rows lie under the action bar. */
+        #main { display: flex; flex-direction: row; margin-top: 24dp; }
+        #rows { display: block; width: 480dp; height: 280dp; overflow-y: auto; }
+        #rows .row { height: 48dp; margin-bottom: 8dp; }
+        #grid { display: flex; flex-direction: row; flex-wrap: wrap; width: 352dp; margin-left: 32dp; }
+        #grid button { width: 160dp; height: 64dp; margin: 8dp; }
+        scrollbarvertical { width: 8dp; }
+        scrollbarvertical sliderbar { background-color: #2b3a40; }
+
+        /* An action bar under it all. */
+        #foot { display: flex; flex-direction: row; margin-top: 24dp; }
+        #foot button { width: 160dp; height: 56dp; margin-right: 16dp; }
+
+        /* A dialog: hidden until opened, traps the focus while open. */
+        #dialog { display: none; position: absolute; left: 480dp; top: 200dp; width: 360dp; padding: 24dp; background-color: #0c1215; }
+        #dialog.is-open { display: block; }
+        #dialog button { height: 48dp; margin-top: 12dp; }
+    </style>
+</head>
+<body>
+    <div id="strip" data-nav="group" data-nav-wrap="">
+        <button id="sec-play">Play</button>
+        <button id="sec-settings">Settings</button>
+        <button id="sec-lighting">Lighting</button>
+        <button id="sec-controls">Controls</button>
+        <button id="sec-about">About</button>
+    </div>
+    <div id="main">
+        <div id="rows" data-nav="group">
+            <div class="row" id="row-1" data-act="open">Window</div>
+            <div class="row" id="row-2" data-act="open">Resolution</div>
+            <div class="row" id="row-3" data-value="choice">Frame rate</div>
+            <div class="row" id="row-4" data-act="open">Aspect</div>
+            <div class="row" id="row-5" data-act="open" data-disabled="">Unavailable</div>
+            <div class="row" id="row-6" data-act="open">Interface size</div>
+            <div class="row" id="row-7" data-value="toggle">Motion</div>
+            <div class="row" id="row-8" data-act="open">Sounds</div>
+            <div class="row" id="row-9" data-act="open">Volume</div>
+            <div class="row" id="row-10" data-act="open">Language</div>
+            <div class="row" id="row-11" data-act="open">Prompts</div>
+            <div class="row" id="row-12" data-act="open">Defaults</div>
+        </div>
+        <div id="grid" data-nav="group">
+            <button id="grid-1">Save</button>
+            <button id="grid-2">Load</button>
+            <button id="grid-3">Rename</button>
+            <button id="grid-4">Delete</button>
+        </div>
+    </div>
+    <div id="foot">
+        <button id="play">Play</button>
+        <button id="quit">Quit</button>
+    </div>
+    <div id="dialog" data-nav="layer" data-back="close">
+        <div>Delete this moment?</div>
+        <button id="yes">Delete</button>
+        <button id="no">Keep</button>
+    </div>
+</body>
+</rml>
