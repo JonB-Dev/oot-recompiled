@@ -1,4 +1,5 @@
 #include "main/sweep.h"
+#include "main/local_time.h"
 
 #include <cstdio>
 #include <ctime>
@@ -101,7 +102,7 @@ namespace oot::sweep {
 
         const std::time_t t = std::time(nullptr);
         std::tm now{};
-        localtime_s(&now, &t);
+        oot::local_time(t, now);
         char day[16];
         char time_of_day[16];
         std::strftime(day, sizeof(day), "%Y-%m-%d", &now);

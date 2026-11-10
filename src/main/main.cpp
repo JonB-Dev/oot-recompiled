@@ -15,9 +15,13 @@
 #include <memory>
 #include <string>
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <io.h>
+#else
+#include <SDL_metal.h>
+#endif
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -109,6 +113,11 @@ namespace {
 } // namespace
 
 int main(int argc, char** argv) {
+#if defined(OOT_MACOS_TRACING_APP)
+    // Advertise hardware support in the tracing bundle, including Finder launches.
+    // The saved Lighting switch still controls use; an explicit environment override wins.
+    setenv("OOT_METAL_RAYTRACING", "1", 0);
+#endif
 
     // FIRST OF ALL, because every path below depends on the answer: which shape is this program
     // running in. A `.installed` marker beside the executable means the setup file put us in the
@@ -116,6 +125,19 @@ int main(int argc, char** argv) {
     // No marker means portable: everything together in this folder, nothing written anywhere
     // else, which is the build tree, the harness and the portable download. See src/main/places.h.
     oot::places::init();
+
+#if defined(__APPLE__)
+    // An explicit isolated profile for local gameplay probes. Resolve it before
+    // boot loads settings or opens SRAM, so the person's normal save is untouched.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--data-root") == 0) {
+            if (i + 1 >= argc || !oot::places::adopt_install_root(argv[++i])) {
+                std::fprintf(stderr, "--data-root needs an absolute writable directory.\n");
+                return 1;
+            }
+        }
+    }
+#endif
 
     // THEN, before the crash handler and before anything that can fail: where everything
     // printed goes. Under the Windows subsystem there is no console. When nothing handed us
@@ -134,6 +156,7 @@ int main(int argc, char** argv) {
     // So: stderr reopens the log (or the null device when the folder refuses a file), stdout
     // reopens the null device, and its descriptor is then made a duplicate of stderr's, which
     // shares the file position, so the two streams' lines land in the order they were printed.
+    #if defined(_WIN32)
     {
         const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -154,6 +177,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    #endif
 
     // Unbuffered, deliberately. Everything printed before the window comes up is boot diagnostics,
     // and the case that matters is the one where the program dies before it would have flushed: a
@@ -169,7 +193,12 @@ int main(int argc, char** argv) {
         char stamp[32] = "?";
         const std::time_t now = std::time(nullptr);
         std::tm local{};
-        if (localtime_s(&local, &now) == 0) {
+        #if defined(_WIN32)
+        const bool have_time = localtime_s(&local, &now) == 0;
+        #else
+        const bool have_time = localtime_r(&now, &local) != nullptr;
+        #endif
+        if (have_time) {
             std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &local);
         }
         std::printf("OoT: Recompiled %s, started %s\n", oot::build_info::version, stamp);
@@ -180,6 +209,7 @@ int main(int argc, char** argv) {
                 oot::places::program().string().c_str(),
                 oot::places::data().string().c_str());
 
+    #if defined(_WIN32)
     oot::crash::install();
 
     // Keep the Start menu entry and Windows' installed apps entry current. The setup file wrote
@@ -208,6 +238,7 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+    #endif
 
     // --moment-dump <file>: print a saved moment's header and leave (phase 75). No window, no game.
     for (int i = 1; i + 1 < argc; i++) {
@@ -230,15 +261,22 @@ int main(int argc, char** argv) {
     // names a newer version and is still signed by us, it runs now and this copy leaves before
     // any window opens. That is the "installs at next start" the update plate promised (the
     // user's ask of 2026-09-23). Portable copies never take this path.
+    #if defined(_WIN32)
     if (oot::updates::install_pending()) {
         return 0;
     }
+    #endif
+
+    uint32_t window_flags = SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
+    #if defined(__APPLE__)
+    window_flags |= SDL_WINDOW_METAL | SDL_WINDOW_ALLOW_HIGHDPI;
+    #endif
 
     SDL_Window* window = SDL_CreateWindow(
         "OoT: Recompiled",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         DEFAULT_WIDTH, DEFAULT_HEIGHT,
-        SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE);
+        window_flags);
 
     if (window == nullptr) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -257,9 +295,22 @@ int main(int argc, char** argv) {
     }
 
     ultramodern::renderer::WindowHandle window_handle{};
+    #if defined(_WIN32)
     window_handle.window = wmInfo.info.win.window;
     window_handle.thread_id = GetCurrentThreadId();
+    #elif defined(__APPLE__)
+    SDL_MetalView metal_view = SDL_Metal_CreateView(window);
+    if (metal_view == nullptr) {
+        std::fprintf(stderr, "SDL_Metal_CreateView failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    window_handle.window = wmInfo.info.cocoa.window;
+    window_handle.view = SDL_Metal_GetLayer(metal_view);
+    #endif
 
+    #if defined(_WIN32)
     // The window's icon: the mark, from the executable's own resource (src/main/app.rc), at the
     // two sizes the title bar and the taskbar use. SDL registers its window class with the
     // stock application icon, so the mark has to be set on the window itself.
@@ -279,6 +330,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "The window icon could not be loaded from the executable.\n");
         }
     }
+    #endif
 
     // rdram is the emulated memory the game will live in. Recompiled code addresses THROUGH it
     // rather than using host pointers, which is what keeps a bug in thirty year old game code from
@@ -420,9 +472,11 @@ int main(int argc, char** argv) {
     // the window goes. Without this, quitting mid-recording would leave the last few hundred
     // frames in a queue nobody ever drains, and the encoder threads would be torn down under the
     // process rather than stopped.
+    #if defined(_WIN32)
     oot::recorder::shutdown();
     // A video still recording is finished the same way: its file is closed and playable.
     oot::video::shutdown();
+    #endif
     SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;

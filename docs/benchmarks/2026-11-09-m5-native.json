@@ -1,0 +1,183 @@
+{
+  "code_commit": "0c48b7f41852c37b5ccd407be58669eccbff083d",
+  "runtime_sha256": "3d7340ccaa4d03e4687d71c0767b7c6cb152485486ccfe9d9fe45525ad75cf26",
+  "display": {
+    "model": "M27Q",
+    "width": 2560,
+    "height": 1440,
+    "refresh_hz": 60
+  },
+  "hardware": {
+    "gpu": "Apple M5",
+    "gpu_cores": 10,
+    "unified_memory_gib": 32,
+    "macos": "26.7.1",
+    "power": "AC",
+    "low_power_mode": false
+  },
+  "profile_save_sha256": "dd90171e874454f6b9570f1f08044c82405e577d34dce435778ab2cf82404972",
+  "pack": "OoT Reloaded v11.0.0 RT64",
+  "texture_detail": "Full",
+  "rt_level": 2,
+  "framerate_target": 20,
+  "python_tests": 57,
+  "native_tests": 32,
+  "baseline_runtime_sha256": "ee634fca6509573beddc8f2c6d9e4b9c480a8fd3264aec6170f5e969661ba668",
+  "runs": [
+    {
+      "name": "before",
+      "scene": "Hyrule Field",
+      "aa": 2,
+      "ao_rays": 2,
+      "duration_seconds": 120,
+      "code_commit": "16d8aeb2588c892fd56089530453a1c9ff683dd1",
+      "comparison": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 20.0,
+        "minimum_presents_per_second": 20.0,
+        "maximum_presents_per_second": 20.0,
+        "mean_present_ms": 50.00720833333334,
+        "worst_present_ms": 56.873
+      },
+      "warm_window": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 20.0,
+        "minimum_presents_per_second": 20.0,
+        "maximum_presents_per_second": 20.0,
+        "mean_present_ms": 50.00720833333334,
+        "worst_present_ms": 56.873
+      },
+      "peak_rss_mib": 1112.8,
+      "probe_sha256": "0ddd2209075ea7bba30eeff30943cf70b9e56c37b4ffec5cde1db12cd84a5648",
+      "guard": "passed"
+    },
+    {
+      "name": "upper-final",
+      "scene": "Kakariko",
+      "aa": 8,
+      "ao_rays": 8,
+      "duration_seconds": 120,
+      "code_commit": "0c48b7f41852c37b5ccd407be58669eccbff083d",
+      "comparison": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 16.666666666666668,
+        "minimum_presents_per_second": 16.0,
+        "maximum_presents_per_second": 17.0,
+        "mean_present_ms": 60.01266666666666,
+        "worst_present_ms": 62.135
+      },
+      "warm_window": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 16.666666666666668,
+        "minimum_presents_per_second": 16.0,
+        "maximum_presents_per_second": 17.0,
+        "mean_present_ms": 60.01266666666666,
+        "worst_present_ms": 62.135
+      },
+      "peak_rss_mib": 1049.6,
+      "probe_sha256": "cd1baec3fc6c2ad661542f19af7e593289ba7f82ed7f680539533a0ad2ad296e",
+      "guard": "passed"
+    },
+    {
+      "name": "detail-field",
+      "scene": "Hyrule Field",
+      "aa": 4,
+      "ao_rays": 4,
+      "duration_seconds": 120,
+      "code_commit": "0c48b7f41852c37b5ccd407be58669eccbff083d",
+      "comparison": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 19.958333333333332,
+        "minimum_presents_per_second": 19.0,
+        "maximum_presents_per_second": 21.0,
+        "mean_present_ms": 50.02579166666666,
+        "worst_present_ms": 56.845
+      },
+      "warm_window": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 19.958333333333332,
+        "minimum_presents_per_second": 19.0,
+        "maximum_presents_per_second": 21.0,
+        "mean_present_ms": 50.02579166666666,
+        "worst_present_ms": 56.845
+      },
+      "peak_rss_mib": 1107.0,
+      "probe_sha256": "2714db36281d8f63ce6f5755fdbd56beb45101870cdd033d4387414d9de6ab48",
+      "guard": "passed"
+    },
+    {
+      "name": "detail-kakariko",
+      "scene": "Kakariko",
+      "aa": 4,
+      "ao_rays": 4,
+      "duration_seconds": 300,
+      "code_commit": "0c48b7f41852c37b5ccd407be58669eccbff083d",
+      "comparison": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 20.0,
+        "minimum_presents_per_second": 20.0,
+        "maximum_presents_per_second": 20.0,
+        "mean_present_ms": 49.989916666666666,
+        "worst_present_ms": 55.837
+      },
+      "warm_window": {
+        "first_sample": 69,
+        "last_sample": 298,
+        "samples": 230,
+        "mean_presents_per_second": 20.0,
+        "minimum_presents_per_second": 19.0,
+        "maximum_presents_per_second": 21.0,
+        "mean_present_ms": 49.9979,
+        "worst_present_ms": 59.106
+      },
+      "peak_rss_mib": 1053.3,
+      "probe_sha256": "b05c7984668ae6f46ebab48d7e4c25c9ada698fa9fc01299e12bc05cc2a544a0",
+      "guard": "passed"
+    },
+    {
+      "name": "detail-8aa",
+      "scene": "Kakariko",
+      "aa": 8,
+      "ao_rays": 4,
+      "duration_seconds": 180,
+      "code_commit": "0c48b7f41852c37b5ccd407be58669eccbff083d",
+      "comparison": {
+        "first_sample": 69,
+        "last_sample": 92,
+        "samples": 24,
+        "mean_presents_per_second": 20.0,
+        "minimum_presents_per_second": 20.0,
+        "maximum_presents_per_second": 20.0,
+        "mean_present_ms": 50.005125,
+        "worst_present_ms": 54.774
+      },
+      "warm_window": {
+        "first_sample": 69,
+        "last_sample": 178,
+        "samples": 110,
+        "mean_presents_per_second": 20.0,
+        "minimum_presents_per_second": 20.0,
+        "maximum_presents_per_second": 20.0,
+        "mean_present_ms": 50.0015,
+        "worst_present_ms": 54.845
+      },
+      "peak_rss_mib": 1049.6,
+      "probe_sha256": "78603e46915ca2d5ecfe0c7f0f1e1bb1cd7f7cb83fa725422f0e38615f015632",
+      "guard": "passed"
+    }
+  ]
+}

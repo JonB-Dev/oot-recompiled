@@ -64,7 +64,11 @@ namespace {
         { "lightbrightness", "Light brightness",  { "Normal", "Bright", "Brighter", "Harsh" }, 4 },
         { "occlusion",       "Ambient occlusion", { "Off", "Light", "Original", "Strong", "Full" }, 5 },
         { "occlusionradius", "Occlusion radius",  { "20 units", "40 units", "80 units", "160 units" }, 4 },
+#if defined(__APPLE__)
+        { "occlusionquality", "Occlusion rays",   { "4", "8", "16", "2" }, 4 },
+#else
         { "occlusionquality", "Occlusion rays",   { "4", "8", "16" }, 3 },
+#endif
         { "lights",          "Local lights",      { "Off", "On" }, 2 },
         // Twelve steps each, fine at the bottom and reaching well past the game's own light at
         // the top. THE NUMBERS MEAN THE GAME'S OWN LIGHT NOW: 100% is the radius and the power
@@ -288,7 +292,12 @@ namespace {
     constexpr float GLOW_SIZE[] = { 0.25f, 0.5f, 1.0f, 2.0f };   // the glow's radius over the game's own light radius
     constexpr float OCCLUSION[] = { 0.0f, 0.35f, 0.7f, 0.85f, 1.0f };
     constexpr float OCCLUSION_RADIUS[] = { 20.0f, 40.0f, 80.0f, 160.0f };
+#if defined(__APPLE__)
+    // Append the lower-cost option so existing saved quality indices keep their meaning.
+    constexpr int OCCLUSION_RAYS[] = { 4, 8, 16, 2 };
+#else
     constexpr int OCCLUSION_RAYS[] = { 4, 8, 16 };
+#endif
     // The row's label IS the number here: 1.0 is the game's own radius and the game's own power,
     // and the last three steps are half as much again, twice, three times (2026-09-24, the caps
     // raised so a torch can light its room and cast a shadow across it).

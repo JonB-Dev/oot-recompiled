@@ -26,10 +26,17 @@
 
 #include <RmlUi/Core.h>
 
+#if defined(__APPLE__)
+#include "ui_vs.hlsl.metal.h"
+#include "ui_ps.hlsl.metal.h"
+#include "ui_mark_ps.hlsl.metal.h"
+#include "ui_gradient_ps.hlsl.metal.h"
+#else
 #include "ui_vs.hlsl.dxil.h"
 #include "ui_ps.hlsl.dxil.h"
 #include "ui_mark_ps.hlsl.dxil.h"
 #include "ui_gradient_ps.hlsl.dxil.h"
+#endif
 #include "ui/ui_gradient.h"
 
 #include <chrono>
@@ -1348,21 +1355,31 @@ namespace {
         }
 
         const RenderShaderFormat format = rhi->getCapabilities().shaderFormat;
+#if defined(__APPLE__)
+        if (format != RenderShaderFormat::METAL) {
+            say("Metal interface shaders require a Metal device");
+            return;
+        }
+        auto vs = g_device->createShader(ui_vs_metal, ui_vs_metal_size, "VSMain", format);
+        auto ps = g_device->createShader(ui_ps_metal, ui_ps_metal_size, "PSMain", format);
+        auto mark_ps = g_device->createShader(ui_mark_ps_metal, ui_mark_ps_metal_size, "PSMark", format);
+        auto gradient_ps = g_device->createShader(ui_gradient_ps_metal, ui_gradient_ps_metal_size, "PSGradient", format);
+#else
         if (format != RenderShaderFormat::DXIL) {
             say("this build only carries DXIL shaders, so the interface will stay dark");
             return;
         }
-
         auto vs = g_device->createShader(ui_vs_dxil, ui_vs_dxil_size, "VSMain", format);
         auto ps = g_device->createShader(ui_ps_dxil, ui_ps_dxil_size, "PSMain", format);
+        auto mark_ps = g_device->createShader(ui_mark_ps_dxil, ui_mark_ps_dxil_size, "PSMark", format);
+        auto gradient_ps = g_device->createShader(ui_gradient_ps_dxil, ui_gradient_ps_dxil_size, "PSGradient", format);
+#endif
         if (vs == nullptr || ps == nullptr) {
             say("the interface shaders would not load");
             return;
         }
         // The mark's pixel shader. Its absence costs the mark, not the interface.
-        auto mark_ps = g_device->createShader(ui_mark_ps_dxil, ui_mark_ps_dxil_size, "PSMark", format);
         // The gradients' pixel shader. Its absence costs the gradient decorators, not the interface.
-        auto gradient_ps = g_device->createShader(ui_gradient_ps_dxil, ui_gradient_ps_dxil_size, "PSGradient", format);
         if (mark_ps == nullptr) {
             say("the mark's shader would not load, so the mark will not be drawn");
         }
@@ -1378,7 +1395,13 @@ namespace {
         // their bindings are. Confusing the two is how a sampler ends up bound to nothing.
         g_set_builder.begin();
         g_set_builder.addTexture(0);
+#if defined(__APPLE__)
+        // Metal shares the argument ID namespace across textures and samplers.
+        // Match DXC's -fvk-s-shift 1 0 in the macOS shader build.
+        g_set_builder.addSampler(1);
+#else
         g_set_builder.addSampler(0);
+#endif
         g_set_builder.end();
 
         // The transform for the vertex stage and the mark's time for the pixel stage, one range.

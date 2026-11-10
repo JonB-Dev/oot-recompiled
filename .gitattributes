@@ -10,3 +10,6 @@ assets/ui/medallion.rcss -text
 assets/ui/textures/** -text
 assets/ui/brand/** -text
 assets/ui/prompts/** -text
+
+# Patch context markers on blank lines must be retained.
+rt64-patches/macos/*.patch whitespace=-blank-at-eol

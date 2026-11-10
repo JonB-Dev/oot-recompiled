@@ -80,6 +80,9 @@ namespace oot::game_state {
     // A warp the harness has asked for, or a negative number when there is none. Taking it
     // CLEARS it, so a single request warps once rather than every frame forever.
     void set_pending_warp(int32_t entrance);
+    // A command-line warp waits through title, file select, and the opening sequence.
+    // Unlike an interactive request, it is not abandoned after three seconds.
+    void set_startup_warp(int32_t entrance);
 
     // HOW MANY TIMES THE GAME HAS UPDATED. Incremented once per Play_Main, which IS the
     // game's update, so the difference between two drawn frames is the number of updates that

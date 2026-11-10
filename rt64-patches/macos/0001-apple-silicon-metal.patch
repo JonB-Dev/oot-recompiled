@@ -1,0 +1,2130 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 49788c3..d234703 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -5,7 +5,7 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+ 
+ if (APPLE)
+     enable_language(OBJC OBJCXX)
+-    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15")
++    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0")
+ endif()
+ 
+ option(RT64_STATIC "Build RT64 as a static library" OFF)
+@@ -78,7 +78,7 @@ add_subdirectory(src/contrib/zstd/build/cmake)
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+     set(PLUME_SDL_VULKAN_ENABLED TRUE)
+ elseif (APPLE)
+-    set(PLUME_APPLE_RETINA_ENABLED OFF)
++    set(PLUME_APPLE_RETINA_ENABLED ON)
+ endif()
+ 
+ add_subdirectory(src/contrib/plume)
+@@ -449,6 +449,9 @@ set_target_properties(rt64 PROPERTIES PREFIX "")
+ if (${RT64_RAYTRACING})
+     target_compile_definitions(rt64 PUBLIC RT_ENABLED=1)
+ endif()
++if (APPLE AND NOT RT64_RAYTRACING)
++    target_compile_definitions(rt64 PRIVATE OOT_MACOS_RASTER_ONLY=1)
++endif()
+ 
+ # Add common libraries.
+ target_link_libraries(rt64 re-spirv)
+@@ -510,8 +513,8 @@ if (${WIN32})
+ endif()
+ 
+ # The ray tracing library (patch 0003): every ray generation, miss and hit shader in one DXIL
+-# library, only when the path is built. This renderer is D3D12 only, so no SPIR-V is compiled.
+-if (${RT64_RAYTRACING} AND ${WIN32})
++# library, only when the path is built. On macOS DXIL is the source for Metal Shader Converter.
++if (RT64_RAYTRACING AND (WIN32 OR APPLE))
+     build_shader_dxil(rt64 "src/shaders/Raytracing.hlsl" "${DXC_LB_OPTS}")
+ endif()
+ 
+@@ -557,7 +560,9 @@ build_compute_shader(rt64 "src/shaders/RtDepthResolveCS.hlsl" "src/shaders/RtDep
+ build_compute_shader(rt64 "src/shaders/RtFilterCS.hlsl" "src/shaders/RtFilterCS1.hlsl" "-D STEP=1")
+ build_compute_shader(rt64 "src/shaders/RtFilterCS.hlsl" "src/shaders/RtFilterCS2.hlsl" "-D STEP=2")
+ # The direct light's history with temporal clamping (patch 0008).
++if (NOT APPLE OR RT64_RAYTRACING)
+ build_compute_shader(rt64 "src/shaders/RtTemporalCS.hlsl")
++endif()
+ build_pixel_shader(  rt64 "src/shaders/RtCopyColorToDepthPS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/RtCopyColorToDepthPS.hlsl" "src/shaders/RtCopyColorToDepth2XPS.hlsl" "-D SAMPLES_2X")
+ build_pixel_shader(  rt64 "src/shaders/RtCopyColorToDepthPS.hlsl" "src/shaders/RtCopyColorToDepth4XPS.hlsl" "-D SAMPLES_4X")
+diff --git a/src/contrib/hlslpp/include/hlsl++/platforms/scalar.h b/src/contrib/hlslpp/include/hlsl++/platforms/scalar.h
+index f2db5ee..4973705 100644
+--- a/src/contrib/hlslpp/include/hlsl++/platforms/scalar.h
++++ b/src/contrib/hlslpp/include/hlsl++/platforms/scalar.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <math.h>
++#include <stdlib.h>
+ #include <stdint.h>
+ 
+ namespace hlslpp
+diff --git a/src/contrib/plume/plume_metal.cpp b/src/contrib/plume/plume_metal.cpp
+index 373c87e..8d22b62 100644
+--- a/src/contrib/plume/plume_metal.cpp
++++ b/src/contrib/plume/plume_metal.cpp
+@@ -15,6 +15,8 @@
+ #include <CoreFoundation/CoreFoundation.h>
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <mutex>
+ 
+ #include "plume_metal.h"
+@@ -25,6 +27,30 @@ extern "C" {
+ }
+ 
+ namespace plume {
++    // Resources encoded into a command buffer must survive until GPU completion.
++    // Keep Metal's strong references and include encoder status in driver errors.
++    static MTL::CommandBuffer *makeRetainedCommandBuffer(MTL::CommandQueue *queue, const char *label) {
++        auto *descriptor = MTL::CommandBufferDescriptor::alloc()->init();
++        descriptor->setRetainedReferences(true);
++        descriptor->setErrorOptions(MTL::CommandBufferErrorOptionEncoderExecutionStatus);
++        auto *buffer = queue->commandBuffer(descriptor);
++        descriptor->release();
++        buffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
++        buffer->addCompletedHandler([](MTL::CommandBuffer *completed) {
++            if (completed->status() != MTL::CommandBufferStatusError) return;
++            auto releasePool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++            const auto *error = completed->error();
++            const auto *details = error && error->userInfo() ? error->userInfo()->description() : nullptr;
++            std::fprintf(stderr, "[metal] command failed: label=%s code=%ld description=%s details=%s\n",
++                completed->label() ? completed->label()->utf8String() : "unlabeled",
++                error ? static_cast<long>(error->code()) : -1L,
++                error ? error->localizedDescription()->utf8String() : "unavailable",
++                details ? details->utf8String() : "unavailable");
++            std::fflush(stderr);
++        });
++        return buffer;
++    }
++
+     // MARK: - Constants
+ 
+     static constexpr size_t MAX_DRAWABLES = 3;
+@@ -154,7 +180,7 @@ namespace plume {
+                 return MTL::DataTypeTexture;
+ 
+             case RenderDescriptorRangeType::ACCELERATION_STRUCTURE:
+-                return MTL::DataTypePrimitiveAccelerationStructure;
++                return MTL::DataTypeInstanceAccelerationStructure;
+ 
+             case RenderDescriptorRangeType::STRUCTURED_BUFFER:
+             case RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER:
+@@ -1140,7 +1166,10 @@ namespace plume {
+         this->desc = desc;
+         this->device = device;
+ 
+-        this->mtl = device->mtl->newBuffer(desc.size, mapResourceOption(desc.heapType));
++        // Metal acceleration structures have their own allocation. This buffer only gives
++        // RT64 a stable RenderBufferReference and must not duplicate the full AS storage.
++        const uint64_t allocationSize = (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE) ? 16 : desc.size;
++        this->mtl = device->mtl->newBuffer(allocationSize, mapResourceOption(desc.heapType));
+ 
+         addressable = desc.flags & RenderBufferFlag::DEVICE_ADDRESSABLE;
+         device->addResource(mtl, addressable);
+@@ -1148,6 +1177,10 @@ namespace plume {
+ 
+     MetalBuffer::~MetalBuffer() {
+         MetalAutoreleasePool releasePool;
++        if (accelerationStructure != nullptr) {
++            device->removeResource(accelerationStructure);
++            accelerationStructure->release();
++        }
+         device->removeResource(mtl, addressable);
+         mtl->release();
+     }
+@@ -1300,13 +1333,72 @@ namespace plume {
+     MetalAccelerationStructure::MetalAccelerationStructure(MetalDevice *device, const RenderAccelerationStructureDesc &desc) {
+         assert(device != nullptr);
+         assert(desc.buffer.ref != nullptr);
++        assert(desc.buffer.offset == 0);
+ 
+         this->device = device;
+         this->type = desc.type;
++        this->buffer = static_cast<const MetalBuffer *>(desc.buffer.ref);
++        this->size = desc.size;
++        MetalBuffer *mutableBuffer = const_cast<MetalBuffer *>(buffer);
++        assert(mutableBuffer->accelerationStructure == nullptr);
++        mutableBuffer->accelerationStructure = device->mtl->newAccelerationStructure(desc.size);
++        assert(mutableBuffer->accelerationStructure != nullptr);
++        device->addResource(mutableBuffer->accelerationStructure);
+     }
+ 
+     MetalAccelerationStructure::~MetalAccelerationStructure() { }
+ 
++    // Rebuild the native descriptor from the API-independent mesh records retained in
++    // RenderBottomLevelASBuildInfo. RT64 updates world-space vertices every frame.
++    static MTL::PrimitiveAccelerationStructureDescriptor *metalBottomLevelDescriptor(
++        const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild) {
++        std::vector<const NS::Object *> geometryObjects;
++        geometryObjects.reserve(meshCount);
++        for (uint32_t i = 0; i < meshCount; i++) {
++            const RenderBottomLevelASMesh &mesh = meshes[i];
++            assert(mesh.vertexFormat == RenderFormat::R32G32B32_FLOAT);
++            assert(mesh.indexCount % 3 == 0);
++            const MetalBuffer *vertices = static_cast<const MetalBuffer *>(mesh.vertexBuffer.ref);
++            const MetalBuffer *indices = static_cast<const MetalBuffer *>(mesh.indexBuffer.ref);
++            assert(vertices != nullptr && indices != nullptr);
++            auto *geometry = MTL::AccelerationStructureTriangleGeometryDescriptor::descriptor();
++            geometry->setVertexBuffer(vertices->mtl);
++            geometry->setVertexBufferOffset(mesh.vertexBuffer.offset);
++            geometry->setVertexFormat(MTL::AttributeFormatFloat3);
++            geometry->setVertexStride(mesh.vertexStride);
++            geometry->setIndexBuffer(indices->mtl);
++            geometry->setIndexBufferOffset(mesh.indexBuffer.offset);
++            geometry->setIndexType(mapIndexFormat(mesh.indexFormat));
++            geometry->setTriangleCount(mesh.indexCount / 3);
++            geometry->setOpaque(mesh.isOpaque);
++            geometryObjects.push_back(geometry);
++        }
++        auto *descriptor = MTL::PrimitiveAccelerationStructureDescriptor::descriptor();
++        descriptor->setGeometryDescriptors(NS::Array::array(geometryObjects.data(), geometryObjects.size()));
++        descriptor->setUsage(preferFastBuild ? MTL::AccelerationStructureUsagePreferFastBuild
++                                             : MTL::AccelerationStructureUsageNone);
++        return descriptor;
++    }
++
++    static MTL::InstanceAccelerationStructureDescriptor *metalTopLevelDescriptor(
++        const RenderTopLevelASInstance *instances, uint32_t instanceCount,
++        const MTL::Buffer *instanceBuffer) {
++        std::vector<const NS::Object *> structures;
++        structures.reserve(instanceCount);
++        for (uint32_t i = 0; i < instanceCount; i++) {
++            const auto *backing = static_cast<const MetalBuffer *>(instances[i].bottomLevelAS.ref);
++            assert(backing != nullptr && backing->accelerationStructure != nullptr);
++            structures.push_back(backing->accelerationStructure);
++        }
++        auto *descriptor = MTL::InstanceAccelerationStructureDescriptor::descriptor();
++        descriptor->setInstancedAccelerationStructures(NS::Array::array(structures.data(), structures.size()));
++        descriptor->setInstanceDescriptorBuffer(instanceBuffer);
++        descriptor->setInstanceDescriptorStride(sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor));
++        descriptor->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
++        descriptor->setInstanceCount(instanceCount);
++        return descriptor;
++    }
++
+     // MetalPool
+ 
+     MetalPool::MetalPool(MetalDevice *device, const RenderPoolDesc &desc) {
+@@ -1333,7 +1425,7 @@ namespace plume {
+         assert(device != nullptr);
+         assert(data != nullptr);
+         assert(size > 0);
+-        assert(format == RenderShaderFormat::METAL);
++        assert(format == RenderShaderFormat::METAL || format == RenderShaderFormat::DXIL);
+ 
+         this->format = format;
+ 
+@@ -1341,6 +1433,12 @@ namespace plume {
+         functionName = (entryPointName != nullptr) ? NS::String::string(entryPointName, NS::UTF8StringEncoding) : MTLSTR("");
+         functionName->retain();
+ 
++        // The DXIL ray library is represented by separately converted Metal
++        // libraries. The ray pipeline loads those functions by symbol name.
++        if (format == RenderShaderFormat::DXIL) {
++            return;
++        }
++
+         NS::Error *error = nullptr;
+         const dispatch_data_t dispatchData = dispatch_data_create(data, size, dispatch_get_main_queue(), ^{});
+         library = device->mtl->newLibrary(dispatchData, &error);
+@@ -1354,7 +1452,9 @@ namespace plume {
+     MetalShader::~MetalShader() {
+         MetalAutoreleasePool releasePool;
+         functionName->release();
+-        library->release();
++        if (library != nullptr) {
++            library->release();
++        }
+ 
+         if (debugName != nullptr) {
+             debugName->release();
+@@ -1370,10 +1470,13 @@ namespace plume {
+         debugName = NS::String::string(name.c_str(), NS::UTF8StringEncoding);
+         debugName->retain();
+ 
+-        library->setLabel(debugName);
++        if (library != nullptr) {
++            library->setLabel(debugName);
++        }
+     }
+ 
+     MTL::Function* MetalShader::createFunction(const RenderSpecConstant *specConstants, const uint32_t specConstantsCount) const {
++        assert(library != nullptr);
+         MTL::FunctionConstantValues *values = MTL::FunctionConstantValues::alloc()->init();
+         if (specConstants != nullptr) {
+             for (uint32_t i = 0; i < specConstantsCount; i++) {
+@@ -1452,7 +1555,7 @@ namespace plume {
+         MTL::ComputePipelineDescriptor *descriptor = MTL::ComputePipelineDescriptor::alloc()->init();
+         MTL::Function *function = computeShader->createFunction(desc.specConstants, desc.specConstantsCount);
+         descriptor->setComputeFunction(function);
+-        descriptor->setLabel(computeShader->functionName);
++        descriptor->setLabel(computeShader->debugName ? computeShader->debugName : computeShader->functionName);
+ 
+         // State variables, initialized here to be reused in encoder re-binding
+         NS::Error *error = nullptr;
+@@ -1657,6 +1760,195 @@ namespace plume {
+         return RenderPipelineProgram();
+     }
+ 
++    // MetalRaytracingPipeline
++
++    MetalRaytracingPipeline::MetalRaytracingPipeline(const MetalDevice *device,
++        const RenderRaytracingPipelineDesc &desc) : MetalPipeline(device, Type::Raytracing) {
++        if (!device->mtl->supportsRaytracing() || desc.libraries == nullptr ||
++            desc.librariesCount == 0 || desc.pipelineLayout == nullptr) {
++            return;
++        }
++
++        MetalAutoreleasePool releasePool;
++        const char *overrideDirectory = std::getenv("RT64_METAL_RT_SHADER_DIR");
++        std::string shaderDirectory;
++        if (overrideDirectory != nullptr && overrideDirectory[0] != '\0') {
++            shaderDirectory = overrideDirectory;
++        } else {
++            const NS::Bundle *bundle = NS::Bundle::mainBundle();
++            if (bundle == nullptr || bundle->resourcePath() == nullptr) {
++                return;
++            }
++            shaderDirectory = bundle->resourcePath()->utf8String();
++            shaderDirectory += "/rt64-raytracing";
++        }
++
++        struct LoadedFunctions {
++            std::vector<MTL::Library *> libraries;
++            std::unordered_map<std::string, MTL::Function *> functions;
++            ~LoadedFunctions() {
++                for (auto &[name, function] : functions) {
++                    function->release();
++                }
++                for (auto *library : libraries) {
++                    library->release();
++                }
++            }
++        } loaded;
++        auto loadFunction = [&](const std::string &fileName, const std::string &symbol) -> MTL::Function * {
++            const std::string path = shaderDirectory + "/" + fileName + ".metallib";
++            NS::Error *error = nullptr;
++            auto *library = device->mtl->newLibrary(
++                NS::URL::fileURLWithPath(NS::String::string(path.c_str(), NS::UTF8StringEncoding)), &error);
++            if (library == nullptr) {
++                std::fprintf(stderr, "[metal-rt] failed to load %s: %s\n", path.c_str(),
++                    error ? error->localizedDescription()->utf8String() : "no Metal error");
++                return nullptr;
++            }
++            loaded.libraries.push_back(library);
++            auto *function = library->newFunction(NS::String::string(symbol.c_str(), NS::UTF8StringEncoding));
++            if (function == nullptr) {
++                std::fprintf(stderr, "[metal-rt] missing shader function %s\n", symbol.c_str());
++                return nullptr;
++            }
++            loaded.functions.emplace(symbol, function);
++            return function;
++        };
++
++        std::vector<std::string> rayGenerationNames;
++        std::vector<MTL::Function *> visibleFunctions;
++        std::unordered_map<std::string, uint64_t> visibleHandles;
++        for (uint32_t libraryIndex = 0; libraryIndex < desc.librariesCount; libraryIndex++) {
++            const auto &library = desc.libraries[libraryIndex];
++            for (uint32_t i = 0; i < library.symbolsCount; i++) {
++                const auto &symbol = library.symbols[i];
++                if (symbol.importName == nullptr) {
++                    return;
++                }
++                const std::string importName(symbol.importName);
++                auto *function = loadFunction(importName, importName);
++                if (function == nullptr) {
++                    return;
++                }
++                const std::string programName = symbol.exportName ? symbol.exportName : symbol.importName;
++                if (!programIndices.emplace(programName, uint32_t(programIdentifiers.size())).second) {
++                    return;
++                }
++                MetalIRShaderIdentifier identifier;
++                if (symbol.type == RenderRaytracingPipelineLibrarySymbolType::RAYGEN) {
++                    rayGenerationNames.push_back(importName);
++                } else {
++                    visibleFunctions.push_back(function);
++                    identifier.shaderHandle = visibleFunctions.size(); // Visible table slot zero is reserved.
++                    visibleHandles.emplace(importName, identifier.shaderHandle);
++                }
++                programIdentifiers.push_back(identifier);
++            }
++        }
++        for (uint32_t i = 0; i < desc.hitGroupsCount; i++) {
++            const auto &group = desc.hitGroups[i];
++            if (group.hitGroupName == nullptr ||
++                (group.closestHitName != nullptr && loaded.functions.count(group.closestHitName) == 0) ||
++                (group.anyHitName != nullptr && loaded.functions.count(group.anyHitName) == 0) ||
++                (group.intersectionName != nullptr && loaded.functions.count(group.intersectionName) == 0)) {
++                return;
++            }
++            MetalIRShaderIdentifier identifier;
++            if (group.closestHitName != nullptr) {
++                const auto found = visibleHandles.find(group.closestHitName);
++                if (found == visibleHandles.end()) return;
++                identifier.shaderHandle = found->second;
++            }
++            if (group.anyHitName != nullptr) {
++                const auto found = visibleHandles.find(group.anyHitName);
++                if (found == visibleHandles.end()) return;
++                identifier.intersectionShaderHandle = found->second;
++            }
++            if (!programIndices.emplace(group.hitGroupName, uint32_t(programIdentifiers.size())).second) {
++                return;
++            }
++            programIdentifiers.push_back(identifier);
++        }
++        auto *intersection = loadFunction("IndirectTriangleIntersection",
++            "irconverter.wrapper.intersection.function.triangle");
++        if (intersection == nullptr || rayGenerationNames.empty()) {
++            return;
++        }
++
++        std::vector<const NS::Object *> linkedObjects;
++        linkedObjects.reserve(visibleFunctions.size() + 1);
++        for (auto *function : visibleFunctions) {
++            linkedObjects.push_back(function);
++        }
++        linkedObjects.push_back(intersection);
++        auto *linked = MTL::LinkedFunctions::linkedFunctions();
++        linked->setFunctions(NS::Array::array(linkedObjects.data(), linkedObjects.size()));
++
++        for (const auto &name : rayGenerationNames) {
++            auto *descriptor = MTL::ComputePipelineDescriptor::alloc()->init();
++            descriptor->setComputeFunction(loaded.functions.at(name));
++            descriptor->setLinkedFunctions(linked);
++            // Converted DXR traversal invokes nested intersection and hit wrappers.
++            // Metal defaults to one frame, which validation rejects on the first ray.
++            descriptor->setMaxCallStackDepth(8);
++            descriptor->setLabel(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
++            NS::Error *error = nullptr;
++            RayGeneration state;
++            state.name = name;
++            state.pipeline = device->mtl->newComputePipelineState(
++                descriptor, MTL::PipelineOptionNone, nullptr, &error);
++            descriptor->release();
++            if (state.pipeline == nullptr) {
++                std::fprintf(stderr, "[metal-rt] failed to link %s: %s\n", name.c_str(),
++                    error ? error->localizedDescription()->utf8String() : "no Metal error");
++                return;
++            }
++            rayGenerations.push_back(state);
++            auto &built = rayGenerations.back();
++            auto *visibleDesc = MTL::VisibleFunctionTableDescriptor::visibleFunctionTableDescriptor();
++            visibleDesc->setFunctionCount(visibleFunctions.size() + 1);
++            built.visibleTable = built.pipeline->newVisibleFunctionTable(visibleDesc);
++            auto *intersectionDesc = MTL::IntersectionFunctionTableDescriptor::intersectionFunctionTableDescriptor();
++            intersectionDesc->setFunctionCount(1);
++            built.intersectionTable = built.pipeline->newIntersectionFunctionTable(intersectionDesc);
++            if (built.visibleTable == nullptr || built.intersectionTable == nullptr) {
++                return;
++            }
++            for (uint32_t i = 0; i < visibleFunctions.size(); i++) {
++                auto *handle = built.pipeline->functionHandle(visibleFunctions[i]);
++                if (handle == nullptr) {
++                    return;
++                }
++                built.visibleTable->setFunction(handle, i + 1); // Zero means no shader.
++            }
++            auto *handle = built.pipeline->functionHandle(intersection);
++            if (handle == nullptr) {
++                return;
++            }
++            built.intersectionTable->setFunction(handle, 0);
++        }
++        valid = true;
++    }
++
++    MetalRaytracingPipeline::~MetalRaytracingPipeline() {
++        MetalAutoreleasePool releasePool;
++        for (auto &state : rayGenerations) {
++            if (state.intersectionTable != nullptr) state.intersectionTable->release();
++            if (state.visibleTable != nullptr) state.visibleTable->release();
++            if (state.pipeline != nullptr) state.pipeline->release();
++        }
++    }
++
++    void MetalRaytracingPipeline::setName(const std::string &name) {
++        (void)name;
++    }
++
++    RenderPipelineProgram MetalRaytracingPipeline::getProgram(const std::string &name) const {
++        const auto found = programIndices.find(name);
++        assert(found != programIndices.end());
++        return found != programIndices.end() ? RenderPipelineProgram(found->second) : RenderPipelineProgram();
++    }
++
+     // MetalDescriptorSet
+ 
+     MetalDescriptorSet::MetalDescriptorSet(MetalDevice *device, const RenderDescriptorSetDesc &desc) {
+@@ -1701,8 +1993,14 @@ namespace plume {
+             argumentBuffer.argumentEncoder->setArgumentBuffer(argumentBuffer.mtl, argumentBuffer.offset);
+         }
+ 
++        uint32_t converterEntryCount = 0;
++        for (const auto &binding : setLayout->setBindings) {
++            converterEntryCount = std::max(converterEntryCount, binding.binding + binding.descriptorCount);
++        }
++        converterEntries.resize(converterEntryCount);
+         bindImmutableSamplers();
+         resourceEntries.resize(maxResources);
++        accelerationStructures.resize(maxResources);
+     }
+ 
+     MetalDescriptorSet::~MetalDescriptorSet() {
+@@ -1718,7 +2016,7 @@ namespace plume {
+         }
+     }
+ 
+-    void MetalDescriptorSet::bindImmutableSamplers() const {
++    void MetalDescriptorSet::bindImmutableSamplers() {
+         // For Tier 2, get pointer to argument buffer for direct writes
+         uint8_t *bufferPtr = nullptr;
+         if (device->useArgumentBuffersTier2) {
+@@ -1734,6 +2032,7 @@ namespace plume {
+                 } else {
+                     argumentBuffer.argumentEncoder->setSamplerState(binding.immutableSamplers[i], argumentIndex);
+                 }
++                converterEntries[argumentIndex].gpuVA = binding.immutableSamplers[i]->gpuResourceID()._impl;
+             }
+         }
+     }
+@@ -1763,7 +2062,13 @@ namespace plume {
+                 offset = bufferStructuredView->firstElement * bufferStructuredView->structureByteStride;
+             }
+ 
+-            const BufferDescriptor descriptor = { .buffer = interfaceBuffer->mtl, .offset = offset };
++            assert(offset <= interfaceBuffer->desc.size);
++            const uint64_t availableSize = interfaceBuffer->desc.size - offset;
++            assert(bufferSize == 0 || bufferSize <= availableSize);
++            const BufferDescriptor descriptor = {
++                .buffer = interfaceBuffer->mtl, .offset = offset,
++                .size = bufferSize == 0 ? availableSize : bufferSize
++            };
+             setDescriptor(descriptorIndex, &descriptor);
+         }
+     }
+@@ -1775,7 +2080,7 @@ namespace plume {
+             return;
+         }
+ 
+-        const MetalTexture *interfaceTexture = static_cast<const MetalTexture *>(texture);
++        const auto *interfaceTexture = static_cast<const ExtendedRenderTexture *>(texture);
+ 
+         if (textureView != nullptr) {
+             const MetalTextureView *interfaceTextureView = static_cast<const MetalTextureView *>(textureView);
+@@ -1784,7 +2089,7 @@ namespace plume {
+             setDescriptor(descriptorIndex, &descriptor);
+         }
+         else {
+-            const TextureDescriptor descriptor = { .texture = interfaceTexture->mtl };
++            const TextureDescriptor descriptor = { .texture = interfaceTexture->getTexture() };
+             setDescriptor(descriptorIndex, &descriptor);
+         }
+     }
+@@ -1802,7 +2107,19 @@ namespace plume {
+     }
+ 
+     void MetalDescriptorSet::setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) {
+-        // TODO: Unimplemented.
++        MetalAutoreleasePool releasePool;
++        if (accelerationStructure == nullptr) {
++            setDescriptor(descriptorIndex, nullptr);
++            return;
++        }
++
++        const auto *structure = static_cast<const MetalAccelerationStructure *>(accelerationStructure);
++        assert(structure->type == RenderAccelerationStructureType::TOP_LEVEL);
++        const AccelerationStructureDescriptor descriptor = {
++            .structure = structure->buffer->accelerationStructure
++        };
++        setDescriptor(descriptorIndex, &descriptor);
++        accelerationStructures[descriptorIndex] = structure;
+     }
+ 
+     void MetalDescriptorSet::setDescriptor(const uint32_t descriptorIndex, const Descriptor *descriptor) {
+@@ -1810,13 +2127,16 @@ namespace plume {
+ 
+         const uint32_t indexBase = setLayout->descriptorIndexBases[descriptorIndex];
+         const uint32_t bindingIndex = setLayout->descriptorBindingIndices[descriptorIndex];
+-        const auto &setLayoutBinding = setLayout->setBindings[indexBase];
+-        const MTL::DataType dtype = mapDataType(setLayoutBinding.descriptorType);
++        const auto *setLayoutBinding = setLayout->getBinding(bindingIndex);
++        assert(setLayoutBinding != nullptr);
++        const MTL::DataType dtype = mapDataType(setLayoutBinding->descriptorType);
+         MTL::Resource *nativeResource = nullptr;
+         RenderDescriptorRangeType descriptorType = getDescriptorType(bindingIndex);
++        const uint32_t argumentIndex = descriptorIndex - indexBase + bindingIndex;
++        auto &converterEntry = converterEntries[argumentIndex];
++        converterEntry = {};
+ 
+         if (descriptor != nullptr) {
+-            const uint32_t argumentIndex = descriptorIndex - indexBase + bindingIndex;
+             const uint32_t argumentOffset = argumentIndex * sizeof(uint64_t);
+ 
+             // For Tier 2, get pointer to argument buffer for direct writes
+@@ -1830,6 +2150,7 @@ namespace plume {
+                     const TextureDescriptor *textureDescriptor = static_cast<const TextureDescriptor *>(descriptor);
+                     nativeResource = textureDescriptor->texture;
+                     MTL::Texture *nativeTexture = static_cast<MTL::Texture *>(nativeResource);
++                    converterEntry.textureViewID = nativeTexture->gpuResourceID()._impl;
+                     if (device->useArgumentBuffersTier2) {
+                         *reinterpret_cast<MTL::ResourceID*>(bufferPtr + argumentOffset) = nativeTexture->gpuResourceID();
+                     } else {
+@@ -1842,6 +2163,9 @@ namespace plume {
+                     const BufferDescriptor *bufferDescriptor = static_cast<const BufferDescriptor *>(descriptor);
+                     nativeResource = bufferDescriptor->buffer;
+                     MTL::Buffer *nativeBuffer = static_cast<MTL::Buffer *>(nativeResource);
++                    assert(bufferDescriptor->size <= UINT32_MAX);
++                    converterEntry.gpuVA = nativeBuffer->gpuAddress() + bufferDescriptor->offset;
++                    converterEntry.metadata = bufferDescriptor->size;
+                     if (device->useDirectBufferAddresses) {
+                         uint64_t gpuAddress = nativeBuffer->gpuAddress() + bufferDescriptor->offset;
+                         *reinterpret_cast<uint64_t*>(bufferPtr + argumentOffset) = gpuAddress;
+@@ -1853,6 +2177,7 @@ namespace plume {
+                 }
+                 case MTL::DataTypeSampler: {
+                     const SamplerDescriptor *samplerDescriptor = static_cast<const SamplerDescriptor *>(descriptor);
++                    converterEntry.gpuVA = samplerDescriptor->state->gpuResourceID()._impl;
+                     if (device->useArgumentBuffersTier2) {
+                         *reinterpret_cast<MTL::ResourceID*>(bufferPtr + argumentOffset) = samplerDescriptor->state->gpuResourceID();
+                     } else {
+@@ -1861,9 +2186,34 @@ namespace plume {
+                     break;
+                 }
+ 
++                case MTL::DataTypeInstanceAccelerationStructure: {
++                    const auto *structureDescriptor = static_cast<const AccelerationStructureDescriptor *>(descriptor);
++                    auto *nativeStructure = structureDescriptor->structure;
++                    assert(nativeStructure != nullptr);
++                    nativeResource = nativeStructure;
++                    // The converter needs an AS header buffer, not this resource ID.
++                    // The ray dispatch path will fill that table entry after building
++                    // the instance contribution array.
++                    if (device->useArgumentBuffersTier2) {
++                        *reinterpret_cast<MTL::ResourceID*>(bufferPtr + argumentOffset) = nativeStructure->gpuResourceID();
++                    } else {
++                        argumentBuffer.argumentEncoder->setAccelerationStructure(nativeStructure, argumentIndex);
++                    }
++                    nativeStructure->retain();
++                    break;
++                }
++
+                 default:
+                     assert(false && "Unsupported descriptor type.");
+             }
++        } else if (dtype == MTL::DataTypeInstanceAccelerationStructure) {
++            const uint32_t argumentIndex = descriptorIndex - indexBase + bindingIndex;
++            if (device->useArgumentBuffersTier2) {
++                auto *bufferPtr = static_cast<uint8_t *>(argumentBuffer.mtl->contents()) + argumentBuffer.offset;
++                *reinterpret_cast<uint64_t *>(bufferPtr + argumentIndex * sizeof(uint64_t)) = 0;
++            } else {
++                argumentBuffer.argumentEncoder->setAccelerationStructure(nullptr, argumentIndex);
++            }
+         }
+ 
+         if (argumentBuffer.mtl->storageMode() == MTL::StorageModeManaged) {
+@@ -1877,6 +2227,9 @@ namespace plume {
+ 
+         resourceEntries[descriptorIndex].resource = nativeResource;
+         resourceEntries[descriptorIndex].type = descriptorType;
++        if (descriptorType == RenderDescriptorRangeType::ACCELERATION_STRUCTURE && descriptor == nullptr) {
++            accelerationStructures[descriptorIndex] = nullptr;
++        }
+     }
+ 
+     RenderDescriptorRangeType MetalDescriptorSet::getDescriptorType(const uint32_t binding) const {
+@@ -1945,7 +2298,7 @@ namespace plume {
+         assert(drawable.mtl != nullptr && "Cannot present without a valid drawable.");
+ 
+         // Create a new command buffer just for presenting
+-        MTL::CommandBuffer *presentBuffer = commandQueue->mtl->commandBufferWithUnretainedReferences();
++        MTL::CommandBuffer *presentBuffer = makeRetainedCommandBuffer(commandQueue->mtl, "Present Command Buffer");
+         presentBuffer->setLabel(MTLSTR("Present Command Buffer"));
+         presentBuffer->enqueue();
+ 
+@@ -2003,11 +2356,14 @@ namespace plume {
+         if (const CGSize current = layer->drawableSize(); !CGSizeEqualToSize(current, drawableSize)) {
+             layer->setDrawableSize(drawableSize);
+ 
+-            for (uint32_t i = 0; i < MAX_DRAWABLES; i++) {
+-                MetalDrawable &drawable = drawables[i];
+-                drawable.desc.width = width;
+-                drawable.desc.height = height;
+-            }
++        }
++
++        // SDL may have already resized the layer during a fullscreen transition.
++        // Framebuffers still need the new dimensions even when the layer matches.
++        for (uint32_t i = 0; i < MAX_DRAWABLES; i++) {
++            MetalDrawable &drawable = drawables[i];
++            drawable.desc.width = width;
++            drawable.desc.height = height;
+         }
+ 
+         return true;
+@@ -2050,7 +2406,7 @@ namespace plume {
+ 
+         // Create a command buffer just to encode the signal
+         MetalAutoreleasePool releasePool;
+-        MTL::CommandBuffer *acquireBuffer = commandQueue->mtl->commandBufferWithUnretainedReferences();
++        MTL::CommandBuffer *acquireBuffer = makeRetainedCommandBuffer(commandQueue->mtl, "Acquire Drawable Command Buffer");
+         acquireBuffer->setLabel(MTLSTR("Acquire Drawable Command Buffer"));
+         const MetalCommandSemaphore *interfaceSemaphore = static_cast<MetalCommandSemaphore *>(signalSemaphore);
+         acquireBuffer->enqueue();
+@@ -2121,11 +2477,11 @@ namespace plume {
+         colorAttachments.reserve(desc.colorAttachmentsCount);
+         depthAttachmentReadOnly = desc.depthAttachmentReadOnly;
+ 
+-        const MetalTexture *firstTexture = nullptr;
++        const ExtendedRenderTexture *firstTexture = nullptr;
+ 
+         for (uint32_t i = 0; i < desc.colorAttachmentsCount; i++) {
+             const MetalTextureView *colorAttachmentView = desc.colorAttachmentViews && desc.colorAttachmentViews[i] ? static_cast<const MetalTextureView *>(desc.colorAttachmentViews[i]) : nullptr;
+-            const MetalTexture *colorAttachment = colorAttachmentView ? colorAttachmentView->parentTexture : static_cast<const MetalTexture *>(desc.colorAttachments[i]);
++            const ExtendedRenderTexture *colorAttachment = colorAttachmentView ? colorAttachmentView->parentTexture : static_cast<const ExtendedRenderTexture *>(desc.colorAttachments[i]);
+             assert((colorAttachment->desc.flags & RenderTextureFlag::RENDER_TARGET) && "Color attachment must be a render target.");
+ 
+             MetalAttachment attachment;
+@@ -2145,7 +2501,7 @@ namespace plume {
+ 
+         if (desc.depthAttachment != nullptr || desc.depthAttachmentView != nullptr) {
+             const MetalTextureView *depthAttachmentView = desc.depthAttachmentView ? static_cast<const MetalTextureView *>(desc.depthAttachmentView) : nullptr;
+-            const MetalTexture *interfaceDepthAttachment = depthAttachmentView ? depthAttachmentView->parentTexture : static_cast<const MetalTexture *>(desc.depthAttachment);
++            const ExtendedRenderTexture *interfaceDepthAttachment = depthAttachmentView ? depthAttachmentView->parentTexture : static_cast<const ExtendedRenderTexture *>(desc.depthAttachment);
+             assert((interfaceDepthAttachment->desc.flags & RenderTextureFlag::DEPTH_TARGET) && "Depth attachment must be a depth target.");
+ 
+             depthAttachment.texture = interfaceDepthAttachment;
+@@ -2243,6 +2599,8 @@ namespace plume {
+     MetalCommandList::~MetalCommandList() {
+         MetalAutoreleasePool releasePool;
+ 
++        for (auto *resource : rayRetainedResources) resource->release();
++
+         if (mtl != nullptr) {
+             mtl->release();
+         }
+@@ -2258,10 +2616,11 @@ namespace plume {
+ 
+     void MetalCommandList::begin() {
+         assert(mtl == nullptr);
++        assert(rayRetainedResources.empty());
+ 
+         MetalAutoreleasePool releasePool;
+         startedEncoding = false;
+-        mtl = queue->mtl->commandBufferWithUnretainedReferences();
++        mtl = makeRetainedCommandBuffer(queue->mtl, "RT64 Command List");
+         mtl->retain();
+         mtl->setLabel(MTLSTR("RT64 Command List"));
+ 
+@@ -2283,6 +2642,7 @@ namespace plume {
+         endActiveResolveTextureComputeEncoder();
+         endActiveBlitEncoder();
+         endActiveComputeEncoder();
++        endActiveAccelerationEncoder();
+ 
+         targetFramebuffer = nullptr;
+ 
+@@ -2293,6 +2653,15 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::commit() {
++        if (!rayRetainedResources.empty()) {
++            auto *resources = new std::vector<MTL::Resource *>(std::move(rayRetainedResources));
++            mtl->addCompletedHandler([resources](MTL::CommandBuffer *) {
++                MetalAutoreleasePool releasePool;
++                for (auto *resource : *resources) resource->release();
++                delete resources;
++            });
++            rayRetainedResourceSet.clear();
++        }
+         mtl->commit();
+         mtl->release();
+         mtl = nullptr;
+@@ -2459,7 +2828,133 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::traceRays(uint32_t width, uint32_t height, uint32_t depth, RenderBufferReference shaderBindingTable, const RenderShaderBindingGroupsInfo &shaderBindingGroupsInfo) {
+-        // TODO: Support Metal RT
++        assert(activeRayPipelineLayout != nullptr && activeRayPipeline != nullptr && activeRayPipeline->isValid());
++        assert(shaderBindingTable.ref != nullptr);
++        const auto &rayGroup = shaderBindingGroupsInfo.rayGen;
++        assert(rayGroup.startIndex < activeRayPipeline->rayGenerations.size());
++        assert(rayGroup.stride >= sizeof(MetalIRShaderIdentifier));
++        const auto *sbt = static_cast<const MetalBuffer *>(shaderBindingTable.ref);
++        const uint64_t rayOffset = rayGroup.offset + uint64_t(rayGroup.startIndex) * rayGroup.stride;
++        assert(rayOffset + sizeof(MetalIRShaderIdentifier) <= sbt->desc.size - shaderBindingTable.offset);
++
++        MetalAutoreleasePool releasePool;
++        const auto &ray = activeRayPipeline->rayGenerations[rayGroup.startIndex];
++        retainRayResource(sbt->mtl);
++        const size_t firstDispatchBuffer = rayRetainedResources.size();
++        std::unordered_map<const MetalDescriptorSet *, MTL::Buffer *> tableCopies;
++        auto snapshotTable = [&](const MetalDescriptorSet *set) -> MTL::Buffer * {
++            assert(set != nullptr);
++            if (const auto found = tableCopies.find(set); found != tableCopies.end()) return found->second;
++            const uint64_t bytes = std::max<size_t>(set->converterEntries.size() * sizeof(MetalConverterDescriptorEntry), 24);
++            auto *table = device->mtl->newBuffer(bytes, MTL::ResourceStorageModeShared);
++            assert(table != nullptr);
++            if (!set->converterEntries.empty()) {
++                std::memcpy(table->contents(), set->converterEntries.data(),
++                            set->converterEntries.size() * sizeof(MetalConverterDescriptorEntry));
++            }
++            ownRayResource(table);
++            tableCopies.emplace(set, table);
++            return table;
++        };
++
++        uint64_t rootAddresses[5] = {};
++        // The global signature has general, sampler, two texture, and framebuffer tables.
++        const uint32_t sourceSets[5] = { 0, 0, 1, 2, 3 };
++        for (uint32_t i = 0; i < 5; i++) {
++            auto *set = rayDescriptorSets[sourceSets[i]];
++            assert(set != nullptr);
++            rootAddresses[i] = snapshotTable(set)->gpuAddress();
++        }
++
++        const auto *common = rayDescriptorSets[0];
++        for (uint32_t i = 0; i < common->accelerationStructures.size(); i++) {
++            const auto *structure = common->accelerationStructures[i];
++            if (structure == nullptr) continue;
++            const uint32_t binding = common->setLayout->descriptorBindingIndices[i];
++            const uint32_t index = binding + i - common->setLayout->descriptorIndexBases[i];
++            assert(index < common->converterEntries.size());
++            auto *contributions = device->mtl->newBuffer(
++                std::max<size_t>(sizeof(uint32_t), structure->instanceContributions.size() * sizeof(uint32_t)),
++                MTL::ResourceStorageModeShared);
++            assert(contributions != nullptr);
++            if (!structure->instanceContributions.empty()) {
++                std::memcpy(contributions->contents(), structure->instanceContributions.data(),
++                            structure->instanceContributions.size() * sizeof(uint32_t));
++            }
++            ownRayResource(contributions);
++            auto *headerBuffer = device->mtl->newBuffer(sizeof(MetalIRAccelerationStructureHeader),
++                                                         MTL::ResourceStorageModeShared);
++            assert(headerBuffer != nullptr);
++            auto *header = static_cast<MetalIRAccelerationStructureHeader *>(headerBuffer->contents());
++            *header = {};
++            header->accelerationStructureID = structure->buffer->accelerationStructure->gpuResourceID()._impl;
++            header->instanceContributions = contributions->gpuAddress();
++            ownRayResource(headerBuffer);
++            auto *entries = static_cast<MetalConverterDescriptorEntry *>(tableCopies.at(common)->contents());
++            entries[index].gpuVA = headerBuffer->gpuAddress();
++        }
++
++        auto *root = device->mtl->newBuffer(sizeof(rootAddresses), MTL::ResourceStorageModeShared);
++        assert(root != nullptr);
++        std::memcpy(root->contents(), rootAddresses, sizeof(rootAddresses));
++        ownRayResource(root);
++
++        const uint64_t sbtAddress = sbt->mtl->gpuAddress() + shaderBindingTable.offset;
++        MetalIRDispatchRaysArgument args;
++        args.desc.rayGen = { sbtAddress + rayOffset, sizeof(MetalIRShaderIdentifier) };
++        auto setGroup = [sbtAddress](MetalIRVirtualAddressRangeAndStride &dst,
++                                     const RenderShaderBindingGroupInfo &src) {
++            dst = { src.size ? sbtAddress + src.offset + uint64_t(src.startIndex) * src.stride : 0,
++                    src.size, src.stride };
++        };
++        setGroup(args.desc.miss, shaderBindingGroupsInfo.miss);
++        setGroup(args.desc.hitGroup, shaderBindingGroupsInfo.hitGroup);
++        setGroup(args.desc.callable, shaderBindingGroupsInfo.callable);
++        args.desc.width = width;
++        args.desc.height = height;
++        args.desc.depth = depth;
++        args.globalRootSignature = root->gpuAddress();
++        args.visibleFunctionTable = ray.visibleTable->gpuResourceID()._impl;
++        args.intersectionFunctionTable = ray.intersectionTable->gpuResourceID()._impl;
++
++        endOtherEncoders(EncoderType::None);
++        auto *encoder = mtl->computeCommandEncoder();
++        barrierWait(MetalBarrierStage::COMPUTE, encoder);
++        encoder->setComputePipelineState(ray.pipeline);
++        encoder->setBuffer(root, 0, 2); // Metal Shader Converter global root argument buffer.
++        encoder->setBytes(&args, sizeof(args), 3);
++        encoder->useResource(sbt->mtl, MTL::ResourceUsageRead);
++        for (size_t i = firstDispatchBuffer; i < rayRetainedResources.size(); i++) {
++            encoder->useResource(rayRetainedResources[i], MTL::ResourceUsageRead);
++        }
++        for (auto &[set, table] : tableCopies) {
++            for (const auto &entry : set->resourceEntries) {
++                if (entry.resource == nullptr) continue;
++                retainRayResource(entry.resource);
++                encoder->useResource(entry.resource, mapResourceUsage(entry.type));
++            }
++        }
++        encoder->useResource(ray.visibleTable, MTL::ResourceUsageRead);
++        encoder->useResource(ray.intersectionTable, MTL::ResourceUsageRead);
++        encoder->dispatchThreads(MTL::Size(width, height, depth), MTL::Size(8, 8, 1));
++        barrierUpdate(MetalBarrierStage::COMPUTE, encoder);
++        encoder->updateFence(timestampQueryFence);
++        encoder->endEncoding();
++        startedEncoding = true;
++    }
++
++    void MetalCommandList::retainRayResource(MTL::Resource *resource) {
++        if (resource != nullptr && rayRetainedResourceSet.insert(resource).second) {
++            resource->retain();
++            rayRetainedResources.push_back(resource);
++        }
++    }
++
++    void MetalCommandList::ownRayResource(MTL::Resource *resource) {
++        if (resource != nullptr) {
++            assert(rayRetainedResourceSet.insert(resource).second);
++            rayRetainedResources.push_back(resource);
++        }
+     }
+ 
+     void MetalCommandList::prepareClearVertices(const RenderRect& rect, simd::float2* outVertices) {
+@@ -2534,6 +3029,9 @@ namespace plume {
+                 }
+                 break;
+             }
++            case MetalPipeline::Type::Raytracing:
++                activeRayPipeline = static_cast<const MetalRaytracingPipeline *>(interfacePipeline);
++                break;
+             default:
+                 assert(false && "Unknown pipeline type.");
+                 break;
+@@ -2653,7 +3151,12 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+-        // TODO: Metal RT
++        assert(pipelineLayout != nullptr);
++        const auto *newLayout = static_cast<const MetalPipelineLayout *>(pipelineLayout);
++        if (activeRayPipelineLayout != newLayout) {
++            activeRayPipelineLayout = newLayout;
++            std::fill(std::begin(rayDescriptorSets), std::end(rayDescriptorSets), nullptr);
++        }
+     }
+ 
+     void MetalCommandList::setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+@@ -2661,7 +3164,9 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::setRaytracingDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) {
+-        // TODO: Metal RT
++        assert(activeRayPipelineLayout != nullptr);
++        assert(setIndex < MAX_DESCRIPTOR_SET_BINDINGS);
++        rayDescriptorSets[setIndex] = static_cast<MetalDescriptorSet *>(descriptorSet);
+     }
+ 
+     void MetalCommandList::setIndexBuffer(const RenderIndexBufferView *view) {
+@@ -2987,8 +3492,10 @@ namespace plume {
+         checkActiveBlitEncoder();
+         activeType = EncoderType::Blit;
+ 
+-        const MetalTexture *dstTexture = static_cast<const MetalTexture *>(dstLocation.texture);
+-        const MetalTexture *srcTexture = static_cast<const MetalTexture *>(srcLocation.texture);
++        // A swap-chain image is MetalDrawable; regular textures are MetalTexture.
++        // Both expose the native texture through ExtendedRenderTexture.
++        const auto *dstTexture = static_cast<const ExtendedRenderTexture *>(dstLocation.texture);
++        const auto *srcTexture = static_cast<const ExtendedRenderTexture *>(srcLocation.texture);
+         const MetalBuffer *dstBuffer = static_cast<const MetalBuffer *>(dstLocation.buffer);
+         const MetalBuffer *srcBuffer = static_cast<const MetalBuffer *>(srcLocation.buffer);
+ 
+@@ -3016,12 +3523,36 @@ namespace plume {
+                 bytesPerRow,
+                 bytesPerImage,
+                 size,
+-                dstTexture->mtl,
++                dstTexture->getTexture(),
+                 dstLocation.subresource.arrayIndex,
+                 dstLocation.subresource.mipLevel,
+                 dstOrigin
+             );
+             activeBlitEncoder->popDebugGroup();
++        } else if (dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT &&
++                   srcLocation.type == RenderTextureCopyType::SUBRESOURCE) {
++            assert(dstBuffer != nullptr && srcTexture != nullptr);
++            const uint32_t blockWidth = RenderFormatBlockWidth(dstLocation.placedFootprint.format);
++            const uint32_t horizontalBlocks =
++                (dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth;
++            const uint32_t verticalBlocks =
++                (dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth;
++            const uint32_t bytesPerRow = horizontalBlocks * RenderFormatSize(dstLocation.placedFootprint.format);
++            const uint32_t bytesPerImage = bytesPerRow * verticalBlocks;
++            const MTL::Origin srcOrigin = srcBox != nullptr
++                ? MTL::Origin(NS::UInteger(srcBox->left), NS::UInteger(srcBox->top), NS::UInteger(srcBox->front))
++                : MTL::Origin(0, 0, 0);
++            const MTL::Size size = srcBox != nullptr
++                ? MTL::Size(srcBox->right - srcBox->left, srcBox->bottom - srcBox->top,
++                            srcBox->back - srcBox->front)
++                : MTL::Size(dstLocation.placedFootprint.width,
++                            dstLocation.placedFootprint.height, dstLocation.placedFootprint.depth);
++            assert(dstLocation.placedFootprint.offset + uint64_t(bytesPerImage) * size.depth <=
++                   dstBuffer->desc.size);
++            activeBlitEncoder->copyFromTexture(srcTexture->getTexture(), srcLocation.subresource.arrayIndex,
++                                               srcLocation.subresource.mipLevel, srcOrigin, size,
++                                               dstBuffer->mtl, dstLocation.placedFootprint.offset,
++                                               bytesPerRow, bytesPerImage);
+         } else {
+             assert(dstTexture != nullptr);
+             assert(srcTexture != nullptr);
+@@ -3040,12 +3571,12 @@ namespace plume {
+             const MTL::Origin dstOrigin = { dstX, dstY, dstZ };
+ 
+             activeBlitEncoder->copyFromTexture(
+-                srcTexture->mtl,                    // source texture
++                srcTexture->getTexture(),           // source texture
+                 srcLocation.subresource.arrayIndex, // source slice (baseArrayLayer)
+                 srcLocation.subresource.mipLevel,   // source mipmap level
+                 srcOrigin,                          // source origin
+                 size,                               // copy size
+-                dstTexture->mtl,                    // destination texture
++                dstTexture->getTexture(),           // destination texture
+                 dstLocation.subresource.arrayIndex, // destination slice (baseArrayLayer)
+                 dstLocation.subresource.mipLevel,   // destination mipmap level
+                 dstOrigin                           // destination origin
+@@ -3079,10 +3610,10 @@ namespace plume {
+         checkActiveBlitEncoder();
+         activeType = EncoderType::Blit;
+ 
+-        const MetalTexture *dst = static_cast<const MetalTexture *>(dstTexture);
+-        const MetalTexture *src = static_cast<const MetalTexture *>(srcTexture);
++        const ExtendedRenderTexture *dst = static_cast<const ExtendedRenderTexture *>(dstTexture);
++        const ExtendedRenderTexture *src = static_cast<const ExtendedRenderTexture *>(srcTexture);
+ 
+-        activeBlitEncoder->copyFromTexture(src->mtl, dst->mtl);
++        activeBlitEncoder->copyFromTexture(src->getTexture(), dst->getTexture());
+     }
+ 
+     void MetalCommandList::resolveTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) {
+@@ -3090,8 +3621,8 @@ namespace plume {
+         assert(srcTexture != nullptr);
+ 
+         MetalAutoreleasePool releasePool;
+-        const MetalTexture *dst = static_cast<const MetalTexture *>(dstTexture);
+-        const MetalTexture *src = static_cast<const MetalTexture *>(srcTexture);
++        const ExtendedRenderTexture *dst = static_cast<const ExtendedRenderTexture *>(dstTexture);
++        const ExtendedRenderTexture *src = static_cast<const ExtendedRenderTexture *>(srcTexture);
+ 
+         // For full texture resolves, use the more efficient render pass resolve
+         endOtherEncoders(EncoderType::Render);
+@@ -3102,8 +3633,8 @@ namespace plume {
+         const MTL::RenderPassDescriptor *renderPassDescriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
+         MTL::RenderPassColorAttachmentDescriptor *colorAttachment = renderPassDescriptor->colorAttachments()->object(0);
+ 
+-        colorAttachment->setTexture(src->mtl);
+-        colorAttachment->setResolveTexture(dst->mtl);
++        colorAttachment->setTexture(src->getTexture());
++        colorAttachment->setResolveTexture(dst->getTexture());
+         colorAttachment->setLoadAction(MTL::LoadActionLoad);
+         colorAttachment->setStoreAction(MTL::StoreActionMultisampleResolve);
+ 
+@@ -3118,10 +3649,10 @@ namespace plume {
+         assert(resolveMode == RenderResolveMode::AVERAGE && "Metal currently only supports AVERAGE resolve mode.");
+ 
+         MetalAutoreleasePool releasePool;
+-        const MetalTexture *dst = static_cast<const MetalTexture *>(dstTexture);
+-        const MetalTexture *src = static_cast<const MetalTexture *>(srcTexture);
++        const ExtendedRenderTexture *dst = static_cast<const ExtendedRenderTexture *>(dstTexture);
++        const ExtendedRenderTexture *src = static_cast<const ExtendedRenderTexture *>(srcTexture);
+ 
+-        assert(dst->mtl->usage() & MTL::TextureUsageShaderWrite);
++        assert(dst->getTexture()->usage() & MTL::TextureUsageShaderWrite);
+ 
+         // Check if we can use full texture resolve
+         const bool canUseFullResolve =
+@@ -3146,8 +3677,8 @@ namespace plume {
+         // Calculate source region
+         uint32_t srcX = 0;
+         uint32_t srcY = 0;
+-        uint32_t width = src->mtl->width();
+-        uint32_t height = src->mtl->height();
++        uint32_t width = src->getTexture()->width();
++        uint32_t height = src->getTexture()->height();
+ 
+         if (srcRect != nullptr) {
+             srcX = srcRect->left;
+@@ -3170,8 +3701,8 @@ namespace plume {
+             width, height
+         };
+ 
+-        activeResolveComputeEncoder->setTexture(src->mtl, 0);
+-        activeResolveComputeEncoder->setTexture(dst->mtl, 1);
++        activeResolveComputeEncoder->setTexture(src->getTexture(), 0);
++        activeResolveComputeEncoder->setTexture(dst->getTexture(), 1);
+         activeResolveComputeEncoder->setBytes(&params, sizeof(params), 0);
+ 
+         const MTL::Size threadGroupSize = { 8, 8, 1 };
+@@ -3182,11 +3713,57 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) {
+-        // TODO: Unimplemented.
++        assert(dstAccelerationStructure != nullptr && scratchBuffer.ref != nullptr);
++        assert(buildInfo.buildData.size() == sizeof(RenderBottomLevelASMesh) * buildInfo.meshCount);
++        MetalAutoreleasePool releasePool;
++        std::vector<RenderBottomLevelASMesh> meshes(buildInfo.meshCount);
++        if (!meshes.empty()) {
++            std::memcpy(meshes.data(), buildInfo.buildData.data(), buildInfo.buildData.size());
++        }
++        auto *descriptor = metalBottomLevelDescriptor(meshes.data(), buildInfo.meshCount, buildInfo.preferFastBuild);
++        const auto *structure = static_cast<const MetalAccelerationStructure *>(dstAccelerationStructure);
++        const auto *scratch = static_cast<const MetalBuffer *>(scratchBuffer.ref);
++        endOtherEncoders(EncoderType::AccelerationStructure);
++        activeType = EncoderType::AccelerationStructure;
++        if (activeAccelerationEncoder == nullptr) {
++            activeAccelerationEncoder = mtl->accelerationStructureCommandEncoder();
++            activeAccelerationEncoder->retain();
++            activeAccelerationEncoder->setLabel(MTLSTR("Acceleration Structure Builds"));
++        }
++        activeAccelerationEncoder->buildAccelerationStructure(structure->buffer->accelerationStructure, descriptor,
++                                            scratch->mtl, scratchBuffer.offset);
++        startedEncoding = true;
+     }
+ 
+     void MetalCommandList::buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) {
+-        // TODO: Unimplemented.
++        assert(dstAccelerationStructure != nullptr && scratchBuffer.ref != nullptr && instancesBuffer.ref != nullptr);
++        assert(buildInfo.buildData.size() == sizeof(RenderTopLevelASInstance) * buildInfo.instanceCount);
++        MetalAutoreleasePool releasePool;
++        std::vector<RenderTopLevelASInstance> instances(buildInfo.instanceCount);
++        if (!instances.empty()) {
++            std::memcpy(instances.data(), buildInfo.buildData.data(), buildInfo.buildData.size());
++        }
++        const auto *instanceData = static_cast<const MetalBuffer *>(instancesBuffer.ref);
++        auto *descriptor = metalTopLevelDescriptor(instances.data(), buildInfo.instanceCount, instanceData->mtl);
++        descriptor->setInstanceDescriptorBufferOffset(instancesBuffer.offset);
++        descriptor->setUsage(buildInfo.preferFastBuild ? MTL::AccelerationStructureUsagePreferFastBuild
++                                                      : MTL::AccelerationStructureUsageNone);
++        const auto *structure = static_cast<const MetalAccelerationStructure *>(dstAccelerationStructure);
++        structure->instanceContributions.resize(buildInfo.instanceCount);
++        for (uint32_t i = 0; i < buildInfo.instanceCount; i++) {
++            structure->instanceContributions[i] = instances[i].instanceContributionToHitGroupIndex;
++        }
++        const auto *scratch = static_cast<const MetalBuffer *>(scratchBuffer.ref);
++        endOtherEncoders(EncoderType::AccelerationStructure);
++        activeType = EncoderType::AccelerationStructure;
++        if (activeAccelerationEncoder == nullptr) {
++            activeAccelerationEncoder = mtl->accelerationStructureCommandEncoder();
++            activeAccelerationEncoder->retain();
++            activeAccelerationEncoder->setLabel(MTLSTR("Acceleration Structure Builds"));
++        }
++        activeAccelerationEncoder->buildAccelerationStructure(structure->buffer->accelerationStructure, descriptor,
++                                            scratch->mtl, scratchBuffer.offset);
++        startedEncoding = true;
+     }
+ 
+     void MetalCommandList::discardTexture(const RenderTexture* texture) {
+@@ -3241,6 +3818,15 @@ namespace plume {
+         }
+     }
+ 
++    void MetalCommandList::endActiveAccelerationEncoder() {
++        if (activeAccelerationEncoder != nullptr) {
++            activeAccelerationEncoder->endEncoding();
++            activeAccelerationEncoder->release();
++            activeAccelerationEncoder = nullptr;
++            activeType = EncoderType::None;
++        }
++    }
++
+     void MetalCommandList::endOtherEncoders(EncoderType type) {
+         if (activeType == type) {
+           // Early return for the most likely case.
+@@ -3263,6 +3849,9 @@ namespace plume {
+         case EncoderType::Resolve:
+           endActiveResolveTextureComputeEncoder();
+           break;
++        case EncoderType::AccelerationStructure:
++          endActiveAccelerationEncoder();
++          break;
+         default:
+           assert(false && "Unknown encoder type.");
+           break;
+@@ -3686,7 +4275,7 @@ namespace plume {
+ 
+         // Create a new command buffer to encode the wait semaphores into
+         MetalAutoreleasePool releasePool;
+-        MTL::CommandBuffer* cmdBuffer = mtl->commandBufferWithUnretainedReferences();
++        MTL::CommandBuffer* cmdBuffer = makeRetainedCommandBuffer(mtl, "Wait Command Buffer");
+         cmdBuffer->setLabel(MTLSTR("Wait Command Buffer"));
+         cmdBuffer->enqueue();
+ 
+@@ -3815,8 +4404,11 @@ namespace plume {
+ 
+         // Fill capabilities.
+         // https://developer.apple.com/documentation/metal/device-inspection
+-        // TODO: Support Raytracing.
+-        // capabilities.raytracing = mtl->supportsRaytracing();
++        // Keep the unverified full-game path opt-in. The headless ray dispatch
++        // probe can run independently of this advertised capability.
++        const char *rayOptIn = std::getenv("OOT_METAL_RAYTRACING");
++        capabilities.raytracing = mtl->supportsRaytracing() && rayOptIn != nullptr &&
++                                   std::strcmp(rayOptIn, "1") == 0;
+         capabilities.maxTextureSize = mtl->supportsFamily(MTL::GPUFamilyApple3) ? 16384 : 8192;
+         capabilities.sampleLocations = mtl->programmableSamplePositionsSupported();
+         capabilities.resolveRegion = true;
+@@ -3901,8 +4493,8 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderPipeline> MetalDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
+-        // TODO: Unimplemented (Raytracing).
+-        return nullptr;
++        auto pipeline = std::make_unique<MetalRaytracingPipeline>(this, desc);
++        return pipeline->isValid() ? std::move(pipeline) : nullptr;
+     }
+ 
+     std::unique_ptr<RenderCommandQueue> MetalDevice::createCommandQueue(RenderCommandListType type) {
+@@ -3946,15 +4538,97 @@ namespace plume {
+     }
+ 
+     void MetalDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+-        // TODO: Unimplemented (Raytracing).
++        assert(meshCount == 0 || meshes != nullptr);
++        MetalAutoreleasePool releasePool;
++        auto *descriptor = metalBottomLevelDescriptor(meshes, meshCount, preferFastBuild);
++        const MTL::AccelerationStructureSizes sizes = mtl->accelerationStructureSizes(descriptor);
++        buildInfo.meshCount = meshCount;
++        buildInfo.primitiveCount = 0;
++        for (uint32_t i = 0; i < meshCount; i++) {
++            buildInfo.primitiveCount += meshes[i].indexCount / 3;
++        }
++        buildInfo.preferFastBuild = preferFastBuild;
++        buildInfo.preferFastTrace = preferFastTrace;
++        buildInfo.scratchSize = sizes.buildScratchBufferSize;
++        buildInfo.accelerationStructureSize = sizes.accelerationStructureSize;
++        buildInfo.buildData.resize(sizeof(RenderBottomLevelASMesh) * meshCount);
++        if (meshCount > 0) {
++            std::memcpy(buildInfo.buildData.data(), meshes, buildInfo.buildData.size());
++        }
+     }
+ 
+     void MetalDevice::setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) {
+-        // TODO: Unimplemented (Raytracing).
++        assert(instanceCount == 0 || instances != nullptr);
++        MetalAutoreleasePool releasePool;
++        buildInfo.instanceCount = instanceCount;
++        buildInfo.preferFastBuild = preferFastBuild;
++        buildInfo.preferFastTrace = preferFastTrace;
++        buildInfo.instancesBufferData.resize(std::max<size_t>(
++            1, sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor) * instanceCount));
++        for (uint32_t i = 0; i < instanceCount; i++) {
++            const RenderTopLevelASInstance &source = instances[i];
++            MTL::AccelerationStructureUserIDInstanceDescriptor native{};
++            for (uint32_t column = 0; column < 4; column++) {
++                for (uint32_t row = 0; row < 3; row++) {
++                    native.transformationMatrix[column][row] = source.transform.m[row][column];
++                }
++            }
++            native.options = source.cullDisable
++                ? MTL::AccelerationStructureInstanceOptionDisableTriangleCulling
++                : MTL::AccelerationStructureInstanceOptionNone;
++            native.mask = source.instanceMask;
++            native.intersectionFunctionTableOffset = 0; // The indirect triangle wrapper uses slot zero.
++            native.accelerationStructureIndex = i;
++            native.userID = source.instanceID;
++            std::memcpy(buildInfo.instancesBufferData.data() + i * sizeof(native), &native, sizeof(native));
++        }
++        buildInfo.buildData.resize(sizeof(RenderTopLevelASInstance) * instanceCount);
++        if (instanceCount > 0) {
++            std::memcpy(buildInfo.buildData.data(), instances, buildInfo.buildData.size());
++        }
++        auto *temporaryInstances = mtl->newBuffer(buildInfo.instancesBufferData.size(), MTL::ResourceStorageModeShared);
++        auto *descriptor = metalTopLevelDescriptor(instances, instanceCount, temporaryInstances);
++        descriptor->setUsage(preferFastBuild ? MTL::AccelerationStructureUsagePreferFastBuild
++                                             : MTL::AccelerationStructureUsageNone);
++        const MTL::AccelerationStructureSizes sizes = mtl->accelerationStructureSizes(descriptor);
++        temporaryInstances->release();
++        buildInfo.scratchSize = sizes.buildScratchBufferSize;
++        buildInfo.accelerationStructureSize = sizes.accelerationStructureSize;
+     }
+ 
+     void MetalDevice::setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) {
+-        // TODO: Unimplemented (Raytracing).
++        (void)descriptorSets; // OoT's ray shaders use a global root signature.
++        (void)descriptorSetCount;
++        const auto *rayPipeline = static_cast<const MetalRaytracingPipeline *>(pipeline);
++        assert(rayPipeline != nullptr && rayPipeline->isValid());
++        uint64_t tableSize = 0;
++        auto layoutGroup = [&](RenderShaderBindingGroupInfo &info, const RenderShaderBindingGroup &group) {
++            info = {};
++            if (group.pipelineProgramsCount == 0) return;
++            info.stride = 64; // Keep each 32-byte IRShaderIdentifier on a D3D-compatible record boundary.
++            info.offset = tableSize;
++            info.size = uint64_t(info.stride) * group.pipelineProgramsCount;
++            tableSize += info.size;
++        };
++        layoutGroup(tableInfo.groups.rayGen, groups.rayGen);
++        layoutGroup(tableInfo.groups.miss, groups.miss);
++        layoutGroup(tableInfo.groups.hitGroup, groups.hitGroup);
++        layoutGroup(tableInfo.groups.callable, groups.callable);
++        tableInfo.tableBufferData.assign(alignUp(tableSize, 256), 0);
++
++        auto encodeGroup = [&](const RenderShaderBindingGroupInfo &info,
++                               const RenderShaderBindingGroup &group) {
++            for (uint32_t i = 0; i < group.pipelineProgramsCount; i++) {
++                const uint32_t index = group.pipelinePrograms[i].programIndex;
++                assert(index < rayPipeline->programIdentifiers.size());
++                std::memcpy(tableInfo.tableBufferData.data() + info.offset + uint64_t(i) * info.stride,
++                            &rayPipeline->programIdentifiers[index], sizeof(MetalIRShaderIdentifier));
++            }
++        };
++        encodeGroup(tableInfo.groups.rayGen, groups.rayGen);
++        encodeGroup(tableInfo.groups.miss, groups.miss);
++        encodeGroup(tableInfo.groups.hitGroup, groups.hitGroup);
++        encodeGroup(tableInfo.groups.callable, groups.callable);
+     }
+ 
+     const RenderDeviceCapabilities &MetalDevice::getCapabilities() const {
+diff --git a/src/contrib/plume/plume_metal.h b/src/contrib/plume/plume_metal.h
+index 59ae129..1c84691 100644
+--- a/src/contrib/plume/plume_metal.h
++++ b/src/contrib/plume/plume_metal.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include <set>
++#include <unordered_map>
+ #include <unordered_set>
+ 
+ #include "plume_render_interface.h"
+@@ -54,6 +55,8 @@ namespace plume {
+     struct MetalBufferFormattedView;
+     struct MetalPipelineLayout;
+     struct MetalGraphicsPipeline;
++    struct MetalRaytracingPipeline;
++    struct MetalAccelerationStructure;
+     struct MetalPool;
+     struct MetalDrawable;
+ 
+@@ -62,7 +65,8 @@ namespace plume {
+         Render,
+         Compute,
+         Blit,
+-        Resolve
++        Resolve,
++        AccelerationStructure
+     };
+ 
+     struct ClearPipelineKey {
+@@ -146,6 +150,7 @@ namespace plume {
+     struct BufferDescriptor: Descriptor {
+         MTL::Buffer *buffer;
+         uint32_t offset = 0;
++        uint64_t size = 0;
+     };
+ 
+     struct TextureDescriptor: Descriptor {
+@@ -156,6 +161,54 @@ namespace plume {
+         MTL::SamplerState *state;
+     };
+ 
++    struct AccelerationStructureDescriptor: Descriptor {
++        MTL::AccelerationStructure *structure;
++    };
++
++    // Metal Shader Converter descriptor table entries are 24 bytes. Keep these
++    // separately from Plume's eight-byte raster argument buffer entries.
++    struct MetalConverterDescriptorEntry {
++        uint64_t gpuVA = 0;
++        uint64_t textureViewID = 0;
++        uint64_t metadata = 0;
++    };
++    static_assert(sizeof(MetalConverterDescriptorEntry) == 24);
++
++    struct MetalIRShaderIdentifier {
++        uint64_t intersectionShaderHandle = 0;
++        uint64_t shaderHandle = 0;
++        uint64_t localRootSignatureSamplersBuffer = 0;
++        uint64_t reserved = 0;
++    };
++    static_assert(sizeof(MetalIRShaderIdentifier) == 32);
++
++    struct MetalIRVirtualAddressRange { uint64_t start = 0, size = 0; };
++    struct MetalIRVirtualAddressRangeAndStride { uint64_t start = 0, size = 0, stride = 0; };
++    struct MetalIRDispatchRaysDescriptor {
++        MetalIRVirtualAddressRange rayGen;
++        MetalIRVirtualAddressRangeAndStride miss, hitGroup, callable;
++        uint32_t width = 0, height = 0, depth = 0;
++    };
++    struct MetalIRDispatchRaysArgument {
++        MetalIRDispatchRaysDescriptor desc;
++        uint64_t globalRootSignature = 0;
++        uint64_t resourceDescriptorHeap = 0;
++        uint64_t samplerDescriptorHeap = 0;
++        uint64_t visibleFunctionTable = 0;
++        uint64_t intersectionFunctionTable = 0;
++        uint64_t intersectionFunctionTables = 0;
++    };
++    static_assert(sizeof(MetalIRDispatchRaysArgument) == 152);
++    static_assert(offsetof(MetalIRDispatchRaysArgument, globalRootSignature) == 104);
++
++    struct MetalIRAccelerationStructureHeader {
++        uint64_t accelerationStructureID = 0;
++        uint64_t instanceContributions = 0;
++        uint64_t reserved[4] = {};
++        uint32_t indirectDispatch[3] = {};
++    };
++    static_assert(sizeof(MetalIRAccelerationStructureHeader) == 64);
++
+     struct MetalDescriptorSetLayout {
+         struct DescriptorSetLayoutBinding {
+             uint32_t binding;
+@@ -216,6 +269,8 @@ namespace plume {
+         std::vector<Descriptor> descriptors;
+         MetalArgumentBuffer argumentBuffer;
+         std::vector<ResourceEntry> resourceEntries;
++        std::vector<MetalConverterDescriptorEntry> converterEntries;
++        std::vector<const MetalAccelerationStructure *> accelerationStructures;
+ 
+         MetalDescriptorSet(MetalDevice *device, const RenderDescriptorSetDesc &desc);
+         MetalDescriptorSet(MetalDevice *device, uint32_t entryCount);
+@@ -225,7 +280,7 @@ namespace plume {
+         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
+         void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override;
+         void setDescriptor(uint32_t descriptorIndex, const Descriptor *descriptor);
+-        void bindImmutableSamplers() const;
++        void bindImmutableSamplers();
+         RenderDescriptorRangeType getDescriptorType(uint32_t binding) const;
+     };
+ 
+@@ -266,7 +321,7 @@ namespace plume {
+     };
+ 
+     struct MetalAttachment {
+-        const MetalTexture *texture = nullptr;
++        const ExtendedRenderTexture *texture = nullptr;
+         const MetalTextureView *textureView = nullptr;
+         RenderFormat format = RenderFormat::UNKNOWN;
+         uint32_t width = 0;
+@@ -356,6 +411,7 @@ namespace plume {
+         MTL::ComputeCommandEncoder *activeComputeEncoder = nullptr;
+         MTL::BlitCommandEncoder *activeBlitEncoder = nullptr;
+         MTL::ComputeCommandEncoder *activeResolveComputeEncoder = nullptr;
++        MTL::AccelerationStructureCommandEncoder *activeAccelerationEncoder = nullptr;
+ 
+         ComputeStateFlags dirtyComputeState{};
+         GraphicsStateFlags dirtyGraphicsState{};
+@@ -444,11 +500,18 @@ namespace plume {
+         const MetalComputeState *activeComputeState = nullptr;
+         MetalDescriptorSet* renderDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
+         MetalDescriptorSet* computeDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
++        MetalDescriptorSet* rayDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
++        const MetalPipelineLayout *activeRayPipelineLayout = nullptr;
++        const MetalRaytracingPipeline *activeRayPipeline = nullptr;
++        std::vector<MTL::Resource *> rayRetainedResources;
++        std::unordered_set<MTL::Resource *> rayRetainedResourceSet;
+ 
+         MTL::Fence *timestampQueryFence = nullptr;
+ 
+         std::unordered_set<MetalDescriptorSet*> currentEncoderDescriptorSets;
+         void bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute);
++        void retainRayResource(MTL::Resource *resource);
++        void ownRayResource(MTL::Resource *resource);
+ 
+         MetalCommandList(const MetalCommandQueue *queue);
+         ~MetalCommandList() override;
+@@ -495,6 +558,7 @@ namespace plume {
+         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
+         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+         void endOtherEncoders(EncoderType type);
++        void endActiveAccelerationEncoder();
+         void checkActiveComputeEncoder();
+         void endActiveComputeEncoder();
+         void checkActiveRenderEncoder();
+@@ -551,6 +615,9 @@ namespace plume {
+ 
+     struct MetalBuffer : RenderBuffer {
+         MTL::Buffer *mtl = nullptr;
++        // RT64 keeps AS backing buffers alive across in-flight frames. Metal's AS is a
++        // separate resource, so keep it on that buffer rather than on the short-lived view.
++        MTL::AccelerationStructure *accelerationStructure = nullptr;
+         MetalPool *pool = nullptr;
+         MetalDevice *device = nullptr;
+         RenderBufferDesc desc;
+@@ -615,6 +682,7 @@ namespace plume {
+         uint64_t offset = 0;
+         uint64_t size = 0;
+         RenderAccelerationStructureType type = RenderAccelerationStructureType::UNKNOWN;
++        mutable std::vector<uint32_t> instanceContributions;
+ 
+         MetalAccelerationStructure(MetalDevice *device, const RenderAccelerationStructureDesc &desc);
+         ~MetalAccelerationStructure() override;
+@@ -683,6 +751,25 @@ namespace plume {
+         RenderPipelineProgram getProgram(const std::string &name) const override;
+     };
+ 
++    struct MetalRaytracingPipeline : MetalPipeline {
++        struct RayGeneration {
++            std::string name;
++            MTL::ComputePipelineState *pipeline = nullptr;
++            MTL::VisibleFunctionTable *visibleTable = nullptr;
++            MTL::IntersectionFunctionTable *intersectionTable = nullptr;
++        };
++
++        bool valid = false;
++        std::vector<MetalIRShaderIdentifier> programIdentifiers;
++        std::vector<RayGeneration> rayGenerations;
++        std::unordered_map<std::string, uint32_t> programIndices;
++        MetalRaytracingPipeline(const MetalDevice *device, const RenderRaytracingPipelineDesc &desc);
++        ~MetalRaytracingPipeline() override;
++        void setName(const std::string &name) override;
++        RenderPipelineProgram getProgram(const std::string &name) const override;
++        bool isValid() const override { return valid; }
++    };
++
+     struct MetalPipelineLayout : RenderPipelineLayout {
+         std::vector<RenderPushConstantRange> pushConstantRanges;
+         uint32_t setLayoutCount = 0;
+diff --git a/src/hle/rt64_present_policy.h b/src/hle/rt64_present_policy.h
+new file mode 100644
+index 0000000..ae6d321
+--- /dev/null
++++ b/src/hle/rt64_present_policy.h
+@@ -0,0 +1,8 @@
++// Original-rate tracing has no disposable interpolated frames. Discarding a present
++// still waits for its expensive workload and can halve visible frame cadence.
++#pragma once
++namespace RT64 {
++inline bool skipQueuedPresent(bool newerQueued, bool tracing, bool originalRate) {
++    return newerQueued && !(tracing && originalRate);
++}
++}
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index f1b0b9f..0f7f8fa 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "rt64_present_queue.h"
++#include "rt64_present_policy.h"
+ 
+ #include "common/rt64_thread.h"
+ #include "rhi/rt64_render_hooks.h"
+@@ -517,6 +518,15 @@ namespace RT64 {
+                 }
+             }
+ 
++#if defined(__APPLE__) && RT_ENABLED
++            {
++                std::scoped_lock<std::mutex> configurationLock(ext.sharedResources->configurationMutex);
++                // The bounded queue already backpressures the producer; retain completed
++                // traced frames at the original rate instead of discarding their GPU work.
++                skipPresent = skipQueuedPresent(skipPresent, ext.sharedResources->rtConfig.level > 0,
++                    ext.sharedResources->userConfig.refreshRate == UserConfiguration::RefreshRate::Original);
++            }
++#endif
+             if (processCursor >= 0) {
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
+                 const bool needsResize = ext.swapChain->needsResize() || !swapChainValid;
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index a1e230e..4527e4f 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -337,7 +337,11 @@ namespace RT64 {
+             uploadProjections = true;
+         }
+ 
+-        const bool processTransforms = prevFrame.matched;
++        bool processTransforms = prevFrame.matched;
++#   if RT_ENABLED
++        // Traced vertices need inverse and previous matrices even without interpolation.
++        processTransforms = processTransforms || workloadConfig.raytracingEnabled;
++#   endif
+         bool uploadTransforms = false;
+         if (processTransforms) {
+             TransformProcessor::ProcessParams transformParams;
+diff --git a/src/render/rt64_descriptor_sets.h b/src/render/rt64_descriptor_sets.h
+index 8b6f4ca..c7c932b 100644
+--- a/src/render/rt64_descriptor_sets.h
++++ b/src/render/rt64_descriptor_sets.h
+@@ -641,7 +641,7 @@ namespace RT64 {
+             gPrevDepth = builder.addReadWriteTexture(6);
+             gPrevNormal = builder.addReadWriteTexture(7);
+             gOutput = builder.addReadWriteTexture(8);
+-            gStats = builder.addReadWriteFormattedBuffer(9);
++            gStats = builder.addReadWriteByteAddressBuffer(9);
+             gVelocity = builder.addReadWriteTexture(10);
+             builder.end();
+ 
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 154ab33..e54267f 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "rt64_framebuffer_renderer.h"
++#include "rt64_raytracing_passes.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -1698,7 +1699,9 @@ namespace RT64 {
+         worker->commandList->setRaytracingDescriptorSet(descTextureSet->get(), 1);
+         worker->commandList->setRaytracingDescriptorSet(descTextureSet->get(), 2);
+         worker->commandList->setRaytracingDescriptorSet(descRealFbSet, 3);
++        rtResources->timerBegin(worker, RaytracingResources::Span::Primary);
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++        rtResources->timerEnd(worker, RaytracingResources::Span::Primary);
+ 
+         // Barriers for shading buffers before dispatching secondary rays.
+         RenderTextureBarrier shadingBarriers[] = {
+@@ -1730,15 +1733,18 @@ namespace RT64 {
+         rtResources->timerEnd(worker, RaytracingResources::Span::Lights);
+ 
+         // The bounce (patch 0007), which the direct pass reads as well.
+-        RT64_LOG_PRINTF("Dispatching indirect light rays");
+-        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 2;
+-        rtResources->timerBegin(worker, RaytracingResources::Span::Bounce);
+-        worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+-        rtResources->timerEnd(worker, RaytracingResources::Span::Bounce);
+-        // The bounce's history with temporal clamping and its spatial filter (patch 0008), in
+-        // place, before the direct pass reads it: one ray a frame with nothing after it was
+-        // most of the grain in shadow.
+-        rtResources->temporalAndFilterBounce(worker, shaderLibrary);
++        const bool bounceEnabled = bouncePassEnabled(rtResources->rtParams.level, float(rtResources->rtParams.tuneBounce.x));
++        if (bounceEnabled) {
++            RT64_LOG_PRINTF("Dispatching indirect light rays");
++            rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 2;
++            rtResources->timerBegin(worker, RaytracingResources::Span::Bounce);
++            worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++            rtResources->timerEnd(worker, RaytracingResources::Span::Bounce);
++            // The bounce's history with temporal clamping and its spatial filter (patch 0008), in
++            // place, before the direct pass reads it: one ray a frame with nothing after it was
++            // most of the grain in shadow.
++            rtResources->temporalAndFilterBounce(worker, shaderLibrary);
++        }
+         // THE RAY TRACING STATE BACK. The step is compute dispatches on this command list, and
+         // they leave the compute pipeline and its layout bound; the direct dispatch after them
+         // ran with those and the device hung on the first traced frame (2026-09-24, found by
+@@ -1769,17 +1775,17 @@ namespace RT64 {
+ 
+         // The volumetric pass (patch 0007). The bounce moved before the direct pass, which reads
+         // it; this reads the primary pass alone and nothing reads it before the composite.
+-        RT64_LOG_PRINTF("Dispatching scatter rays");
+-        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 7;
+-        rtResources->timerBegin(worker, RaytracingResources::Span::Scatter);
+-        worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+-        rtResources->timerEnd(worker, RaytracingResources::Span::Scatter);
++        // PrimaryRayGen clears scatter when the effect is disabled.
++        if (scatterPassEnabled(rtResources->rtParams.level)) {
++            RT64_LOG_PRINTF("Dispatching scatter rays");
++            rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 7;
++            rtResources->timerBegin(worker, RaytracingResources::Span::Scatter);
++            worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++            rtResources->timerEnd(worker, RaytracingResources::Span::Scatter);
++        }
+         worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rtResources->scatterTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL));
+ 
+-        // Dispatch rays for refraction.
+-        RT64_LOG_PRINTF("Dispatching refraction rays");
+-        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 4;
+-        worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++        // RefractionRayGen is empty; DirectRayGen already wrote the fog contribution.
+ 
+         // Wait until refraction is done before dispatching reflection rays.
+         // TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
+@@ -1839,7 +1845,7 @@ namespace RT64 {
+         rtResources->filterDirectLight(worker, shaderLibrary);
+ 
+         // Copy indirect light raw buffer to the first indirect filtered buffer.
+-        bool denoiseGI = rtResources->denoiserEnabled && (rtResources->rtParams.giSamples > 0) && (rtResources->upscalerMode != UpscaleMode::DLSS);
++        bool denoiseGI = bounceEnabled && rtResources->denoiserEnabled && (rtResources->rtParams.giSamples > 0) && (rtResources->upscalerMode != UpscaleMode::DLSS);
+         {
+             RenderTexture *source = rtResources->indirectLightTexture[rtResources->swapBuffers ? 1 : 0].get();
+             RenderTexture *dest = rtResources->filteredIndirectLightTexture[denoiseGI ? 0 : 1].get();
+@@ -2295,7 +2301,9 @@ namespace RT64 {
+ #endif
+ 
+     void FramebufferRenderer::addFramebuffer(const DrawParams &p) {
++#if RT_ENABLED
+         rtFrameSeconds = p.deltaTimeMs;   // patch 0048: the time this displayed frame stands for, in seconds
++#endif
+         assert(p.fbStorage != nullptr);
+         
+         // Setup framebuffer pair data and descriptor set.
+diff --git a/src/render/rt64_raytracing_passes.h b/src/render/rt64_raytracing_passes.h
+new file mode 100644
+index 0000000..5208c02
+--- /dev/null
++++ b/src/render/rt64_raytracing_passes.h
+@@ -0,0 +1,6 @@
++// Decide optional ray work from the effects that actually contribute to the frame.
++#pragma once
++namespace RT64 {
++inline bool bouncePassEnabled(unsigned level, float strength) { return level >= 3 && strength > 0.0f; }
++inline bool scatterPassEnabled(unsigned level) { return level >= 3; }
++}
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index 4afdefb..df81521 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -258,9 +258,9 @@ namespace RT64 {
+             const uint32_t i = uint32_t(span);
+             return (spanFrames[i] > 0) ? (spanMilliseconds[i] / spanFrames[i]) : 0.0;
+         };
+-        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao %.3f lights %.3f gi %.3f reflect %.3f scatter %.3f filter 0.000 ms (gpu), recording %.3f ms, %u frames\n",
++        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao %.3f lights %.3f gi %.3f reflect %.3f scatter %.3f filter 0.000 ms (gpu), recording %.3f ms, %u frames, primary %.3f ms (gpu)\n",
+             (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), spanMs(Span::Occlusion), spanMs(Span::Lights),
+-            spanMs(Span::Bounce), spanMs(Span::Reflections), spanMs(Span::Scatter), recordingMs, buildFrames);
++            spanMs(Span::Bounce), spanMs(Span::Reflections), spanMs(Span::Scatter), recordingMs, buildFrames, spanMs(Span::Primary));
+ 
+         // The reprojection count (patch 0008): pixels that took their history over pixels traced,
+         // on a one in sixty four sample, summed over the second.
+@@ -483,7 +483,7 @@ namespace RT64 {
+         set->setTexture(set->gOutput, scratch, RenderTextureLayout::GENERAL);
+         // The count is one buffer and the shader always adds to it, so the bounce's run adds as
+         // well as the direct light's; the readback halves each frame's words (statsResolve).
+-        set->setBuffer(set->gStats, statsBuffer.get(), 16, statsBufferView.get());
++        set->setBuffer(set->gStats, statsBuffer.get(), 16);
+         set->setTexture(set->gVelocity, shadingSpecularTexture.get(), RenderTextureLayout::GENERAL);   // the hit's motion, or water
+ 
+         RenderTextureBarrier before[] = {
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index 3016f8c..9e89fb9 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -422,6 +422,7 @@ namespace RT64 {
+             Bounce,      // patch 0007
+             Reflections, // patch 0007
+             Scatter,     // patch 0007
++            Primary,     // camera rays, measured separately from lighting
+             Count
+         };
+ 
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index 6d8c6b6..1256778 100644
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -34,7 +34,9 @@
+ #include "shaders/RtDepthResolveCSMS.hlsl.spirv.h"
+ #include "shaders/RtFilterCS1.hlsl.spirv.h"
+ #include "shaders/RtFilterCS2.hlsl.spirv.h"
++#if !defined(OOT_MACOS_RASTER_ONLY)
+ #include "shaders/RtTemporalCS.hlsl.spirv.h"
++#endif
+ #include "shaders/RSPWorldCS.hlsl.spirv.h"
+ #include "shaders/RtCopyColorToDepthPS.hlsl.spirv.h"
+ #include "shaders/RtCopyColorToDepth2XPS.hlsl.spirv.h"
+@@ -85,7 +87,9 @@
+ #   include "shaders/RtDepthResolveCSMS.hlsl.dxil.h"
+ #   include "shaders/RtFilterCS1.hlsl.dxil.h"
+ #   include "shaders/RtFilterCS2.hlsl.dxil.h"
++#   if !defined(OOT_MACOS_RASTER_ONLY)
+ #   include "shaders/RtTemporalCS.hlsl.dxil.h"
++#   endif
+ #   include "shaders/RSPWorldCS.hlsl.dxil.h"
+ #   include "shaders/RtCopyColorToDepthPS.hlsl.dxil.h"
+ #   include "shaders/RtCopyColorToDepth2XPS.hlsl.dxil.h"
+@@ -135,7 +139,9 @@
+ #   include "shaders/RtDepthResolveCSMS.hlsl.metal.h"
+ #   include "shaders/RtFilterCS1.hlsl.metal.h"
+ #   include "shaders/RtFilterCS2.hlsl.metal.h"
++#   if !defined(OOT_MACOS_RASTER_ONLY)
+ #   include "shaders/RtTemporalCS.hlsl.metal.h"
++#   endif
+ #   include "shaders/RSPWorldCS.hlsl.metal.h"
+ #   include "shaders/RtCopyColorToDepthPS.hlsl.metal.h"
+ #   include "shaders/RtCopyColorToDepth2XPS.hlsl.metal.h"
+@@ -279,6 +285,7 @@ namespace RT64 {
+             bicubicScaling.pipelineLayout = layoutBuilder.create(device);
+             
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(BicubicScalingCSBlobDXIL, BicubicScalingCSBlobSPIRV, BicubicScalingCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("BicubicScalingCS");
+             RenderComputePipelineDesc pipelineDesc(bicubicScaling.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             bicubicScaling.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -293,6 +300,7 @@ namespace RT64 {
+             boxFilter.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(BoxFilterCSBlobDXIL, BoxFilterCSBlobSPIRV, BoxFilterCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("BoxFilterCS");
+             RenderComputePipelineDesc pipelineDesc(boxFilter.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             boxFilter.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -369,6 +377,7 @@ namespace RT64 {
+             idle.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(IdleCSBlobDXIL, IdleCSBlobSPIRV, IdleCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("IdleCS");
+             RenderComputePipelineDesc pipelineDesc(idle.pipelineLayout.get(), computeShader.get(), 1, 1, 1);
+             idle.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -382,6 +391,7 @@ namespace RT64 {
+             fbChangesClear.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesClearCSBlobDXIL, FbChangesClearCSBlobSPIRV, FbChangesClearCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("FbChangesClearCS");
+             RenderComputePipelineDesc pipelineDesc(fbChangesClear.pipelineLayout.get(), computeShader.get(), 1, 1, 1);
+             fbChangesClear.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -399,9 +409,11 @@ namespace RT64 {
+             fbReadAnyFull.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> anyChangesShader = device->createShader(CREATE_SHADER_INPUTS(FbReadAnyChangesCSBlobDXIL, FbReadAnyChangesCSBlobSPIRV, FbReadAnyChangesCSBlobMSL, "CSMain", shaderFormat));
++            anyChangesShader->setName("FbReadAnyChangesCS");
+             fbReadAnyChanges.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbReadAnyChanges.pipelineLayout.get(), anyChangesShader.get(), 8, 8, 1));
+ 
+             std::unique_ptr<RenderShader> fullShader = device->createShader(CREATE_SHADER_INPUTS(FbReadAnyFullCSBlobDXIL, FbReadAnyFullCSBlobSPIRV, FbReadAnyFullCSBlobMSL, "CSMain", shaderFormat));
++            fullShader->setName("FbReadAnyFullCS");
+             fbReadAnyFull.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbReadAnyFull.pipelineLayout.get(), fullShader.get(), 8, 8, 1));
+         }
+ 
+@@ -415,6 +427,7 @@ namespace RT64 {
+             fbReinterpret.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(FbReinterpretCSBlobDXIL, FbReinterpretCSBlobSPIRV, FbReinterpretCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("FbReinterpretCS");
+             RenderComputePipelineDesc pipelineDesc(fbReinterpret.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             fbReinterpret.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -433,12 +446,15 @@ namespace RT64 {
+             fbWriteDepthMS.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> colorShader = device->createShader(CREATE_SHADER_INPUTS(FbWriteColorCSBlobDXIL, FbWriteColorCSBlobSPIRV, FbWriteColorCSBlobMSL, "CSMain", shaderFormat));
++            colorShader->setName("FbWriteColorCS");
+             fbWriteColor.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbWriteColor.pipelineLayout.get(), colorShader.get(), 8, 8, 1));
+ 
+             std::unique_ptr<RenderShader> depthShader = device->createShader(CREATE_SHADER_INPUTS(FbWriteDepthCSBlobDXIL, FbWriteDepthCSBlobSPIRV, FbWriteDepthCSBlobMSL, "CSMain", shaderFormat));
++            depthShader->setName("FbWriteDepthCS");
+             fbWriteDepth.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbWriteDepth.pipelineLayout.get(), depthShader.get(), 8, 8, 1));
+ 
+             std::unique_ptr<RenderShader> depthShaderMS = device->createShader(CREATE_SHADER_INPUTS(FbWriteDepthCSMSBlobDXIL, FbWriteDepthCSMSBlobSPIRV, FbWriteDepthCSMSBlobMSL, "CSMain", shaderFormat));
++            depthShaderMS->setName("FbWriteDepthCSMS");
+             fbWriteDepthMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbWriteDepthMS.pipelineLayout.get(), depthShaderMS.get(), 8, 8, 1));
+         }
+ 
+@@ -452,6 +468,7 @@ namespace RT64 {
+             gaussianFilterRGB3x3.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(GaussianFilterRGB3x3CSBlobDXIL, GaussianFilterRGB3x3CSBlobSPIRV, GaussianFilterRGB3x3CSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("GaussianFilterRGB3x3CS");
+             RenderComputePipelineDesc pipelineDesc(gaussianFilterRGB3x3.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             gaussianFilterRGB3x3.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -466,6 +483,7 @@ namespace RT64 {
+             histogramAverage.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramAverageCSBlobDXIL, HistogramAverageCSBlobSPIRV, HistogramAverageCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("HistogramAverageCS");
+             RenderComputePipelineDesc pipelineDesc(histogramAverage.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             histogramAverage.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -479,6 +497,7 @@ namespace RT64 {
+             histogramClear.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramClearCSBlobDXIL, HistogramClearCSBlobSPIRV, HistogramClearCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("HistogramClearCS");
+             RenderComputePipelineDesc pipelineDesc(histogramClear.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             histogramClear.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -493,6 +512,7 @@ namespace RT64 {
+             histogramSet.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramSetCSBlobDXIL, HistogramSetCSBlobSPIRV, HistogramSetCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("HistogramSetCS");
+             RenderComputePipelineDesc pipelineDesc(histogramSet.pipelineLayout.get(), computeShader.get(), 1, 1, 1);
+             histogramSet.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -507,6 +527,7 @@ namespace RT64 {
+             luminanceHistogram.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(LuminanceHistogramCSBlobDXIL, LuminanceHistogramCSBlobSPIRV, LuminanceHistogramCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("LuminanceHistogramCS");
+             RenderComputePipelineDesc pipelineDesc(luminanceHistogram.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             luminanceHistogram.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -521,6 +542,7 @@ namespace RT64 {
+             rspModify.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPModifyCSBlobDXIL, RSPModifyCSBlobSPIRV, RSPModifyCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("RSPModifyCS");
+             RenderComputePipelineDesc pipelineDesc(rspModify.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspModify.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -535,6 +557,7 @@ namespace RT64 {
+             rspProcess.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPProcessCSBlobDXIL, RSPProcessCSBlobSPIRV, RSPProcessCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("RSPProcessCS");
+             RenderComputePipelineDesc pipelineDesc(rspProcess.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspProcess.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -549,6 +572,7 @@ namespace RT64 {
+             rspSmoothNormal.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPSmoothNormalCSBlobDXIL, RSPSmoothNormalCSBlobSPIRV, RSPSmoothNormalCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("RSPSmoothNormalCS");
+             RenderComputePipelineDesc pipelineDesc(rspSmoothNormal.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspSmoothNormal.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -563,6 +587,7 @@ namespace RT64 {
+             rspWorld.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPWorldCSBlobDXIL, RSPWorldCSBlobSPIRV, RSPWorldCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("RSPWorldCS");
+             RenderComputePipelineDesc pipelineDesc(rspWorld.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspWorld.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -597,6 +622,7 @@ namespace RT64 {
+             textureDecode.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(TextureDecodeCSBlobDXIL, TextureDecodeCSBlobSPIRV, TextureDecodeCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("TextureDecodeCS");
+             RenderComputePipelineDesc pipelineDesc(textureDecode.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             textureDecode.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -932,9 +958,11 @@ namespace RT64 {
+             rspVertexTestZMS.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPVertexTestZCSBlobDXIL, RSPVertexTestZCSBlobSPIRV, RSPVertexTestZCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("RSPVertexTestZCS");
+             rspVertexTestZ.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rspVertexTestZ.pipelineLayout.get(), computeShader.get(), 1, 1, 1));
+ 
+             std::unique_ptr<RenderShader> computeShaderMS = device->createShader(CREATE_SHADER_INPUTS(RSPVertexTestZCSMSBlobDXIL, RSPVertexTestZCSMSBlobSPIRV, RSPVertexTestZCSMSBlobMSL, "CSMain", shaderFormat));
++            computeShaderMS->setName("RSPVertexTestZCSMS");
+             rspVertexTestZMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rspVertexTestZMS.pipelineLayout.get(), computeShaderMS.get(), 1, 1, 1));
+         }
+ 
+@@ -948,9 +976,11 @@ namespace RT64 {
+             rtDepthResolveMS.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RtDepthResolveCSBlobDXIL, RtDepthResolveCSBlobSPIRV, RtDepthResolveCSBlobMSL, "CSMain", shaderFormat));
++            computeShader->setName("RtDepthResolveCS");
+             rtDepthResolve.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtDepthResolve.pipelineLayout.get(), computeShader.get(), 8, 8, 1));
+ 
+             std::unique_ptr<RenderShader> computeShaderMS = device->createShader(CREATE_SHADER_INPUTS(RtDepthResolveCSMSBlobDXIL, RtDepthResolveCSMSBlobSPIRV, RtDepthResolveCSMSBlobMSL, "CSMain", shaderFormat));
++            computeShaderMS->setName("RtDepthResolveCSMS");
+             rtDepthResolveMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtDepthResolveMS.pipelineLayout.get(), computeShaderMS.get(), 8, 8, 1));
+         }
+ 
+@@ -964,13 +994,16 @@ namespace RT64 {
+             rtFilter2.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> filterShader1 = device->createShader(CREATE_SHADER_INPUTS(RtFilterCS1BlobDXIL, RtFilterCS1BlobSPIRV, RtFilterCS1BlobMSL, "CSMain", shaderFormat));
++            filterShader1->setName("RtFilterCS1");
+             rtFilter1.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtFilter1.pipelineLayout.get(), filterShader1.get(), 8, 8, 1));
+ 
+             std::unique_ptr<RenderShader> filterShader2 = device->createShader(CREATE_SHADER_INPUTS(RtFilterCS2BlobDXIL, RtFilterCS2BlobSPIRV, RtFilterCS2BlobMSL, "CSMain", shaderFormat));
++            filterShader2->setName("RtFilterCS2");
+             rtFilter2.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtFilter2.pipelineLayout.get(), filterShader2.get(), 8, 8, 1));
+         }
+ 
+         // The direct light's history with temporal clamping (patch 0008).
++#if !defined(OOT_MACOS_RASTER_ONLY)
+         {
+             RtTemporalDescriptorSet descriptorSet;
+             layoutBuilder.begin();
+@@ -979,8 +1012,10 @@ namespace RT64 {
+             rtTemporal.pipelineLayout = layoutBuilder.create(device);
+ 
+             std::unique_ptr<RenderShader> temporalShader = device->createShader(CREATE_SHADER_INPUTS(RtTemporalCSBlobDXIL, RtTemporalCSBlobSPIRV, RtTemporalCSBlobMSL, "CSMain", shaderFormat));
++            temporalShader->setName("RtTemporalCS");
+             rtTemporal.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rtTemporal.pipelineLayout.get(), temporalShader.get(), 8, 8, 1));
+         }
++#endif
+ 
+         // Texture Resolve.
+         if (TextureResolvePSBlob != nullptr) {
+diff --git a/src/render/rt64_transform_processor.cpp b/src/render/rt64_transform_processor.cpp
+index cd8004d..1c211fb 100644
+--- a/src/render/rt64_transform_processor.cpp
++++ b/src/render/rt64_transform_processor.cpp
+@@ -64,7 +64,9 @@ namespace RT64 {
+                 for (size_t t = 0; t < drawData.worldTransforms.size(); t++) {
+                     invMatrix = hlslpp::inverse(drawData.worldTransforms[t]);
+                     invTMatrix = hlslpp::transpose(invMatrix);
++                    lerpWorldTransforms.push_back(drawData.worldTransforms[t]);
+                     invTWorldTransforms.push_back(invTMatrix);
++                    prevWorldTransforms.push_back(drawData.worldTransforms[t]);
+                 }
+             }
+         }
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+index a8b0443..95ce0dc 100644
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -23,6 +23,7 @@
+ //
+ 
+ #include "Color.hlsli"
++#include "shared/rt64_packed_indices.h"
+ #include "FbRendererCommon.hlsli"
+ #include "FbRendererRT.hlsli"
+ #include "BlueNoise.hlsli"
+@@ -1331,7 +1332,7 @@ void DirectRayGen() {
+         if (RtParams.tuneFade.x > 0.0f) {
+             const uint faceStart = instanceRenderIndices[uint(gInstanceId[launchIndex])].faceIndicesStart;
+             const uint vertexIndex = indexBuffer.Load(faceStart * 4);
+-            const uint fogIndex = srcFogIndices.Load(vertexIndex * 4);
++            const uint fogIndex = unpackIndex16(srcFogIndices.Load(packedIndex16WordOffset(vertexIndex)), vertexIndex);
+             if (fogIndex > 0) {
+                 const RSPFog rspFog = RSPFogVector[fogIndex - 1];
+                 const float4 clip = mul(RtParams.viewProj, float4(position, 1.0f));
+diff --git a/src/shaders/RtFilterCS.hlsl b/src/shaders/RtFilterCS.hlsl
+index 3f00db5..f76230c 100644
+--- a/src/shaders/RtFilterCS.hlsl
++++ b/src/shaders/RtFilterCS.hlsl
+@@ -30,23 +30,49 @@ float luminance(float3 c) {
+     return dot(c, float3(0.299f, 0.587f, 0.114f));
+ }
+ 
++// All lanes load the shared halo before any lane can return, including partial groups.
++static const uint TileWidth = 8 + 4 * STEP;
++groupshared float4 tileInput[TileWidth * TileWidth];
++groupshared float3 tilePosition[TileWidth * TileWidth];
++groupshared float3 tileNormal[TileWidth * TileWidth];
++groupshared int tileInstance[TileWidth * TileWidth];
++
+ [numthreads(8, 8, 1)]
+-void CSMain(uint2 pixel : SV_DispatchThreadID) {
++void CSMain(uint2 pixel : SV_DispatchThreadID, uint2 group : SV_GroupID,
++            uint2 local : SV_GroupThreadID, uint lane : SV_GroupIndex) {
+     uint width;
+     uint height;
+     gOutput.GetDimensions(width, height);
++    const int2 origin = int2(group * 8) - 2 * STEP;
++    for (uint index = lane; index < TileWidth * TileWidth; index += 64) {
++        const int2 source = origin + int2(index % TileWidth, index / TileWidth);
++        if (all(source >= 0) && source.x < int(width) && source.y < int(height)) {
++            tileInput[index] = gInput[source];
++            tilePosition[index] = gPosition[source].xyz;
++            tileNormal[index] = gNormal[source].xyz;
++            tileInstance[index] = gInstance[source];
++        }
++        else {
++            tileInput[index] = 0;
++            tilePosition[index] = 0;
++            tileNormal[index] = 0;
++            tileInstance[index] = -1;
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++    const uint centerIndex = (local.y + 2 * STEP) * TileWidth + local.x + 2 * STEP;
+     if ((pixel.x >= width) || (pixel.y >= height)) {
+         return;
+     }
+ 
+-    const float4 center = gInput[pixel];
+-    if (gInstance[pixel] < 0) {
++    const float4 center = tileInput[centerIndex];
++    if (tileInstance[centerIndex] < 0) {
+         gOutput[pixel] = center;
+         return;
+     }
+ 
+-    const float3 normal = gNormal[pixel].xyz;
+-    const float3 position = gPosition[pixel].xyz;
++    const float3 normal = tileNormal[centerIndex];
++    const float3 position = tilePosition[centerIndex];
+     const float centerLuma = luminance(center.rgb);
+     float3 sum = 0.0f;
+     float weightSum = 0.0f;
+@@ -57,21 +83,22 @@ void CSMain(uint2 pixel : SV_DispatchThreadID) {
+                 continue;
+             }
+ 
+-            if (gInstance[tap] < 0) {
++            const uint tapIndex = int(centerIndex) + j * STEP * int(TileWidth) + i * STEP;
++            if (tileInstance[tapIndex] < 0) {
+                 continue;
+             }
+ 
+             float weight = Kernel[i + 2] * Kernel[j + 2];
+-            const float3 tapNormal = gNormal[tap].xyz;
++            const float3 tapNormal = tileNormal[tapIndex];
+             weight *= pow(saturate(dot(normal, tapNormal)), NormalPower);
+ 
+-            const float3 offset = gPosition[tap].xyz - position;
++            const float3 offset = tilePosition[tapIndex] - position;
+             const float distance = length(offset);
+             if (distance > 0.0f) {
+                 weight *= saturate(1.0f - PlaneSlope * abs(dot(normal, offset)) / distance);
+             }
+ 
+-            const float4 value = gInput[tap];
++            const float4 value = tileInput[tapIndex];
+             weight *= exp(-abs(luminance(value.rgb) - centerLuma) / FactorSigma);
+             sum += value.rgb * weight;
+             weightSum += weight;
+diff --git a/src/shaders/RtTemporalCS.hlsl b/src/shaders/RtTemporalCS.hlsl
+index 37d5b5c..f8651ae 100644
+--- a/src/shaders/RtTemporalCS.hlsl
++++ b/src/shaders/RtTemporalCS.hlsl
+@@ -26,7 +26,7 @@ RWTexture2D<int> gInstance : register(u5);
+ RWTexture2D<float> gPrevDepth : register(u6);
+ RWTexture2D<float4> gPrevNormal : register(u7);
+ RWTexture2D<float4> gOutput : register(u8);      // the accumulated factor for this frame
+-RWBuffer<uint> gStats : register(u9);            // [0] accepted, [1] traced, on one pixel in 64
++RWByteAddressBuffer gStats : register(u9);        // byte offsets 0 accepted, 4 traced; one pixel in 64
+ RWTexture2D<float4> gVelocity : register(u10);   // the hit's motion since the previous presented frame (xyz) where w is 0; water otherwise
+ 
+ static const float ClampMargin = 0.02f;
+@@ -164,9 +164,9 @@ void CSMain(uint2 pixel : SV_DispatchThreadID) {
+     if (((pixel.x & 7) == 0) && ((pixel.y & 7) == 0)) {
+         uint previous;
+         if (accepted) {
+-            InterlockedAdd(gStats[0], 1u, previous);
++            gStats.InterlockedAdd(0, 1u, previous);
+         }
+-        InterlockedAdd(gStats[1], 1u, previous);
++        gStats.InterlockedAdd(4, 1u, previous);
+     }
+ 
+     gOutput[pixel] = float4(result, age);
+diff --git a/src/shared/rt64_packed_indices.h b/src/shared/rt64_packed_indices.h
+new file mode 100644
+index 0000000..b050fe3
+--- /dev/null
++++ b/src/shared/rt64_packed_indices.h
+@@ -0,0 +1,11 @@
++// Packed uint16 indices shared by the CPU upload format and ray shaders.
++#pragma once
++#include "shared/rt64_hlsl.h"
++#ifdef HLSL_CPU
++namespace interop {
++#endif
++inline uint packedIndex16WordOffset(uint index) { return (index >> 1u) * 4u; }
++inline uint unpackIndex16(uint word, uint index) { return (word >> ((index & 1u) * 16u)) & 0xffffu; }
++#ifdef HLSL_CPU
++}
++#endif
+diff --git a/src/tools/spirv_cross_msl/spirv_cross_msl.cpp b/src/tools/spirv_cross_msl/spirv_cross_msl.cpp
+index 2ddad6e..1281d5a 100644
+--- a/src/tools/spirv_cross_msl/spirv_cross_msl.cpp
++++ b/src/tools/spirv_cross_msl/spirv_cross_msl.cpp
+@@ -2,6 +2,7 @@
+ #include "spirv_parser.hpp"
+ #include <iostream>
+ #include <vector>
++#include <algorithm>
+ #include <regex>
+ #include <sstream>
+ 
+@@ -95,12 +96,12 @@ std::string pad_descriptor_sets(const std::string& source) {
+             if (line_id == -1) {
+                 throw std::runtime_error("Could not extract id from line: " + line);
+             }
+-            while (current_id != line_id) {
++            while (current_id < line_id) {
+                 result << default_resource_prefix << current_id << " [[id(" << current_id << ")]];" << std::endl;
+                 current_id++;
+             }
+             // Current line id consumes the current id
+-            current_id++;
++            current_id = std::max(current_id, line_id + 1);
+         }
+ 
+         result << line << std::endl;
+@@ -126,7 +127,7 @@ int main(int argc, char* argv[]) {
+ 
+         // Configure MSL options
+         spirv_cross::CompilerMSL::Options msl_options;
+-        msl_options.msl_version = spirv_cross::CompilerMSL::Options::make_msl_version(2, 1);
++        msl_options.msl_version = spirv_cross::CompilerMSL::Options::make_msl_version(3, 0);
+         msl_options.argument_buffers = true;
+         msl_options.texture_buffer_native = true;
+         msl_options.enable_decoration_binding = true;
