@@ -38,7 +38,9 @@
 #include "hle/rt64_present_queue.h"
 // The D3D12 device behind plume's interface, for the removed device report (report_gpu_state):
 // the device removed reason and the breadcrumbs are D3D12's own and have no plume surface.
+#if defined(_WIN32)
 #include "plume/plume_d3d12.h"
+#endif
 
 #include "librecomp/game.hpp"
 #include "ultramodern/ultramodern.hpp"
@@ -119,6 +121,7 @@ namespace {
     // cost a little every frame, and the report is for bring-up and for bug reports.
     bool g_gpu_breadcrumbs = false;
 
+#if defined(_WIN32)
     void enable_gpu_breadcrumbs() {
         ID3D12DeviceRemovedExtendedDataSettings* settings = nullptr;
         if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&settings))) || settings == nullptr) {
@@ -175,6 +178,11 @@ namespace {
             default: return "an unknown reason";
         }
     }
+#else
+    void enable_gpu_breadcrumbs() {
+        std::fprintf(stderr, "[gpu] D3D12 breadcrumbs are unavailable on Metal\n");
+    }
+#endif
 
     // Phase 53: what the harness asked for on the command line, applied once after setup. When
     // given, the flag wins over the lighting file's level and view for the run (phase 57), so
@@ -578,7 +586,12 @@ oot::renderer::RT64Context::RT64Context(uint8_t* rdram,
     static unsigned char dummy_rom_header[0x40]{};
 
     RT64::Application::Core appCore{};
+#if defined(_WIN32)
     appCore.window = window_handle.window;
+#elif defined(__APPLE__)
+    appCore.window.window = window_handle.window;
+    appCore.window.view = window_handle.view;
+#endif
     appCore.checkInterrupts = dummy_check_interrupts;
 
     appCore.HEADER = dummy_rom_header;
@@ -711,7 +724,11 @@ oot::renderer::RT64Context::RT64Context(uint8_t* rdram,
         enable_gpu_breadcrumbs();
     }
 
+#if defined(_WIN32)
     setup_result = map_setup_result(app->setup(window_handle.thread_id));
+#else
+    setup_result = map_setup_result(app->setup(0));
+#endif
     chosen_api = map_graphics_api(app->chosenGraphicsAPI);
 
     if (setup_result != ultramodern::renderer::SetupResult::Success) {
@@ -1081,6 +1098,7 @@ void oot::renderer::request_gpu_breadcrumbs() {
 }
 
 void oot::renderer::report_gpu_state() {
+#if defined(_WIN32)
     if (g_app == nullptr || g_app->device == nullptr) {
         return;
     }
@@ -1152,6 +1170,9 @@ void oot::renderer::report_gpu_state() {
         }
     }
     dred->Release();
+#else
+    std::fprintf(stderr, "[gpu] Metal device diagnostics are not yet implemented\n");
+#endif
 }
 
 plume::RenderTexture* oot::renderer::swap_chain_texture(const plume::RenderFramebuffer* framebuffer) {

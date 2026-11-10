@@ -14,6 +14,10 @@
 #include "ui/ui_render.h"
 #include "ui/ui_settings.h"
 #include "ui/ui_lighting.h"
+#if defined(__APPLE__)
+#include "ui/macos_gameplay_presets.h"
+#include "game/texture_packs.h"
+#endif
 #include "ui/ui_system.h"
 #include "ui/models/rows_model.h"
 #include "ui/models/shell_model.h"
@@ -34,6 +38,7 @@
 #include "main/install.h"
 #include "main/shots.h"
 #include "main/updates.h"
+#include "main/local_time.h"
 
 #include <algorithm>
 #include <cmath>
@@ -51,9 +56,15 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <shellapi.h>
+#elif defined(__APPLE__)
+#include <crt_externs.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#endif
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Elements/ElementFormControl.h>
@@ -749,8 +760,65 @@ namespace {
     // in the settings that opens it, LightingReset the sub menu's last row (2026-09-24).
     // LightingSweep is the sub menu's harness row: every option of every row captured in turn
     // (main/sweep.h, the user's ask of 2026-09-24).
+#if defined(__APPLE__)
+    bool g_macos_advanced = false;
+    int g_macos_last_pack = 0;
+    int g_macos_status_row = -1;
+    std::string g_macos_status;
+
+    int macos_count(int row) {
+        if (row == 1) return oot::packs::list().empty() ? 1 : 3;
+        if (row == 2) {
+#if defined(OOT_MACOS_TRACING_APP)
+            return oot::rt_state::supported() ? 4 : 1;
+#else
+            return 1;
+#endif
+        }
+        return 3;
+    }
+    int macos_value(int row) {
+        if (macos_count(row) == 1) return 0;
+        if (row == 0) return oot::ui::macos::picture_choice(oot::ui::settings());
+        if (row == 1) return oot::ui::macos::texture_choice(oot::ui::settings());
+        return oot::ui::macos::lighting_choice(oot::ui::lighting::current());
+    }
+    const char* macos_label(int row, int value) {
+        if (value < 0) return "Custom";
+        const char* picture[] = { "Low", "Medium", "High" };
+        const char* textures[] = { "Original", "Enhanced", "Maximum" };
+        const char* lighting[] = { "Off", "Low", "Medium", "High" };
+        return row == 0 ? picture[value] : (row == 1 ? textures[value] : lighting[value]);
+    }
+    void macos_set(int row, int value) {
+        if (row < 0 || row > 2 || value < 0 || value >= macos_count(row)) return;
+        auto settings = oot::ui::settings();
+        auto lighting = oot::ui::lighting::current();
+        bool saved = false;
+        if (row == 0) {
+            oot::ui::macos::picture_quality(value, settings);
+            saved = oot::ui::apply(settings);
+        } else if (row == 1) {
+            if (settings.texture_pack > 0) g_macos_last_pack = settings.texture_pack;
+            if (!oot::ui::macos::texture_quality(value, static_cast<int>(oot::packs::list().size()),
+                                                g_macos_last_pack, settings)) return;
+            saved = oot::ui::apply(settings);
+        } else {
+            oot::ui::macos::lighting_quality(value, lighting);
+            saved = oot::ui::lighting::apply(lighting);
+        }
+        g_macos_status_row = row;
+        g_macos_status = saved ? "" : " Applied for now, but settings could not be saved.";
+        std::fprintf(stderr, "[graphics] control=%d choice=%d saved=%d\n", row, value, saved);
+    }
+#endif
+
     enum class RowKind { Setting, Rom, Controls, Files, Moments, Debug, Play, Quit, Lighting, LightingMenu, LightingReset, LightingSweep, Warps, TimeOfDay, Piece, HudMenu,
-                         CapturePhoto, CaptureVideo };
+                         CapturePhoto, CaptureVideo
+#if defined(__APPLE__)
+                         , MacSimple, MacAdvanced
+#endif
+                         };
 
     struct RowSpec {
         RowKind kind = RowKind::Setting;
@@ -779,8 +847,12 @@ namespace {
         static const int resize_refresh = oot::ui::row_index("resizerefresh");
         static const int scale_reload = oot::ui::row_index("scalereload");
         static const int smooth_scroll = oot::ui::row_index("smoothscroll");
+#if defined(__APPLE__)
+        return (row >= 0) && (row == resize_refresh || row == scale_reload || row == smooth_scroll);
+#else
         return (row >= 0) && (row == recorder || row == length || row == comparison || row == resize_refresh ||
                               row == scale_reload || row == smooth_scroll);
+#endif
     }
 
     // COMPARISON SHOTS SHOWS ONLY WHILE SCREENSHOTS IS ON (the user, 2026-10-09: "this being enabled
@@ -1003,6 +1075,15 @@ namespace {
             }
         };
         if (screen == Screen::Graphics) {
+#if defined(__APPLE__)
+            for (int control = 0; control < 3; ++control)
+                rows.push_back(RowSpec{ RowKind::MacSimple, control });
+            rows.push_back(RowSpec{ RowKind::MacAdvanced, 0 });
+            if (!g_macos_advanced) {
+                rows.push_back(RowSpec{ RowKind::Quit, 0 });
+                return rows;
+            }
+#endif
             for (const char* key : { "window", "resolution", "downsampling", "aspect", "antialiasing", "renderdistance",
                                      "framerate", "counter", "texturepack" }) {
                 add(key);
@@ -1013,6 +1094,10 @@ namespace {
                 add("texturedetail");
             }
             rows.push_back(RowSpec{ RowKind::LightingMenu, 0 });
+#if defined(__APPLE__)
+            rows.push_back(RowSpec{ RowKind::Files, 0 });
+            rows.push_back(RowSpec{ RowKind::Quit, 0 });
+#endif
             return rows;
         }
         if (screen == Screen::Gameplay) {
@@ -1058,7 +1143,11 @@ namespace {
             return rows;
         }
         // Settings itself: the program, not the game.
-        for (const char* key : { "updates", "autosave", "saveonquit", "resumeonstart", "menu", "interfacesize", "volume",
+        for (const char* key : {
+#if !defined(__APPLE__)
+                                 "updates",
+#endif
+                                 "autosave", "saveonquit", "resumeonstart", "menu", "interfacesize", "volume",
                                  "menusounds" }) {
             add(key);
         }
@@ -1410,6 +1499,38 @@ namespace {
                                  [setting](int i) { return oot::ui::lighting::option_label(setting, i); });
                     break;
                 }
+#if defined(__APPLE__)
+                case RowKind::MacSimple: {
+                    const int control = specs[i].setting;
+                    const char* labels[] = { "Picture quality", "Textures", "Lighting effects" };
+                    const char* notes[] = {
+                        "High gives the sharpest picture. Try Medium or Low if play feels slow.",
+                        "Enhanced artwork uses an installed texture pack. Maximum keeps its finest detail.",
+                        "Richer light and shadows. Turn this down for smoother play." };
+                    const int value = macos_value(control), count = macos_count(control);
+                    row.label = labels[control];
+                    row.value = macos_label(control, value);
+                    row.note = notes[control];
+                    if (control == 1 && count == 1)
+                        row.note = "No texture pack installed. Add one through Advanced, then Your files, and restart the app.";
+                    else if (control == 1 && s.texture_pack > 0)
+                        row.note += " Using: " + std::string(oot::packs::label_for(s.texture_pack)) + ".";
+                    if (control == 2 && count == 1)
+                        row.note = "Extra lighting effects are unavailable on this device or app build.";
+                    if (value < 0) row.note += " Choose a preset to replace this group's custom setup.";
+                    if (g_macos_status_row == control) row.note += g_macos_status;
+                    row.shape = oot::ui::rows::Stepper;
+                    row.low = value <= 0; row.high = value >= count - 1;
+                    row.icon = control == 0 ? "monitor" : (control == 1 ? "layers" : "sun");
+                    draw_options(row, count, value, [control](int v) { return macos_label(control, v); });
+                    break;
+                }
+                case RowKind::MacAdvanced:
+                    row.label = g_macos_advanced ? "Hide advanced settings" : "Advanced settings";
+                    row.value = g_macos_advanced ? "Show fewer controls" : "Optional fine-tuning";
+                    row.shape = oot::ui::rows::Action;
+                    break;
+#endif
                 case RowKind::LightingMenu:
                     row.label = "Lighting";
                     row.value = "Switch each part of it on or off, and tune it";
@@ -1594,6 +1715,15 @@ namespace {
             return;
         }
         const RowSpec spec = specs[static_cast<size_t>(index)];
+#if defined(__APPLE__)
+        if (spec.kind == RowKind::MacSimple) {
+            macos_set(spec.setting, wanted);
+            g_focus = index;
+            refresh_rows(g_screen);
+            apply_rows_focus(g_screen);
+            return;
+        }
+#endif
         const auto now = [&spec]() {
             return spec.kind == RowKind::Lighting ? oot::ui::lighting::get_row(oot::ui::lighting::current(), spec.setting)
                                                   : oot::ui::get_row(oot::ui::settings(), spec.setting);
@@ -1621,6 +1751,17 @@ namespace {
         if (index < 0 || index >= static_cast<int>(specs.size())) {
             return;
         }
+#if defined(__APPLE__)
+        if (specs[index].kind == RowKind::MacSimple) {
+            const int control = specs[index].setting;
+            const int current = macos_value(control);
+            macos_set(control, current < 0 ? 0 : current + (id.compare(0, 5, "prev-") == 0 ? -1 : 1));
+            g_focus = index;
+            refresh_rows(g_screen);
+            apply_rows_focus(g_screen);
+            return;
+        }
+#endif
         if (specs[index].kind != RowKind::Setting && specs[index].kind != RowKind::Lighting &&
             specs[index].kind != RowKind::TimeOfDay && specs[index].kind != RowKind::Piece) {
             return;
@@ -1860,6 +2001,13 @@ namespace {
                     }
                     apply_rows_focus(screen);
                 }
+#if defined(__APPLE__)
+                else if (spec.kind == RowKind::MacSimple) {
+                    const int current = macos_value(spec.setting);
+                    macos_set(spec.setting, current < 0 ? 0 : current + (nav == Nav::Right ? 1 : -1));
+                    refresh_rows(screen);
+                }
+#endif
                 else if (spec.kind == RowKind::Setting) {
                     nudge_setting(spec.setting, nav == Nav::Right ? 1 : -1);
                     refresh_rows(screen);
@@ -1917,6 +2065,16 @@ namespace {
                     case RowKind::CaptureVideo:
                         show(Screen::Video);
                         break;
+#if defined(__APPLE__)
+                    case RowKind::MacSimple:
+                        macos_set(spec.setting, (macos_value(spec.setting) + 1) % macos_count(spec.setting));
+                        refresh_rows(screen);
+                        break;
+                    case RowKind::MacAdvanced:
+                        g_macos_advanced = !g_macos_advanced;
+                        refresh_rows(screen);
+                        break;
+#endif
                     case RowKind::LightingReset:
                         oot::ui::lighting::apply(oot::ui::lighting::defaults());
                         refresh_rows(screen);
@@ -2107,7 +2265,9 @@ namespace {
         rows.push_back({ "Texture packs", oot::places::texture_packs(), oot::places::texture_packs() });
         rows.push_back({ "Settings", settings, settings.parent_path() });
         rows.push_back({ "Controls", controls, controls.parent_path() });
+#if !defined(__APPLE__)
         rows.push_back({ "Recordings", oot::places::captures(), oot::places::captures() });
+#endif
 
         // The ROM is the user's own file in the user's own place, and saying exactly where it is
         // matters more here than anywhere else on this screen: this program reads it where it
@@ -2118,6 +2278,9 @@ namespace {
                          rom.empty() ? std::filesystem::path() : rom.parent_path() });
 
         if (oot::places::mode() == oot::places::Mode::Installed) {
+#if defined(__APPLE__)
+            // The local Mac build has no installer or shortcuts.
+#else
             const oot::install::Options chosen = oot::install::options();
             if (chosen.start_menu) {
                 const std::filesystem::path link = oot::install::shortcut_path();
@@ -2127,6 +2290,7 @@ namespace {
                 const std::filesystem::path link = oot::install::desktop_shortcut_path();
                 rows.push_back({ "Desktop shortcut", link, link.parent_path() });
             }
+#endif
         }
         return rows;
     }
@@ -2169,7 +2333,11 @@ namespace {
 
         std::string mode = oot::places::mode_word();
         if (oot::places::mode() == oot::places::Mode::Installed) {
+#if defined(__APPLE__)
+            mode = "local macOS build";
+#else
             mode += ", version " + oot::places::installed_version();
+#endif
         }
         else {
             mode += ", nothing was installed on this machine";
@@ -2200,11 +2368,15 @@ namespace {
         // Uninstalling removes the program and nothing of the person's (install.h, remove_program).
         set_text(g_files_doc, "files-left-label", g_remove_armed ? "No, keep it" : "Close");
         if (oot::places::mode() == oot::places::Mode::Installed) {
+#if defined(__APPLE__)
+            set_text(g_files_doc, "files-foot", "Click a row, or its Open, to open that folder");
+#else
             set_text(g_files_doc, "files-right-label", g_remove_armed ? "Yes, uninstall" : "Uninstall");
             set_text(g_files_doc, "files-foot",
                      g_remove_armed
                          ? "Uninstall the program? Its Program files folder above is deleted. Your saves and moments, your ROM, texture packs, mods, settings and controls all stay where they are"
                          : "Click a row, or its Open, to open that folder");
+#endif
         }
         else {
             // Portable installed nothing, so there is nothing here to remove. Saying so is more
@@ -2214,7 +2386,11 @@ namespace {
                      "Click a row, or its Open, to open that folder. This copy runs portable, so it installed nothing");
         }
         if (Rml::Element* e = g_files_doc->GetElementById("files-right")) {
+#if defined(__APPLE__)
+            e->SetProperty("display", "none");
+#else
             e->SetClass("armed", g_remove_armed);
+#endif
         }
         apply_files_focus();
     }
@@ -2231,7 +2407,17 @@ namespace {
         if (!std::filesystem::exists(folder, ec)) {
             return;
         }
+#if defined(_WIN32)
         ShellExecuteW(nullptr, L"open", folder.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+        const std::string path = folder.string();
+        char* const argv[] = { const_cast<char*>("open"), const_cast<char*>(path.c_str()), nullptr };
+        pid_t child = 0;
+        if (posix_spawn(&child, "/usr/bin/open", nullptr, nullptr, argv, *_NSGetEnviron()) == 0) {
+            int status = 0;
+            (void)waitpid(child, &status, 0);
+        }
+#endif
     }
 
     void click_files(const std::string& id) {
@@ -2248,6 +2434,9 @@ namespace {
             return;
         }
         if (id == "files-right") {
+#if defined(__APPLE__)
+            return;
+#endif
             if (oot::places::mode() != oot::places::Mode::Installed) {
                 return;
             }
@@ -2307,7 +2496,11 @@ namespace {
             case Nav::Right:
                 // Sideways only within the pair: a row has nothing beside it.
                 if (on_buttons) {
+#if defined(__APPLE__)
+                    g_ffocus = left;
+#else
                     g_ffocus = nav == Nav::Left ? left : right;
+#endif
                     apply_files_focus();
                 }
                 break;
@@ -2485,6 +2678,9 @@ namespace {
     // The ROM question only makes sense once there IS a ROM to copy and somewhere of our own to
     // put it, so it waits for both rather than being asked into the void on a fresh install.
     bool rom_copy_worth_asking() {
+#if defined(__APPLE__)
+        return false;
+#else
         if (oot::ui::rom_choice_made() || oot::places::mode() != oot::places::Mode::Installed) {
             return false;
         }
@@ -2497,15 +2693,18 @@ namespace {
         std::error_code ec;
         return !rom.parent_path().empty() &&
                !std::filesystem::equivalent(rom.parent_path(), oot::places::roms(), ec);
+#endif
     }
 
     // Which question is due, if any. Returns false when there is nothing left to ask, which is
     // the normal state after the first run.
     bool ask_next_question() {
+#if !defined(__APPLE__)
         if (!oot::ui::update_choice_made()) {
             g_question = Question::Updates;
             return true;
         }
+#endif
         if (rom_copy_worth_asking()) {
             g_question = Question::RomCopy;
             return true;
@@ -3482,11 +3681,17 @@ namespace {
         if (g_frame_doc == nullptr || !g_frame_shown) {
             return;
         }
+#if !defined(__APPLE__)
         const bool fullscreen = g_fullscreen.load(std::memory_order_relaxed);
+#endif
         const bool header = g_pointer_in_band ||
                             seconds_since(g_band_left_at) < HEADER_LINGER_SECONDS ||
                             seconds_since(g_frame_since) < HEADER_INTRO_SECONDS;
+#if defined(__APPLE__)
+        const bool edge = false;
+#else
         const bool edge = !fullscreen;
+#endif
         if (header != g_header_shown) {
             g_header_shown = header;
             if (Rml::Element* e = g_frame_doc->GetElementById("frame-bar")) {
@@ -3978,7 +4183,7 @@ namespace {
                 // another saved where it was) is a new picture to the interface's cache, which
                 // otherwise keeps the first one it loaded under a name, or a failed load, for good.
                 const auto stamp = std::filesystem::last_write_time(thumb, ec).time_since_epoch().count();
-                src += "?v=" + std::to_string(stamp) + "-" + std::to_string(std::filesystem::file_size(thumb, ec));
+                src += "?v=" + std::to_string(static_cast<long long>(stamp)) + "-" + std::to_string(std::filesystem::file_size(thumb, ec));
                 rml += "<img class=\"thumb\" src=\"" + escape(src) + "\"/>";
             }
             else {
@@ -4011,7 +4216,7 @@ namespace {
                 char when[32] = {};
                 const std::time_t t = static_cast<std::time_t>(header.captured_at);
                 std::tm tm{};
-                localtime_s(&tm, &t);
+                oot::local_time(t, tm);
                 std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
                 // The region the place sits in, beside the date; the scene's number where the
                 // catalog has no place for it.
@@ -4868,7 +5073,11 @@ namespace {
             return false;
         }
         const RowSpec& spec = specs[static_cast<size_t>(g_focus)];
-        return spec.kind == RowKind::Lighting || spec.kind == RowKind::TimeOfDay || spec.kind == RowKind::Piece ||
+        return
+#if defined(__APPLE__)
+               spec.kind == RowKind::MacSimple ||
+#endif
+               spec.kind == RowKind::Lighting || spec.kind == RowKind::TimeOfDay || spec.kind == RowKind::Piece ||
                (spec.kind == RowKind::Setting && !is_check_setting(spec.setting));
     }
 
@@ -5328,6 +5537,10 @@ namespace {
             screen = Screen::Launch;
         }
         const Screen previous = g_screen;
+#if defined(__APPLE__)
+        if (screen == Screen::Graphics && previous != Screen::Graphics && previous != Screen::Lighting)
+            g_macos_advanced = false;
+#endif
         if (screen == Screen::Ask && previous != Screen::Ask) {
             g_ask_yes = false;
         }
@@ -5384,8 +5597,12 @@ namespace {
             set_text(g_lighting_doc, "lighting-foot",
                      oot::rt_state::supported()
                          ? "Each part switches on its own; the tools for inspecting a single pass are under Debugging"
+#if defined(__APPLE__)
+                         : "Extra lighting effects are unavailable on this device or app build");
+#else
                          : "This graphics device cannot trace rays, so these rows change nothing and the game "
                            "draws its own lighting and shadows. It needs a card that supports DirectX Raytracing");
+#endif
         }
         set(g_about_doc, page == Screen::About);
         set(g_controls_doc, page == Screen::Controls);

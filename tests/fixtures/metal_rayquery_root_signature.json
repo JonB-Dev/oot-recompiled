@@ -1,0 +1,36 @@
+{
+  "RootSignature": {
+    "Flags": "IRRootSignatureFlagNone",
+    "NumParameters": 1,
+    "NumStaticSamplers": 0,
+    "Parameters": [
+      {
+        "DescriptorTable": {
+          "DescriptorRanges": [
+            {
+              "BaseShaderRegister": 0,
+              "Flags": "IRDescriptorRangeFlagDescriptorsVolatile",
+              "NumDescriptors": 1,
+              "OffsetInDescriptorsFromTableStart": 0,
+              "RangeType": "IRDescriptorRangeTypeSRV",
+              "RegisterSpace": 0
+            },
+            {
+              "BaseShaderRegister": 1,
+              "Flags": "IRDescriptorRangeFlagDescriptorsVolatile",
+              "NumDescriptors": 1,
+              "OffsetInDescriptorsFromTableStart": 1,
+              "RangeType": "IRDescriptorRangeTypeUAV",
+              "RegisterSpace": 0
+            }
+          ],
+          "NumDescriptorRanges": 2
+        },
+        "ParameterType": "IRRootParameterTypeDescriptorTable",
+        "ShaderVisibility": "IRShaderVisibilityAll"
+      }
+    ],
+    "StaticSamplers": []
+  },
+  "version": "IRRootSignatureVersion_1_1"
+}

@@ -40,6 +40,9 @@ namespace oot::ui::menu {
         if (mode_ == Mode::Launcher) out.push_back(Section::Play);
         for (Section s : { Section::Settings, Section::Graphics, Section::Gameplay, Section::Hud, Section::Controls,
                            Section::Capture, Section::Moments }) {
+#if defined(__APPLE__)
+            if (s == Section::Capture) continue;
+#endif
             out.push_back(s);
         }
         if (mode_ == Mode::Game && debugging_) out.push_back(Section::Debugging);
@@ -128,7 +131,10 @@ namespace oot::ui::menu {
 
         {
             Router r(Mode::Launcher);
-            const std::vector<S> want = { S::Play, S::Settings, S::Graphics, S::Gameplay, S::Hud, S::Controls, S::Capture,
+            const std::vector<S> want = { S::Play, S::Settings, S::Graphics, S::Gameplay, S::Hud, S::Controls,
+#if !defined(__APPLE__)
+                                          S::Capture,
+#endif
                                           S::Moments, S::About };
             check(r.sections() == want, "the launcher's dial: Play, Settings, Graphics, Gameplay, HUD, Controls, Capture, Moments, About");
             check(r.open() && r.section() == S::Play, "the launcher opens on Play, and is always open");
@@ -151,8 +157,11 @@ namespace oot::ui::menu {
             Router r(Mode::Launcher);
             r.set_mode(Mode::Game);
             check(!r.open(), "Play closes the menu");
-            const std::vector<S> want = { S::Settings, S::Graphics, S::Gameplay, S::Hud, S::Controls, S::Capture, S::Moments,
-                                          S::About };
+            const std::vector<S> want = { S::Settings, S::Graphics, S::Gameplay, S::Hud, S::Controls,
+#if !defined(__APPLE__)
+                                          S::Capture,
+#endif
+                                          S::Moments, S::About };
             check(r.sections() == want, "the game's dial: Settings to About, no Play, no Debugging yet");
             r.toggle();
             check(r.open() && r.section() == S::Settings, "the menu key opens on Settings the first time");
@@ -170,7 +179,8 @@ namespace oot::ui::menu {
             check(r.section() == S::Settings, "Debugging cannot be opened before its confirmation");
             r.unlock_debugging();
             check(r.section() == S::Debugging && r.available(S::Debugging), "after it, Debugging joins the dial and opens");
-            check(r.sections().size() == 9 && r.sections()[7] == S::Debugging, "it sits before About");
+            check(r.sections().size() == want.size() + 1 && r.sections()[r.sections().size() - 2] == S::Debugging,
+                  "it sits before About");
             r.push(Page::Warps);
             r.push_layer(Layer::Ask);
             r.next();

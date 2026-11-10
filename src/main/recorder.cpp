@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "main/places.h"
+#include "main/local_time.h"
 #include "game/rt_state.h"
 #include "ui/ui_lighting.h"
 #include "ui/ui_settings.h"
@@ -152,7 +153,7 @@ namespace {
     std::tm local_now() {
         const std::time_t now = std::time(nullptr);
         std::tm out{};
-        localtime_s(&out, &now);
+        oot::local_time(now, out);
         return out;
     }
 

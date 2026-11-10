@@ -1,4 +1,5 @@
 # ROM and anything derived from it. NEVER COMMIT.
+/data/
 *.z64
 *.n64
 *.v64
@@ -18,12 +19,15 @@ upstream/
 build/
 build-cmake/
 out/
+outputs/
 *.obj
 *.exe
 *.dll
 *.lib
 *.pdb
 .cache
+__pycache__/
+*.pyc
 
 # Editor
 .vs/
@@ -36,9 +40,9 @@ out/
 rt64.log
 imgui.ini
 
-# Captures. A screenshot of the game is a picture of its assets and is Restricted, the same class
-# as the ROM. The harness writes under build-cmake\harness (already excluded above); these lines
-# catch a capture saved anywhere near the tooling by mistake.
+# Temporary captures stay ignored. Curated gameplay illustrations requested for the README
+# are kept separately in docs/screenshots; ROMs, texture packs, generated game code, and
+# raw capture sessions remain excluded.
 tools/**/*.png
 tools/**/*.bmp
 **/harness-out/

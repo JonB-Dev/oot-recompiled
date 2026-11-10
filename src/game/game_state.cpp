@@ -76,6 +76,7 @@ namespace {
 
     // Written by the command line, read by the game thread once per frame.
     std::atomic<int32_t> g_pending_warp{ -1 };
+    std::atomic<bool> g_startup_warp{ false };
 
     /* HOW LONG AN INTERACTIVE REQUEST STAYS ALIVE.
        A warp or a time of day asked for by a person is held until the game is actually playing,
@@ -271,7 +272,14 @@ namespace oot::game_state {
     std::atomic<uint32_t> g_warps_taken{ 0 };
 
     void set_pending_warp(int32_t entrance) {
+        g_startup_warp.store(false, std::memory_order_relaxed);
         g_warp_set_at.store(now_ms(), std::memory_order_relaxed);
+        g_pending_warp.store(entrance, std::memory_order_relaxed);
+    }
+
+    void set_startup_warp(int32_t entrance) {
+        g_warp_set_at.store(now_ms(), std::memory_order_relaxed);
+        g_startup_warp.store(true, std::memory_order_relaxed);
         g_pending_warp.store(entrance, std::memory_order_relaxed);
     }
 
@@ -291,7 +299,7 @@ namespace oot::game_state {
         const Snapshot now = read();
         if (!now.valid || now.game_mode != 0) {
             // Lapse rather than wait. See PENDING_LIFETIME.
-            if (lapsed(g_warp_set_at)) {
+            if (!g_startup_warp.load(std::memory_order_relaxed) && lapsed(g_warp_set_at)) {
                 g_pending_warp.store(-1, std::memory_order_relaxed);
             }
             return -1;
@@ -299,6 +307,9 @@ namespace oot::game_state {
 
         const int32_t taken = g_pending_warp.exchange(-1, std::memory_order_relaxed);
         if (taken >= 0) {
+            if (g_startup_warp.exchange(false, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[warp] startup request applied: 0x%03X\n", taken);
+            }
             g_warps_taken.fetch_add(1, std::memory_order_relaxed);
         }
         return taken;

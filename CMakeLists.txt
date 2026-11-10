@@ -9,6 +9,11 @@ cmake_minimum_required(VERSION 3.20)
 
 project(OoTRecompiled VERSION 0.6.1 LANGUAGES C CXX)
 
+if (APPLE)
+    include(cmake/MacOS.cmake)
+    return()
+endif()
+
 # The executable's icon is a Windows resource (src/main/app.rc), compiled by the resource
 # compiler the Build Tools environment provides; the mark it holds is cut by tools/make_icon.py.
 enable_language(RC)

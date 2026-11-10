@@ -1,5 +1,6 @@
 // Screenshots, and the before and after pair. See screenshots.h.
 #include "main/screenshots.h"
+#include "main/local_time.h"
 
 #include <atomic>
 #include <cstdio>
@@ -54,7 +55,7 @@ namespace oot::screenshots {
         bool make_names(bool comparison) {
             const std::time_t t = std::time(nullptr);
             std::tm now{};
-            localtime_s(&now, &t);
+            oot::local_time(t, now);
             char day[16];
             char time_of_day[16];
             std::strftime(day, sizeof(day), "%Y-%m-%d", &now);

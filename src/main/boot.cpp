@@ -16,11 +16,17 @@
 #include <string>
 #include <filesystem>
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#endif
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#if defined(__APPLE__)
+#include <SDL_metal.h>
+#include "ui/input/pointer_coordinates.h"
+#endif
 
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/ultra64.h"
@@ -70,6 +76,7 @@ RspExitReason njpgdspMain(uint8_t* rdram, uint32_t ucode_addr);
 namespace {
 
     SDL_Window* g_window = nullptr;
+    ultramodern::renderer::WindowHandle g_native_window{};
     SDL_AudioDeviceID g_audio_device = 0;
     std::atomic<uint32_t> g_sample_rate{ 32000 };
     // The window's client size, kept by the thread that pumps its messages so the game thread
@@ -421,6 +428,9 @@ namespace {
     }
 
     ultramodern::renderer::WindowHandle create_window(void*) {
+#if defined(__APPLE__)
+        return g_native_window;
+#else
         SDL_SysWMinfo wmInfo{};
         SDL_VERSION(&wmInfo.version);
         SDL_GetWindowWMInfo(g_window, &wmInfo);
@@ -429,6 +439,7 @@ namespace {
         handle.window = wmInfo.info.win.window;
         handle.thread_id = GetCurrentThreadId();
         return handle;
+#endif
     }
 
     // Keys the interface owns. F1, F2 and F3 open its screens; everything else here only does
@@ -646,6 +657,16 @@ namespace {
             s_quit_sent = true;
             ultramodern::quit();
         }
+        const auto post_pointer = [](int x, int y) {
+#if defined(__APPLE__)
+            int width = 0, height = 0, pixels_w = 0, pixels_h = 0;
+            SDL_GetWindowSize(g_window, &width, &height);
+            SDL_Metal_GetDrawableSize(g_window, &pixels_w, &pixels_h);
+            x = oot::ui::input::drawable_coordinate(x, width, pixels_w);
+            y = oot::ui::input::drawable_coordinate(y, height, pixels_h);
+#endif
+            oot::ui::shell::post_mouse_move(x, y);
+        };
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
@@ -678,7 +699,7 @@ namespace {
                     // The mouse reaches the documents (the launcher, a menu over the game) and
                     // the game window's own header, which shows when the pointer is at the top.
                     // The game itself never reads it.
-                    oot::ui::shell::post_mouse_move(ev.motion.x, ev.motion.y);
+                    post_pointer(ev.motion.x, ev.motion.y);
                     oot::ui::input::mouse();
                     break;
 
@@ -687,6 +708,10 @@ namespace {
                     // SDL numbers left, middle, right as 1, 2, 3; RmlUi as 0, 2, 1.
                     const int button = (ev.button.button == SDL_BUTTON_LEFT) ? 0
                                      : (ev.button.button == SDL_BUTTON_RIGHT) ? 1 : 2;
+#if defined(__APPLE__)
+                    // A click can arrive without a motion event (including after a resize).
+                    post_pointer(ev.button.x, ev.button.y);
+#endif
                     oot::ui::shell::post_mouse_button(button, ev.type == SDL_MOUSEBUTTONDOWN);
                     oot::ui::input::mouse();
                     break;
@@ -939,6 +964,7 @@ void oot::boot::run(SDL_Window* window,
                     int argc,
                     char** argv) {
     g_window = window;
+    g_native_window = window_handle;
     {
         int width = 0;
         int height = 0;
@@ -1055,7 +1081,11 @@ void oot::boot::run(SDL_Window* window,
                         const int32_t entrance =
                             static_cast<int32_t>(std::strtol(one.c_str(), nullptr, 0));
                         if (first) {
+#if defined(__APPLE__)
+                            oot::game_state::set_startup_warp(entrance);
+#else
                             oot::game_state::set_pending_warp(entrance);
+#endif
                             first = false;
                         }
                         else {
@@ -1257,6 +1287,11 @@ void oot::boot::run(SDL_Window* window,
         else if (arg == "--play") {
             g_play_now = true;
         }
+#if defined(__APPLE__)
+        else if (arg == "--data-root") {
+            ++i; // main selected the profile before boot read settings and SRAM.
+        }
+#endif
         // Windows runs this when somebody picks Uninstall in its installed apps list, and the
         // launcher's own Your files row reaches the same surface. It is NOT a silent removal:
         // the program comes up on that surface with the real paths listed and a button that has
