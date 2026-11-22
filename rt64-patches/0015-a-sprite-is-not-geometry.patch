@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 18:50:00 +0100
+Subject: [PATCH] A sprite is not geometry
+
+Patch 0015 of the renderer series (OoT: Recompiled).
+
+Patch 0014's rungs did not remove what the user calls the navi shadow conflict: on rung 20, with
+the newest build, a dark RECTANGLE still sits behind the fairy with her glow inside it and the
+hedge either side of it lit normally. A rectangle that follows nothing in the world is a quad.
+
+Every rung since patch 0012 decides a draw is geometry rather than a sprite by asking for more
+than TWO triangles, and two is a very low bar. A fairy's glow is a handful of layered quads, not
+two, so it has been passing that test and being reclassified as solid all along. A sprite treated
+as solid is rasterized before the composite and therefore multiplied by the surface's shadow
+factor, which is the exact fault that putting translucent draws after the composite was written to
+fix, and the exact thing being reported.
+
+These two rungs raise the bar, bracketed rather than guessed at one value, because the right cut
+sits somewhere between a sprite and a tree: a pine is a few crossed quads and a hedge line is
+many. If the fairy comes right at one of them and the trees stay lit, the bar is the lever and the
+value is whichever of the two holds both.
+
+It is offered as the likeliest reading of one frame rather than as a diagnosis. If neither rung
+holds both, the instrument rather than another reading: the Hits view at that spot says whether
+the rectangle is a traced hit at all.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1886,6 +1886,20 @@ namespace RT64 {
+                             // out by a partial coverage. 20 keeps the shadow off, 21 puts it back.
+                             case 20: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
+                             case 21: solidDraw = otherMode.zCmp() && manyTriangles; break;
++                            // 22 and 23 RAISE THE BAR that decides a draw is geometry rather than
++                            // a sprite (patch 0015). Every rung above says "more than two
++                            // triangles", and two is a very low bar: a fairy's glow is a handful
++                            // of layered quads, not two, so she has been passing it. A sprite
++                            // reclassified as solid is rasterized BEFORE the composite and so is
++                            // multiplied by the surface's shadow factor, which is exactly the
++                            // fault the translucent-after-composite work fixed in the first place,
++                            // and exactly what "the navi shadow conflict" describes.
++                            //
++                            // Bracketed rather than guessed at one number, because the right cut
++                            // sits somewhere between a sprite and a tree and neither of us knows
++                            // where: a pine is a few crossed quads, a hedge line is many.
++                            case 22: solidDraw = otherMode.zCmp() && (call.callDesc.triangleCount > 4); castsNothing = true; break;
++                            case 23: solidDraw = otherMode.zCmp() && (call.callDesc.triangleCount > 16); castsNothing = true; break;
+                             default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
+                         }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).

@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 17:12:50 -0400
+Subject: [PATCH] The windows' light can be aimed from the Debugging menu
+
+Patch 0044 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, of the bright patch the game painted on the Master Sword room's floor where
+its beam once landed, after every way of removing it also took other floor with it: "it may be
+easier to actually just adjust the alignment of the real ray tracing to actually just match up with
+that perfectly ... allow me to cycle through positioning in a debug setting and I'll tell you
+exactly what ends up lining it up"; "adjust the angle of the lighting and the depth ... the actual
+angle vertically and horizontally ... on the x and y and z axis".
+
+Two new float4s in the parameter block, read on the CPU where the place's windows are put in the
+light list: tuneWindowAim (x degrees steeper, y degrees turned about the vertical, z which window
+by its place in the list, 0 every one, w 1 to start from the direction of the last slanted shaft
+drawn in the place, remembered even when it was never traced to a window) and tuneWindowMove (a
+move of the aimed window's glass in world units). Whenever the count or the aim changes, every
+window is logged with its number, its glass, its size and the way its light falls, so the number
+to aim can be read from the log. At their defaults nothing differs from 0043.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -577,6 +577,25 @@ namespace RT64 {
+         return true;
+     }
+ 
++    // THE WINDOWS' AIM FROM THE DEBUGGING MENU (patch 0044, the user, 2026-10-08, of the Master
++    // Sword room's painted bright patch, after removing it took other floor with it: "it may be
++    // easier to actually just adjust the alignment of the real ray tracing to actually just match up
++    // with that perfectly ... allow me to cycle through positioning in a debug setting and I'll tell
++    // you exactly what ends up lining it up"; "adjust the angle of the lighting and the depth ... the
++    // actual angle vertically and horizontally ... on the x and y and z axis"). A window's light is
++    // turned about the vertical and made steeper or flatter by whole degrees, from its own slope or
++    // from the drawn shaft's; the move (applied by the caller) shifts the glass it comes through.
++    static hlslpp::float3 aimWindowLight(const hlslpp::float3 &falls, float steeperDegrees, float turnDegrees) {
++        const float toRadians = 3.14159265f / 180.0f;
++        const float x = float(falls.x);
++        const float y = float(falls.y);
++        const float z = float(falls.z);
++        const float level = std::sqrt(x * x + z * z);
++        const float drop = std::clamp(std::atan2(-y, level) + steeperDegrees * toRadians, 5.0f * toRadians, 89.0f * toRadians);
++        const float heading = std::atan2(z, x) + turnDegrees * toRadians;
++        return hlslpp::float3(std::cos(drop) * std::cos(heading), -std::sin(drop), std::cos(drop) * std::sin(heading));
++    }
++
+     // EVERY WINDOW IN A DRAW, NOT ONE WINDOW PER DRAW (patch 0032). The hall's side windows are
+     // drawn by one actor (Bg_Toki_Hikari) in ONE draw: four windows on the two side walls and one
+     // at the front, five separate pieces facing three ways, which is not one flat plane, so the
+@@ -3028,6 +3047,7 @@ namespace RT64 {
+         // walls' shadow with the windows' light cut out of it.
+         if (!rtExternalEnvironment.windowLights) {
+             rtWindowSunKnown = false;
++            rtShaftKnown = false;   // patch 0044
+         }
+ 
+         bool anyWindow = false;
+@@ -3099,9 +3119,25 @@ namespace RT64 {
+             uint32_t shaftCount = 0;
+             std::vector<interop::PointLight> placeLights;
+             bool first = true;
++            // The Debugging menu's aim (patch 0044): which window (0 every one), from the drawn
++            // shaft's direction or each window's own, how many degrees steeper and turned, and the
++            // move of its light.
++            const hlslpp::float4 aim = rtResources->rtParams.tuneWindowAim;
++            const hlslpp::float4 aimMoveRaw = rtResources->rtParams.tuneWindowMove;
++            const uint32_t aimWindow = uint32_t(std::max(float(aim.z), 0.0f));
++            const bool aimFromShaft = float(aim.w) > 0.5f;
++            const float aimSteeper = float(aim.x);
++            const float aimTurn = float(aim.y);
++            const hlslpp::float3 aimMove(float(aimMoveRaw.x), float(aimMoveRaw.y), float(aimMoveRaw.z));
++            std::vector<interop::PointLight> aimedWindows;
+             for (const interop::PointLight &light : beamLights) {
+                 if ((light.groupBits & BeamLightBit) != 0u) {
+                     shaftCount++;
++                    const hlslpp::float3 shaftFalls = light.direction;
++                    if ((-float(shaftFalls.y)) <= 0.97f) {
++                        rtShaftDirection = shaftFalls;
++                        rtShaftKnown = true;
++                    }
+                     continue;
+                 }
+ 
+@@ -3113,8 +3149,16 @@ namespace RT64 {
+                         kept.direction = interop::float3(rtWindowSunDirection);
+                     }
+ 
++                    if ((aimWindow == 0u) || (aimWindow == windowCount)) {
++                        const hlslpp::float3 ownFalls = kept.direction;
++                        const hlslpp::float3 falls = (aimFromShaft && rtShaftKnown) ? rtShaftDirection : ownFalls;
++                        kept.direction = interop::float3(aimWindowLight(falls, aimSteeper, aimTurn));
++                        kept.position = interop::float3(center + aimMove);
++                    }
++
+                     kept.flickerIntensity = first ? 1.0f : 0.0f;
+                     first = false;
++                    aimedWindows.push_back(kept);
+                 }
+ 
+                 placeLights.push_back(kept);
+@@ -3122,6 +3166,27 @@ namespace RT64 {
+ 
+             beamLights = std::move(placeLights);
+ 
++            // Every window as it is aimed now, numbered as the Debugging menu numbers them, whenever
++            // the count or the aim changes: where each one's glass is, how big, and the way its light
++            // falls, so the number to aim can be found from the log (patch 0044).
++            const uint32_t logKey = windowCount + 64u * aimWindow + 4096u * uint32_t(aimFromShaft) +
++                                    8192u * uint32_t(int(aimSteeper * 10.0f) + 1000) + 524287u * uint32_t(int(aimTurn * 10.0f) + 1000) +
++                                    131u * uint32_t(int(float(aimMove.x)) + 2000) + 257u * uint32_t(int(float(aimMove.y)) + 2000) +
++                                    521u * uint32_t(int(float(aimMove.z)) + 2000);
++            if (logKey != rtWindowLogKey) {
++                rtWindowLogKey = logKey;
++                std::fprintf(stderr, "[rt] window aim: window %u, from %s, %.0f steeper, %.0f turned, moved %.0f %.0f %.0f\n", aimWindow,
++                             (aimFromShaft && rtShaftKnown) ? "the shaft" : "its own slope", aimSteeper, aimTurn,
++                             float(aimMove.x), float(aimMove.y), float(aimMove.z));
++                for (size_t w = 0; w < aimedWindows.size(); w++) {
++                    const interop::PointLight &window = aimedWindows[w];
++                    std::fprintf(stderr, "[rt]   window %zu: glass at %.0f %.0f %.0f, %.0f by %.0f, falls %.2f %.2f %.2f\n", w + 1,
++                                 float(window.position.x), float(window.position.y), float(window.position.z),
++                                 window.pointRadius * 2.0f, window.spotMaxCosine * 2.0f,
++                                 float(window.direction.x), float(window.direction.y), float(window.direction.z));
++                }
++            }
++
+             // Once in a while, what was found, so a place that looks wrong can be read from the
+             // log: the windows, the shafts, and whether a shaft was traced to a window.
+             static uint32_t windowLogCountdown = 0;
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -190,6 +190,12 @@ namespace RT64 {
+         // Which window that shaft comes through, by the middle of its glass (patch 0032): only
+         // that window takes the shaft's direction, the others keep their own.
+         hlslpp::float3 rtWindowShaftCenter = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        // The direction of the last slanted shaft drawn in a place with windows, whether or not it
++        // was traced to one (patch 0044), for the Debugging menu's aim from the old beam.
++        hlslpp::float3 rtShaftDirection = hlslpp::float3(0.0f, -1.0f, 0.0f);
++        bool rtShaftKnown = false;
++        // What the window list last logged, so it is logged again when it changes (patch 0044).
++        uint32_t rtWindowLogKey = 0;
+ 
+         // The game's point lights for the traced scene (patch 0006), set every frame by the
+         // workload queue from what the program published; taken before the projection's own.
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -848,6 +848,11 @@ namespace RT64 {
+         // Where the ambience's fade with distance ends (patch 0037).
+         rtParams.tuneAmbience = hlslpp::float4(std::clamp(rtConfig.indoorAmbienceDistance, 100.0f, 8000.0f), std::clamp(rtConfig.indoorDustSize, 0.05f, 4.0f),
+                                                std::clamp(rtConfig.outdoorDustSize, 0.05f, 4.0f), std::clamp(rtConfig.outdoorAmbienceDistance, 100.0f, 8000.0f));
++        // The windows' aim (patch 0044), for the CPU's window list.
++        rtParams.tuneWindowAim = hlslpp::float4(std::clamp(rtConfig.windowTilt, -45.0f, 45.0f), std::clamp(rtConfig.windowTurn, -90.0f, 90.0f),
++                                                float(std::clamp(rtConfig.windowAim, 0, 16)), (rtConfig.windowAimFromShaft != 0) ? 1.0f : 0.0f);
++        rtParams.tuneWindowMove = hlslpp::float4(std::clamp(rtConfig.windowMoveX, -1000.0f, 1000.0f), std::clamp(rtConfig.windowMoveY, -1000.0f, 1000.0f),
++                                                 std::clamp(rtConfig.windowMoveZ, -1000.0f, 1000.0f), 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -116,6 +116,16 @@ namespace RT64 {
+         // out; each mote is half to twice it. The densities are motes to a cell since 0038.
+         float indoorDustSize = 0.3f;
+         float outdoorDustSize = 0.3f;
++        // The windows' aim from the Debugging menu (patch 0044): which window (0 every one),
++        // whether it starts from the drawn shaft's direction, degrees steeper and turned, and a
++        // move of its light in world units.
++        int windowAim = 0;
++        int windowAimFromShaft = 0;
++        float windowTilt = 0.0f;
++        float windowTurn = 0.0f;
++        float windowMoveX = 0.0f;
++        float windowMoveY = 0.0f;
++        float windowMoveZ = 0.0f;
+         int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -110,6 +110,8 @@ namespace interop {
+         float4 tuneAmbience;     // patch 0037: x where the ambience's long fade with distance ends, in world units (indoors since 0041); patch 0038: y and z the indoor and the outdoor median mote radius in world units; patch 0041: w the outdoor fade's end
+         // (patch 0041: a tuneWind direction of nothing asks for the varied wind)
+         // (patch 0038: tuneDust.x and z are now motes to a cell, 0 to 8, no longer a share of cells)
++        float4 tuneWindowAim;    // patch 0044, read on the CPU: x degrees steeper, y degrees turned, z the window aimed (0 every one), w 1 to start from the drawn shaft's direction
++        float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

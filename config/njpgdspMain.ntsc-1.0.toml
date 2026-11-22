@@ -1,0 +1,20 @@
+# njpgdsp: the JPEG decode microcode, used by the pause screen's rendered background.
+#
+# Every number here is computed from OUR rom and OUR symbol table, by
+# tools/calc_ucode_offset.py. RSPRecomp does no symbol lookup: it takes a raw file offset and a
+# length, so a wrong offset does not fail, it silently recompiles whatever bytes are there.
+#
+# text_offset:  0x800E6BC0 lies in ..code, which begins at rom 0x00A87000 / vram 0x800110A0.
+#               0x800E6BC0 - 0x800110A0 + 0x00A87000 = 0xB5CB20.
+#               First four words at that offset: 8C360004 8C370038 8C38003C 32D60001.
+# text_size:    njpgdspMainTextEnd 0x800E76B0 minus njpgdspMainTextStart 0x800E6BC0 = 0xAF0.
+#               The reference project's njpgdsp is the same size, which is why this one is expected
+#               to need no extra_indirect_branch_targets while aspMain does.
+# text_address: where the microcode runs in RSP IMEM, from app-type.md.
+
+text_offset = 0xB5CB20
+text_size = 0xAF0
+text_address = 0x04001080
+rom_file_path = "../build/oot.ntsc-1.0.rom_uncompressed.z64"
+output_file_path = "../src/rsp/njpgdspMain.cpp"
+output_function_name = "njpgdspMain"

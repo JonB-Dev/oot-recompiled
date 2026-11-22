@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 13:57:18 -0400
+Subject: [PATCH] Every window of the hall is found and lights its own way
+
+Patch 0032 of the renderer series (OoT: Recompiled).
+
+The user's test of 0031 in the Temple of Time, 2026-10-08: the walls' shadow worked, but the
+hall's side windows gave no light and "look like they're actually just casting shadows onto the
+walls as if they're an object hanging in front of the wall", and a bright spot on the floor sat
+away from where the light falls.
+
+The side windows are an actor's (Bg_Toki_Hikari), drawn in ONE draw: four windows on the two side
+walls and one at the front, five separate pieces facing three ways. A draw was taken as a window
+only when the whole of it was one flat plane, so these never were, and their glass, hung a little
+in front of the wall, cast the room's light onto the wall below. And the glass an adult sees is a
+darker texture than a child's (0.38 and 0.23 against 0.71 and 0.33), under the lattice test's bar.
+
+So a draw is split into its pieces, the triangles joined by a shared corner, and each piece is
+measured as a window of its own; the lattice test takes a mean of 0.3 and a spread of 0.2; a draw
+with a window in it takes the foliage mask, seen by every gathering ray and by no shadow ray, so
+the glass casts no shadow and keeps its place in the raster; and a point on the glass counts as
+lit, so the windows stay bright.
+
+With every window on the one sun of 0031, the side windows faced across a light falling lengthwise
+and let almost none of it in. So each window falls inward and down at its own slope again; the
+window a drawn shaft comes through takes the shaft's direction, kept by where its glass is; and the
+walls' shadow is one even share over every surface of the place, carried by the first window. No
+shaft lights on its own in a place with windows, which takes away the bright spot. Up to twelve
+beams and windows follow the game's lights, and every four seconds or so the log says how many
+windows and shafts were found and whether a shaft was traced to a window.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -160,7 +160,7 @@ namespace RT64 {
+     // The texture must be a fade, which a cut-out never is, and the draw must be one the traced
+     // scene leaves out as see-through. Shape, not position, so a beam no list names (an actor's,
+     // a warp's) is found the same way, at any scale.
+-    static const uint32_t MaxBeamLights = 8;            // per traced scene, after the game's own lights
++    static const uint32_t MaxBeamLights = 12;           // per traced scene, after the game's own lights; twelve since patch 0032 (the hall's seven windows)
+     static const uint32_t MaxBeamTriangles = 128;       // a shaft is a few dozen at most; anything larger is a surface
+     static const float BeamMinElongation = 4.0f;
+     static const float BeamMinRoundness = 0.25f;
+@@ -471,50 +471,7 @@ namespace RT64 {
+     static const float WindowStrength = 0.9f;
+     static const uint32_t WindowLightBit = 16u;        // the group bit the shaders read as a window (Raytracing.hlsl)
+ 
+-    // The distinct world positions of a draw's vertices, as beamFromDraw reads them.
+-    static uint32_t drawWorldPoints(const DrawData &drawData, const GameCall &call, hlslpp::float3 *points, uint32_t maxPoints) {
+-        const uint32_t triangleCount = call.callDesc.triangleCount;
+-        const uint32_t start = call.meshDesc.faceIndicesStart;
+-        if ((start + triangleCount * 3) > drawData.faceIndices.size()) {
+-            return 0;
+-        }
+-
+-        uint32_t indices[MaxBeamTriangles * 3];
+-        uint32_t count = 0;
+-        for (uint32_t i = 0; (i < (triangleCount * 3)) && (count < maxPoints) && (count < (MaxBeamTriangles * 3)); i++) {
+-            const uint32_t v = drawData.faceIndices[start + i];
+-            if (std::find(indices, indices + count, v) == (indices + count)) {
+-                indices[count++] = v;
+-            }
+-        }
+-
+-        for (uint32_t i = 0; i < count; i++) {
+-            const uint32_t v = indices[i];
+-            if ((v >= drawData.worldIndices.size()) || (((v + 1) * 3) > drawData.posFloats.size())) {
+-                return 0;
+-            }
+-
+-            const uint16_t transformIndex = drawData.worldIndices[v];
+-            if (transformIndex >= drawData.worldTransforms.size()) {
+-                return 0;
+-            }
+-
+-            const hlslpp::float4 local(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
+-            const hlslpp::float4x4 worldMatrix = drawData.worldTransforms[transformIndex];
+-            const hlslpp::float4 world = hlslpp::mul(local, worldMatrix);
+-            points[i] = world.xyz;
+-        }
+-
+-        return count;
+-    }
+-
+-    static bool windowFromDraw(const DrawData &drawData, const GameCall &call, const hlslpp::float3 &eye, interop::PointLight &window) {
+-        if ((call.callDesc.triangleCount < 1) || (call.callDesc.triangleCount > 16)) {
+-            return false;
+-        }
+-
+-        hlslpp::float3 points[48];
+-        const uint32_t count = drawWorldPoints(drawData, call, points, 48);
++    static bool windowFromPoints(const hlslpp::float3 *points, uint32_t count, const hlslpp::float3 &eye, interop::PointLight &window) {
+         if (count < 3) {
+             return false;
+         }
+@@ -602,6 +559,96 @@ namespace RT64 {
+         return true;
+     }
+ 
++    // EVERY WINDOW IN A DRAW, NOT ONE WINDOW PER DRAW (patch 0032). The hall's side windows are
++    // drawn by one actor (Bg_Toki_Hikari) in ONE draw: four windows on the two side walls and one
++    // at the front, five separate pieces facing three ways, which is not one flat plane, so the
++    // draw was never taken as a window and its glass, hung a little in front of the wall, only
++    // shadowed the wall under it (the user, 2026-10-08: "as if they're an object hanging in front
++    // of the wall"). So a draw is split into its pieces, the triangles joined by a shared corner,
++    // and each piece is measured as a window of its own.
++    static const uint32_t MaxWindowTriangles = 64;
++
++    static void windowsFromDraw(const DrawData &drawData, const GameCall &call, const hlslpp::float3 &eye, std::vector<interop::PointLight> &windows) {
++        const uint32_t triangleCount = call.callDesc.triangleCount;
++        const uint32_t start = call.meshDesc.faceIndicesStart;
++        if ((triangleCount < 1) || (triangleCount > MaxWindowTriangles) || ((start + triangleCount * 3) > drawData.faceIndices.size())) {
++            return;
++        }
++
++        // Union the triangles that share a corner.
++        uint32_t parent[MaxWindowTriangles];
++        for (uint32_t t = 0; t < triangleCount; t++) {
++            parent[t] = t;
++        }
++
++        auto root = [&](uint32_t t) {
++            while (parent[t] != t) {
++                parent[t] = parent[parent[t]];
++                t = parent[t];
++            }
++            return t;
++        };
++
++        for (uint32_t a = 0; a < triangleCount; a++) {
++            for (uint32_t b = a + 1; b < triangleCount; b++) {
++                bool shared = false;
++                for (uint32_t i = 0; (i < 3) && !shared; i++) {
++                    for (uint32_t j = 0; (j < 3) && !shared; j++) {
++                        shared = (drawData.faceIndices[start + a * 3 + i] == drawData.faceIndices[start + b * 3 + j]);
++                    }
++                }
++
++                if (shared) {
++                    parent[root(a)] = root(b);
++                }
++            }
++        }
++
++        bool done[MaxWindowTriangles] = {};
++        for (uint32_t first = 0; first < triangleCount; first++) {
++            const uint32_t piece = root(first);
++            if (done[piece]) {
++                continue;
++            }
++
++            done[piece] = true;
++            hlslpp::float3 points[MaxWindowTriangles * 3];
++            uint32_t vertices[MaxWindowTriangles * 3];
++            uint32_t count = 0;
++            bool readable = true;
++            for (uint32_t t = 0; (t < triangleCount) && readable; t++) {
++                if (root(t) != piece) {
++                    continue;
++                }
++
++                for (uint32_t i = 0; i < 3; i++) {
++                    const uint32_t v = drawData.faceIndices[start + t * 3 + i];
++                    if (std::find(vertices, vertices + count, v) != (vertices + count)) {
++                        continue;
++                    }
++
++                    if ((v >= drawData.worldIndices.size()) || (((v + 1) * 3) > drawData.posFloats.size()) ||
++                        (drawData.worldIndices[v] >= drawData.worldTransforms.size())) {
++                        readable = false;
++                        break;
++                    }
++
++                    const hlslpp::float4 local(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++                    const hlslpp::float4x4 worldMatrix = drawData.worldTransforms[drawData.worldIndices[v]];
++                    const hlslpp::float4 world = hlslpp::mul(local, worldMatrix);
++                    vertices[count] = v;
++                    points[count] = world.xyz;
++                    count++;
++                }
++            }
++
++            interop::PointLight window;
++            if (readable && windowFromPoints(points, count, eye, window)) {
++                windows.push_back(window);
++            }
++        }
++    }
++
+     // One light per shaft: a shaft drawn in layers (an inner and an outer cylinder) is one beam.
+     static void addBeam(std::vector<interop::PointLight> &beams, const interop::PointLight &beam) {
+         for (interop::PointLight &existing : beams) {
+@@ -2572,7 +2619,7 @@ namespace RT64 {
+                             }
+                         }
+ 
+-                        // A LATTICE WINDOW BECOMES A LIGHT (patch 0030, above windowFromDraw),
++                        // A LATTICE WINDOW BECOMES A LIGHT (patch 0030, above windowsFromDraw),
+                         // where the game says this place's windows give light. Only a draw the
+                         // traced scene takes as a surface, so the glass is solid to the rays the
+                         // way the wall around it is.
+@@ -2583,10 +2630,21 @@ namespace RT64 {
+                                 const hlslpp::float4x4 view = drawData.modViewTransforms[proj.transformsIndex];
+                                 const hlslpp::float4 eyePoint = hlslpp::mul(hlslpp::float4(0.0f, 0.0f, 0.0f, 1.0f), hlslpp::inverse(view));
+                                 const hlslpp::float3 eye = eyePoint.xyz;
+-                                interop::PointLight window;
+-                                if (windowFromDraw(drawData, call, eye, window)) {
++                                std::vector<interop::PointLight> windows;
++                                windowsFromDraw(drawData, call, eye, windows);
++                                for (const interop::PointLight &window : windows) {
+                                     addWindow(beamLights, window);
+                                 }
++
++                                // THE GLASS CASTS NO SHADOW (patch 0032): an actor's glass hangs a
++                                // little in front of its wall and the room's light threw its
++                                // shadow onto the wall below. The foliage mask is what every
++                                // gathering ray sees and no shadow ray does; the draw keeps its
++                                // place in the raster, so glass flush with a wall is drawn as it
++                                // always was.
++                                if (!windows.empty()) {
++                                    raytracing.queryMask = FoliageRayQueryMask;
++                                }
+                             }
+                         }
+ 
+@@ -2902,6 +2960,7 @@ namespace RT64 {
+         if (anyWindow) {
+             // A shaft that, followed up past its top, meets a window's glass gives the direction.
+             const interop::PointLight *throughWindow = nullptr;
++            hlslpp::float3 throughCenter(0.0f, 0.0f, 0.0f);
+             for (const interop::PointLight &beam : beamLights) {
+                 if ((beam.groupBits & BeamLightBit) == 0u) {
+                     continue;
+@@ -2933,6 +2992,7 @@ namespace RT64 {
+                     const float upOffset = std::abs(float(onGlass.y) - float(center.y));
+                     if ((acrossOffset <= (window.pointRadius * 1.25f)) && (upOffset <= (window.spotMaxCosine * 1.25f))) {
+                         throughWindow = &beam;
++                        throughCenter = center;
+                         break;
+                     }
+                 }
+@@ -2944,35 +3004,37 @@ namespace RT64 {
+ 
+             if (throughWindow != nullptr) {
+                 rtWindowSunDirection = throughWindow->direction;
++                rtWindowShaftCenter = throughCenter;
+                 rtWindowSunKnown = true;
+             }
+ 
+-            // Never seen a shaft here yet: the largest window's own slope.
+-            hlslpp::float3 sunFalls = rtWindowSunDirection;
+-            if (!rtWindowSunKnown) {
+-                float largest = -1.0f;
+-                for (const interop::PointLight &window : beamLights) {
+-                    if (((window.groupBits & WindowLightBit) != 0u) && ((window.pointRadius * window.spotMaxCosine) > largest)) {
+-                        largest = window.pointRadius * window.spotMaxCosine;
+-                        sunFalls = window.direction;
+-                    }
+-                }
+-            }
+-
+-            // The shaft that came through a window is the sun's light, not a light of its own; a
+-            // shaft from anything else (a song's cylinder) still is.
++            // EACH WINDOW ITS OWN LIGHT, THE WALLS ONE SHADOW (patch 0032). With every window on
++            // the one sun of 0031, the side windows of the hall face across a light that falls
++            // lengthwise and let almost none of it in. So each window falls inward and down at its
++            // own slope again, the window a shaft comes through takes the shaft's direction (kept
++            // by where its glass is, while the place lasts), and the walls' shadow stays one share
++            // over the whole place, carried by the first window. And NO shaft lights on its own in
++            // a place with windows: the light under it is the window's (the user, 2026-10-08: "the
++            // spot on the floor is still incredibly bright and it's not in the same spot that it
++            // needs to be").
++            uint32_t windowCount = 0;
++            uint32_t shaftCount = 0;
+             std::vector<interop::PointLight> placeLights;
+             bool first = true;
+             for (const interop::PointLight &light : beamLights) {
+-                if (&light == throughWindow) {
++                if ((light.groupBits & BeamLightBit) != 0u) {
++                    shaftCount++;
+                     continue;
+                 }
+ 
+                 interop::PointLight kept = light;
+                 if ((kept.groupBits & WindowLightBit) != 0u) {
+-                    kept.direction = interop::float3(sunFalls);
+-                    // The first window carries the sun's share everywhere, blocked or not, so the
+-                    // walls' shadow is counted once however many windows there are.
++                    windowCount++;
++                    const hlslpp::float3 center = kept.position;
++                    if (rtWindowSunKnown && (float(hlslpp::length(center - rtWindowShaftCenter)) < 1.0f)) {
++                        kept.direction = interop::float3(rtWindowSunDirection);
++                    }
++
+                     kept.flickerIntensity = first ? 1.0f : 0.0f;
+                     first = false;
+                 }
+@@ -2981,6 +3043,34 @@ namespace RT64 {
+             }
+ 
+             beamLights = std::move(placeLights);
++
++            // Once in a while, what was found, so a place that looks wrong can be read from the
++            // log: the windows, the shafts, and whether a shaft was traced to a window.
++            static uint32_t windowLogCountdown = 0;
++            if (windowLogCountdown == 0) {
++                std::fprintf(stderr, "[rt] windows %u, shafts %u, a shaft through a window %s\n", windowCount, shaftCount,
++                             rtWindowSunKnown ? "known" : "not seen");
++                windowLogCountdown = 240;
++            }
++            else {
++                windowLogCountdown--;
++            }
++        }
++        else if (rtExternalEnvironment.windowLights && !targetDrawCall.rtScenes.empty()) {
++            // A place with windows whose traced draws held none this frame: no shaft lights on its
++            // own here either, so say so.
++            beamLights.erase(std::remove_if(beamLights.begin(), beamLights.end(), [](const interop::PointLight &light) {
++                return (light.groupBits & BeamLightBit) != 0u;
++            }), beamLights.end());
++
++            static uint32_t noWindowLogCountdown = 0;
++            if (noWindowLogCountdown == 0) {
++                std::fprintf(stderr, "[rt] a place with windows and none among this frame's traced draws\n");
++                noWindowLogCountdown = 240;
++            }
++            else {
++                noWindowLogCountdown--;
++            }
+         }
+ 
+         // The beams join the scene's lights after the game's own (patch 0029). The traced scene
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -187,6 +187,9 @@ namespace RT64 {
+         // shaft is out of view.
+         hlslpp::float3 rtWindowSunDirection = hlslpp::float3(0.0f, -1.0f, 0.0f);
+         bool rtWindowSunKnown = false;
++        // Which window that shaft comes through, by the middle of its glass (patch 0032): only
++        // that window takes the shaft's direction, the others keep their own.
++        hlslpp::float3 rtWindowShaftCenter = hlslpp::float3(0.0f, 0.0f, 0.0f);
+ 
+         // The game's point lights for the traced scene (patch 0006), set every frame by the
+         // workload queue from what the program published; taken before the projection's own.
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -1426,6 +1426,13 @@ namespace RT64 {
+     // floor passes too; the renderer takes only upright surfaces as windows. Reads texture memory
+     // the way classifyTextureAlpha does; a paletted texture or a format it does not read is never
+     // a lattice.
++    //
++    // LOWERED TO 0.3 AND 0.2 (patch 0032). The hall's side windows are an actor's (Bg_Toki_Hikari),
++    // and the glass it draws for an adult is a darker texture than a child's: 0.38 and 0.23 against
++    // 0.71 and 0.33, so an adult's windows were never found (the user, 2026-10-08: "it does not look
++    // like the windows are actually being made into lights"). Every other texture of the scene and
++    // its objects that reaches these is level (the checkered floor), see-through, or drawn too
++    // small to be a window (the Master Sword's, at a fortieth of its size).
+     static bool classifyTextureLattice(const uint8_t *TMEM, int width, int height, uint32_t tlut, const LoadTile &loadTile) {
+         if ((width <= 0) || (height <= 0) || (width > 1024) || (height > 1024) || (tlut > 0)) {
+             return false;
+@@ -1484,7 +1491,7 @@ namespace RT64 {
+         const double count = double(width) * double(height);
+         const double mean = sum / count;
+         const double spread = std::sqrt(std::max(sumSquares / count - mean * mean, 0.0));
+-        return (mean >= 0.6) && (spread >= 0.25);
++        return (mean >= 0.3) && (spread >= 0.2);
+     }
+ 
+     void TextureCache::queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM) {
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -624,21 +624,41 @@ static const float WindowClearance = 12.0f;   // world units before the glass th
+ static const float WindowEdge = 0.02f;        // the edge of a window's light softens by this share of the distance it fell
+ static const float WindowSpread = 0.015f;     // how far its shadow rays lean, so its shadows soften with distance
+ 
++// EACH WINDOW FALLS AT ITS OWN SLOPE AGAIN, THE WALLS ONE EVEN SHADOW (patch 0032). With each
++// window's light falling its own way, the walls' shadow cannot follow one direction, so it is an
++// even share over every surface of the place, as though the walls stood between all of it and the
++// daylight outside. And a point ON the glass is lit: the glass is where the daylight is, and it
++// had been taking the walls' shadow like the stone round it.
++static const float WindowShadeShare = 0.8f;   // the share of a window's light that every surface of the place would have without its walls
++static const float WindowGlassDepth = 4.0f;   // world units either side of the glass's plane that still count as the glass
++
+ void windowLight(PointLight light, float3 position, float3 normal, float biasBase, uint2 launchIndex, uint lightIndex, uint lightSamples,
+                  inout float3 sum, inout float3 sumUnblocked) {
+     const float3 falls = light.direction;
+     const float3 toLight = -falls;
+-    const float ndl = saturate(dot(normal, toLight));
+-    if (ndl <= 0.0f) {
+-        return;
++    const float3 inward = light.specularColor;
++    const float inside = dot(position - light.position, inward);
++    if (abs(inside) < WindowGlassDepth) {
++        const float3 glassOffset = position - light.position;
++        const float3 glassAcross = normalize(cross(float3(0.0f, 1.0f, 0.0f), inward));
++        if ((abs(dot(glassOffset, glassAcross)) <= light.pointRadius) && (abs(glassOffset.y) <= light.spotMaxCosine)) {
++            sum += light.diffuseColor * WindowShadeShare;
++            if (light.flickerIntensity > 0.5f) {
++                sumUnblocked += light.diffuseColor * WindowShadeShare;
++            }
++            return;
++        }
+     }
+ 
+     if (light.flickerIntensity > 0.5f) {
+-        sumUnblocked += light.diffuseColor * ndl;
++        sumUnblocked += light.diffuseColor * WindowShadeShare;
++    }
++
++    const float ndl = saturate(dot(normal, toLight));
++    if (ndl <= 0.0f) {
++        return;
+     }
+ 
+-    const float3 inward = light.specularColor;
+-    const float inside = dot(position - light.position, inward);
+     if (inside <= 0.0f) {
+         return;
+     }

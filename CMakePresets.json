@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-clang",
+      "displayName": "Windows, clang and Ninja",
+      "description": "The only supported configuration. Run it from a developer shell so clang finds the Windows SDK: a configure that succeeds outside one still fails at link, which reads like a project fault rather than an environment one.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-clang-debug",
+      "inherits": "windows-clang",
+      "displayName": "Windows, clang and Ninja, debug",
+      "binaryDir": "${sourceDir}/build-cmake-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-clang", "configurePreset": "windows-clang", "targets": ["OoTRecompiled"] },
+    { "name": "windows-clang-debug", "configurePreset": "windows-clang-debug", "targets": ["OoTRecompiled"] }
+  ]
+}

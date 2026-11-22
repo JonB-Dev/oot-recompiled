@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:38:23 -0400
+Subject: [PATCH] Many motes to a cell, each its own size, opacity and
+ brightness
+
+Patch 0038 of the renderer series (OoT: Recompiled).
+
+The user's test of the dust, 2026-10-08, at the Temple of Time's window with Bright and Thick: "this
+is bright and thick which shows almost no particles. so the brightness setting is fine! it works
+well, BUT the density is WAY too low. this thick setting should probably be a new "very sparse"
+setting and then it needs to densen significantly as it goes through each". And: "there needs to
+be variance in size, there needs to be variance in opacity, and there needs to be a variance in
+brightness for every single particle ... most of them, would be more transparent ... the particle
+size would then control ... the median size".
+
+A density is now motes to a cell, from 0 to 8: the whole part in every cell and the fraction by
+chance, where it was a share of cells holding one mote. Each mote draws its own place, its own
+radius (half to twice the place's median, from two new values in tuneAmbience, y indoors and z
+outdoors, held between three quarters of a pixel and eight pixels across), its own opacity (from
+0.12 to 1, most of them near the faint end) and its own brightness (a third either side of the
+place's visibility). The visibility stays the overall level.
+
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -839,13 +839,15 @@ namespace RT64 {
+         rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, std::clamp(rtConfig.lightBrightness, 0.0f, 1.0f),
+                                                  std::max(rtConfig.indoorDustDrift, 0.0f));
+         // The dust indoors and out, and the outdoor wind (patch 0036).
+-        rtParams.tuneDust = hlslpp::float4(std::clamp(rtConfig.indoorDustDensity, 0.0f, 1.0f), std::max(rtConfig.indoorDustVisibility, 0.0f),
+-                                           std::clamp(rtConfig.outdoorDustDensity, 0.0f, 1.0f), std::max(rtConfig.outdoorDustVisibility, 0.0f));
++        // Motes to a cell since patch 0038, up to the shader's eight.
++        rtParams.tuneDust = hlslpp::float4(std::clamp(rtConfig.indoorDustDensity, 0.0f, 8.0f), std::max(rtConfig.indoorDustVisibility, 0.0f),
++                                           std::clamp(rtConfig.outdoorDustDensity, 0.0f, 8.0f), std::max(rtConfig.outdoorDustVisibility, 0.0f));
+         const float windLength = std::sqrt(rtConfig.windX * rtConfig.windX + rtConfig.windZ * rtConfig.windZ);
+         rtParams.tuneWind = hlslpp::float4((windLength > 0.0f) ? (rtConfig.windX / windLength) : 0.0f, (windLength > 0.0f) ? (rtConfig.windZ / windLength) : 0.0f,
+                                            std::max(rtConfig.windSpeed, 0.0f), std::clamp(rtConfig.windGusts, 0.0f, 1.0f));
+         // Where the ambience's fade with distance ends (patch 0037).
+-        rtParams.tuneAmbience = hlslpp::float4(std::clamp(rtConfig.ambienceDistance, 100.0f, 8000.0f), 0.0f, 0.0f, 0.0f);
++        rtParams.tuneAmbience = hlslpp::float4(std::clamp(rtConfig.ambienceDistance, 100.0f, 8000.0f), std::clamp(rtConfig.indoorDustSize, 0.05f, 4.0f),
++                                               std::clamp(rtConfig.outdoorDustSize, 0.05f, 4.0f), 0.0f);
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -110,6 +110,10 @@ namespace RT64 {
+         float windZ = 1.0f;
+         // The Ambience distance row (patch 0037): where the dust's long fade with distance ends.
+         float ambienceDistance = 1200.0f;
++        // The dust size rows (patch 0038): the median mote's radius in world units, indoors and
++        // out; each mote is half to twice it. The densities are motes to a cell since 0038.
++        float indoorDustSize = 0.3f;
++        float outdoorDustSize = 0.3f;
+         int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1472,7 +1472,9 @@ static const float LightScatter = 0.002f;      // per world unit at a light's ce
+ // passes, which is a few pixels in a hundred.
+ static const float DustCell = 40.0f;          // world units; at most one mote in each
+ static const float DustNear = 20.0f;          // no mote closer to the eye than this
+-static const float DustSize = 0.3f;           // a mote's own radius in world units, held between one and three pixels
++static const uint DustMaxPerCell = 8;         // patch 0038: motes a cell can hold at the densest
++static const float DustFaintest = 0.12f;      // patch 0038: the faintest mote's opacity; most lie near it
++static const float DustBrightnessSpread = 0.35f;   // patch 0038: how far a mote's brightness lies from the row's, either way
+ static const float DustDrift = 0.3f;          // how far a mote wanders from its place, as a share of its cell
+ 
+ // THE THINGS THAT MOVE THROUGH THE DUST (patch 0037, the user, 2026-10-08: "as Link runs through
+@@ -1601,7 +1603,7 @@ static const float AmbienceFadeStart = 0.2f;  // the share of the distance where
+ static const uint DustMaxSteps = 128;
+ static const uint DustMaxMovers = 4;          // the movers near one ray that push the motes it passes
+ 
+-float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, bool outdoors) {
++float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float density, float visibility, float medianSize, bool outdoors) {
+     const float fadeEnd = RtParams.tuneAmbience.x;
+     const float range = min(end, fadeEnd);
+     const float stepLength = max(DustCell * 0.5f, range / float(DustMaxSteps));
+@@ -1639,41 +1641,55 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+         }
+ 
+         lastCell = cell;
+-        const float4 h = float4(dustHash(uint4(uint3(cell), 0x2545F491u))) * (1.0f / 4294967295.0f);
+-        if (h.w > density) {
+-            continue;
+-        }
+ 
+-        const float3 phase = h.xyz * 6.28318531f;
+-        const float3 drift = sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
+-        float3 mote = (float3(cell) + 0.2f + h.xyz * 0.6f) * DustCell + drift + carried;
++        // MANY MOTES TO A CELL, EACH ITS OWN (patch 0038, the user, 2026-10-08, at the Temple of
++        // Time's window with Thick dust: "shows almost no particles ... the density is WAY too low
++        // ... this thick setting should probably be a new "very sparse" setting and then it needs
++        // to densen significantly"; "there needs to be variance in size, there needs to be variance
++        // in opacity, and there needs to be a variance in brightness for every single particle
++        // ... most of them, would be more transparent"). The density is now motes to a cell, the
++        // whole part always and the fraction by chance, up to DustMaxPerCell. Each mote draws its
++        // own place, its own size (half to twice the size row's median), its own opacity (most of
++        // them faint, a few full) and its own brightness (a third either side of the row's).
++        const float4 cellHash = float4(dustHash(uint4(uint3(cell), 0x2545F491u))) * (1.0f / 4294967295.0f);
++        const uint motes = min(uint(density) + ((cellHash.w < frac(density)) ? 1u : 0u), DustMaxPerCell);
++        for (uint j = 0; j < motes; j++) {
++            const float4 h = float4(dustHash(uint4(uint3(cell), 0x2545F491u + 0x9E3779B9u * (j + 1u)))) * (1.0f / 4294967295.0f);
++            const float4 own = float4(dustHash(uint4(uint3(cell) ^ uint3(0x68E31DA4u, 0xB5297A4Du, 0x1B56C4E9u), j))) * (1.0f / 4294967295.0f);
++            const float3 phase = h.xyz * 6.28318531f;
++            const float3 drift = sin(seconds * wander * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
++            float3 mote = (float3(cell) + 0.1f + h.xyz * 0.8f) * DustCell + drift + carried;
++
++            // Pushed by whatever moves near it, never further than its own cell allows, so it is
++            // still found where the march looks for it.
++            float3 pushed = float3(0.0f, 0.0f, 0.0f);
++            for (uint k = 0; k < moverCount; k++) {
++                pushed += moverPush(mote, SceneLights[movers[k]]);
++            }
+ 
+-        // Pushed by whatever moves near it, never further than its own cell allows, so it is
+-        // still found where the march looks for it.
+-        float3 pushed = float3(0.0f, 0.0f, 0.0f);
+-        for (uint k = 0; k < moverCount; k++) {
+-            pushed += moverPush(mote, SceneLights[movers[k]]);
+-        }
++            const float pushedLength = length(pushed);
++            const float pushLimit = DustCell * 0.45f;
++            mote += (pushedLength > pushLimit) ? (pushed * (pushLimit / pushedLength)) : pushed;
+ 
+-        const float pushedLength = length(pushed);
+-        const float pushLimit = DustCell * 0.45f;
+-        mote += (pushedLength > pushLimit) ? (pushed * (pushLimit / pushedLength)) : pushed;
++            const float along = dot(mote - origin, direction);
++            if ((along <= DustNear) || (along >= range)) {
++                continue;
++            }
+ 
+-        const float along = dot(mote - origin, direction);
+-        if ((along <= DustNear) || (along >= range)) {
+-            continue;
+-        }
++            const float pixel = along * pixelAngle;
++            const float moteSize = medianSize * exp2((own.x - 0.5f) * 2.0f);
++            const float radius = clamp(moteSize, pixel * 0.75f, pixel * 8.0f);
++            const float apart = length(mote - (origin + direction * along));
++            const float cover = 1.0f - smoothstep(0.0f, radius, apart);
++            if (cover <= 0.0f) {
++                continue;
++            }
+ 
+-        const float apart = length(mote - (origin + direction * along));
+-        const float size = clamp(DustSize, along * pixelAngle, along * pixelAngle * 3.0f);
+-        const float cover = 1.0f - smoothstep(0.0f, size, apart);
+-        if (cover <= 0.0f) {
+-            continue;
++            const float opacity = lerp(DustFaintest, 1.0f, own.y * own.y);
++            const float brightness = lerp(1.0f - DustBrightnessSpread, 1.0f + DustBrightnessSpread, own.z);
++            const float distanceFade = 1.0f - smoothstep(fadeEnd * AmbienceFadeStart, fadeEnd, along);
++            sum += dustLightAt(mote, launchIndex) * (cover * distanceFade * opacity * brightness);
+         }
+-
+-        const float distanceFade = 1.0f - smoothstep(fadeEnd * AmbienceFadeStart, fadeEnd, along);
+-        const float twinkle = 0.5f + 0.5f * frac(h.w * 7.0f);
+-        sum += dustLightAt(mote, launchIndex) * (cover * distanceFade * twinkle);
+     }
+ 
+     return sum * visibility;
+@@ -1698,6 +1714,7 @@ void ScatterRayGen() {
+     const bool outdoors = (RtParams.sunShadows == 1u);
+     const float dustDensity = outdoors ? RtParams.tuneDust.z : RtParams.tuneDust.x;
+     const float dustVisibility = outdoors ? RtParams.tuneDust.w : RtParams.tuneDust.y;
++    const float dustSize = max(outdoors ? RtParams.tuneAmbience.z : RtParams.tuneAmbience.y, 0.05f);   // the median mote's radius (patch 0038)
+     const bool dust = (dustDensity > 0.0f) && (dustVisibility > 0.0f);
+ 
+     // Only the air in front of a surface: the sky the game drew has its own haze in it, and a
+@@ -1706,7 +1723,7 @@ void ScatterRayGen() {
+     const int instance = gInstanceId[launchIndex];
+     if (instance < 0) {
+         gScatter[launchIndex] = (dust && outdoors)
+-            ? float4(dustInLight(origin, direction, RtParams.tuneAmbience.x, launchIndex, dustDensity, dustVisibility, true), 1.0f)
++            ? float4(dustInLight(origin, direction, RtParams.tuneAmbience.x, launchIndex, dustDensity, dustVisibility, dustSize, true), 1.0f)
+             : 0.0f;
+         return;
+     }
+@@ -1774,7 +1791,7 @@ void ScatterRayGen() {
+ 
+     // The dust in the light, along the same ray to the same surface (patches 0035 and 0036).
+     if (dust) {
+-        sum += dustInLight(origin, direction, end, launchIndex, dustDensity, dustVisibility, outdoors);
++        sum += dustInLight(origin, direction, end, launchIndex, dustDensity, dustVisibility, dustSize, outdoors);
+     }
+ 
+     // No history here (patch 0008): the glow is smooth on its own and follows a moving light
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -107,7 +107,8 @@ namespace interop {
+         float4 tuneExperiment;   // x the Experiment row of the lighting menu (0 off): a numbered variant of a disputed sum, for the person to cycle in play
+         float4 tuneDust;         // patch 0036: x the indoor dust's density (0 off), y its visibility, z the outdoor dust's density (0 off), w its visibility
+         float4 tuneWind;         // patch 0036: x and y the way the outdoor wind blows over the ground (world x and z), z its speed in world units a second, w its gusts (0 none)
+-        float4 tuneAmbience;     // patch 0037: x where the ambience's long fade with distance ends, in world units; y to w spare
++        float4 tuneAmbience;     // patch 0037: x where the ambience's long fade with distance ends, in world units; patch 0038: y and z the indoor and the outdoor median mote radius in world units; w spare
++        // (patch 0038: tuneDust.x and z are now motes to a cell, 0 to 8, no longer a share of cells)
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

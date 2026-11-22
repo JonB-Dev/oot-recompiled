@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 11:34:33 -0400
+Subject: [PATCH] A cut-out quad is not a sprite
+
+Patch 0027 of the renderer series (OoT: Recompiled).
+
+The foliage work of 2026-09-30 keeps a translucent draw out of the traced scene unless it is
+more than two triangles, because a glow, a spark or a shaft is a quad and a quad traced as solid
+casts the shadow of a quad. The same count threw out every cut-out drawn as a single quad. A
+patch of vines on a wall is two triangles, so it went to the raster after the composite, took no
+light, and covered the lit wall behind it with an unlit square. The user saw it beside Navi on
+2026-10-08, and every Inspect view showed the square in its own color, which is what a draw on
+the wrong side of the composite looks like.
+
+An inventory of every room in the game (the decompilation's extracted scenes, walked with this
+renderer's own draw call rule) found 135 draws the count keeps out. About 75 are cut-outs, nearly
+all flat on walls: vines, grates, webs, the shooting gallery's and the fishing pond's painted
+backdrops. The rest are water planes, light shafts, mist and glows, which must stay out. Format
+does not separate the two (both are mostly IA), and neither do the combiner or the render mode.
+The texture's alpha does: a cut-out has clear texels and almost no partial ones, a fade is
+partial nearly everywhere, and a water plane has no clear texel at all.
+
+So the texture cache reads each texture's alpha once, from texture memory, when the texture is
+first queued (the hasher's addressing: the console's byte order, odd rows swapped, palettes in
+the upper half, RGBA32 split), and keeps the answer by hash. A two-triangle translucent draw that
+reads depth and samples a cut-out texture is now solid, exactly as a tree is, and the traced alpha
+test gives it its holes. Glows, shafts, water and anything not yet read stay as they were.
+
+The default and the rungs built on it take the new rule; the ladder's historical rungs keep what
+they did, and rung 35 puts the count alone back for a side by side.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1857,6 +1857,25 @@ namespace RT64 {
+                         const uint32_t acMode = otherMode.alphaCompare();
+                         const int cutoutRule = int(rtResources->rtParams.tuneExperiment.x);
+                         const bool manyTriangles = (call.callDesc.triangleCount > 2);
++                        // A CUT-OUT QUAD IS NOT A SPRITE (patch 0027). The triangle count above
++                        // was the way to keep a glow's quad out of the traced scene, and it threw
++                        // out every cut-out drawn as one quad with it: a patch of vines on a wall
++                        // is two triangles, so it went to the raster after the composite, took no
++                        // light, and covered the lit wall behind it with an unlit square (the
++                        // user, 2026-10-08, beside Navi: "We had fixed vines ... Yet I seem to see
++                        // those details now", and in every Inspect view the square stayed its own
++                        // color). An inventory of every room in the game found 135 draws the count
++                        // keeps out: about 75 cut-outs, nearly all flat on walls (vines, grates,
++                        // the shooting gallery's and the fishing pond's backdrops), and the rest
++                        // water planes and fades that must stay out. The texture is what tells
++                        // them apart: a cut-out has clear texels and almost no partial ones
++                        // (texture cache, textureAlphaKind). Rung 35 puts the count alone back.
++                        bool cutoutQuad = false;
++                        if (!manyTriangles && otherMode.zCmp() && (call.callDesc.tileCount > 0) && (cutoutRule != 35)) {
++                            const DrawCallTile &callTile = drawData.callTiles[call.callDesc.tileIndex];
++                            cutoutQuad = callTile.valid && !callTile.tileCopyUsed &&
++                                         (textureAlphaKind(callTile.tmemHashOrID) == TextureAlphaKind::Cutout);
++                        }
+                         bool solidDraw;
+                         bool castsNothing = false;
+                         switch (cutoutRule) {
+@@ -1958,6 +1977,14 @@ namespace RT64 {
+                             // still there for anyone who wants to see it.
+                             default: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                         }
++                        // The default and the rungs built on it take the cut-out quads (patch
++                        // 0027): Off, the unrelated shader experiments 1 to 7, 25 (the rule that
++                        // won, which IS the default) and 30 to 34. The ladder's own historical
++                        // rules (8 to 24, 26 to 29) and 35 keep exactly what they did.
++                        const bool defaultFamily = (cutoutRule < 8) || (cutoutRule == 25) || ((cutoutRule >= 30) && (cutoutRule <= 34));
++                        if (defaultFamily && cutoutQuad) {
++                            solidDraw = true;
++                        }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+                         const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);
+                         if (wasTranslucent && !solidDraw) {
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -1311,9 +1311,112 @@ namespace RT64 {
+         }
+     }
+ 
++    // THE ALPHA OF EVERY TEXTURE SEEN, BY HASH (patch 0027). A hash names the same texels for the
++    // life of the program, so an answer never goes stale, and there are a few thousand of them
++    // at most. The lock is held only to read or write one entry.
++    static std::mutex textureAlphaKindMutex;
++    static std::unordered_map<uint64_t, TextureAlphaKind> textureAlphaKinds;
++
++    TextureAlphaKind textureAlphaKind(uint64_t hash) {
++        std::scoped_lock lock(textureAlphaKindMutex);
++        const auto it = textureAlphaKinds.find(hash);
++        return (it != textureAlphaKinds.end()) ? it->second : TextureAlphaKind::Unknown;
++    }
++
++    // Counts the texels a draw samples into clear, solid and partial, reading texture memory the
++    // way the hasher above reads it: the console's byte order, each row at line * 8 bytes, odd
++    // rows with their 32-bit halves swapped, a palette's entries eight bytes apart in the upper
++    // half (CI4 offset by the palette number), and RGBA32 split between the two halves. A format
++    // this does not read (a 16-bit index, say) answers Unknown, which leaves a draw as it was.
++    static TextureAlphaKind classifyTextureAlpha(const uint8_t *TMEM, int width, int height, uint32_t tlut, const LoadTile &loadTile) {
++        if ((width <= 0) || (height <= 0) || (width > 1024) || (height > 1024)) {
++            return TextureAlphaKind::Unknown;
++        }
++
++        const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
++        const bool usesTLUT = (tlut > 0);
++        if (usesTLUT && (loadTile.siz > G_IM_SIZ_8b)) {
++            return TextureAlphaKind::Unknown;
++        }
++
++        const uint32_t tmemMask = (RGBA32 || usesTLUT) ? 2047U : 4095U;
++        const uint32_t rowBytes = uint32_t(loadTile.line) << 3;
++        const uint32_t base = uint32_t(loadTile.tmem) << 3;
++        auto byteAt = [&](uint32_t row, uint32_t offset, uint32_t half) -> uint8_t {
++            uint32_t address = (base + row * rowBytes + offset) & tmemMask;
++            if (row & 1) {
++                address ^= 4;
++            }
++
++            return TMEM[(address & tmemMask) | half];
++        };
++
++        auto paletteAlpha = [&](uint32_t index) -> uint32_t {
++            const uint32_t paletteOffset = (loadTile.siz == G_IM_SIZ_4b) ? (uint32_t(loadTile.palette) << 7) : 0U;
++            const uint32_t address = (2048U + paletteOffset + index * 8U) & 4095U;
++            const uint32_t entry = (uint32_t(TMEM[address]) << 8) | TMEM[(address + 1) & 4095U];
++            return (tlut == G_TT_IA16) ? (entry & 0xFFU) : ((entry & 1U) ? 255U : 0U);
++        };
++
++        uint32_t clear = 0, solid = 0, partial = 0;
++        for (uint32_t y = 0; y < uint32_t(height); y++) {
++            for (uint32_t x = 0; x < uint32_t(width); x++) {
++                uint32_t alpha = 0;
++                if (loadTile.siz == G_IM_SIZ_4b) {
++                    const uint8_t byte = byteAt(y, x >> 1, 0);
++                    const uint32_t nibble = (x & 1) ? (byte & 0xFU) : (byte >> 4);
++                    if (usesTLUT) { alpha = paletteAlpha(nibble); }
++                    else if (loadTile.fmt == G_IM_FMT_IA) { alpha = (nibble & 1U) ? 255U : 0U; }
++                    else if (loadTile.fmt == G_IM_FMT_I) { alpha = nibble * 17U; }
++                    else { return TextureAlphaKind::Unknown; }
++                }
++                else if (loadTile.siz == G_IM_SIZ_8b) {
++                    const uint8_t byte = byteAt(y, x, 0);
++                    if (usesTLUT) { alpha = paletteAlpha(byte); }
++                    else if (loadTile.fmt == G_IM_FMT_IA) { alpha = (byte & 0xFU) * 17U; }
++                    else if (loadTile.fmt == G_IM_FMT_I) { alpha = byte; }
++                    else { return TextureAlphaKind::Unknown; }
++                }
++                else if (loadTile.siz == G_IM_SIZ_16b) {
++                    const uint8_t low = byteAt(y, x * 2 + 1, 0);
++                    if (loadTile.fmt == G_IM_FMT_RGBA) { alpha = (low & 1U) ? 255U : 0U; }
++                    else if (loadTile.fmt == G_IM_FMT_IA) { alpha = low; }
++                    else { return TextureAlphaKind::Unknown; }
++                }
++                else if (RGBA32) {
++                    alpha = byteAt(y, x * 2 + 1, 2048U);
++                }
++                else {
++                    return TextureAlphaKind::Unknown;
++                }
++
++                if (alpha == 0) { clear++; }
++                else if (alpha >= 255) { solid++; }
++                else { partial++; }
++            }
++        }
++
++        // A tenth partial at most: a cut-out drawn with a soft rim is still a cut-out, a glow or a
++        // shaft is partial nearly everywhere (the 2026-10-08 inventory of every room in the game
++        // found the two kinds far apart).
++        const uint32_t total = clear + solid + partial;
++        if (clear == 0) {
++            return TextureAlphaKind::Opaque;
++        }
++
++        return ((partial * 10U) <= total) ? TextureAlphaKind::Cutout : TextureAlphaKind::Fade;
++    }
++
+     void TextureCache::queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM) {
+         assert(!decodeTMEM || ((width > 0) && (height > 0)));
+ 
++        // Patch 0027: what this texture's alpha is, while its memory is in hand.
++        if (decodeTMEM && (bytes != nullptr) && (bytesCount >= 4096)) {
++            const TextureAlphaKind alphaKind = classifyTextureAlpha(bytes, width, height, tlut, loadTile);
++            std::scoped_lock lock(textureAlphaKindMutex);
++            textureAlphaKinds[hash] = alphaKind;
++        }
++
+         TextureUpload newUpload;
+         newUpload.hash = hash;
+         newUpload.creationFrame = creationFrame;
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -40,6 +40,22 @@ namespace interop {
+ };
+ 
+ namespace RT64 {
++    // WHAT A TEXTURE'S ALPHA IS (patch 0027, OoT: Recompiled). Read once from the texture memory
++    // the first time a texture is queued, and kept by its hash for the framebuffer renderer, which
++    // has to decide whether a two-triangle translucent draw is a cut-out on a wall (traced, like
++    // the trees) or a glow, a shaft or water (left out of the traced scene). A CUT-OUT has clear
++    // texels and almost nothing between clear and solid; a FADE has partial alpha throughout;
++    // OPAQUE has no clear texel, so its transparency, if any, comes from a color, not the texture.
++    enum class TextureAlphaKind : uint8_t {
++        Unknown,
++        Opaque,
++        Cutout,
++        Fade
++    };
++
++    // Unknown until the texture's memory has been seen. Any thread.
++    TextureAlphaKind textureAlphaKind(uint64_t hash);
++
+     struct TextureUpload {
+         uint64_t hash;
+         uint64_t creationFrame;

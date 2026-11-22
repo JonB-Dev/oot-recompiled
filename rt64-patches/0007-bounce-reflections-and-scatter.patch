@@ -1,0 +1,814 @@
+From ed93177dc31fa2a84ddd90c4f5248be4249d4de7 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 24 Sep 2026 07:30:27 -0400
+Subject: [PATCH] Bounce light, reflections on water and the air catching light
+
+Patch 0007 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md).
+
+Level 3 of the row. The bounce pass sends one cosine weighted ray per pixel and takes the light
+arriving from what it hits as the light bounced onto the surface, which the direct pass adds to
+the game's ambient through the surface's own color. The reflection pass takes the water the
+primary probe found (a horizontal translucent surface in front of the opaque hit; translucent
+draws have a query mask of their own since patch 0006) and reflects one ray off it, weighted by
+Fresnel. The volumetric pass marches the eye's ray in a few jittered steps and sums the sun
+reaching the air (a shadow ray per step, under a sky only) and each local light's glow at the
+game's own falloff.
+
+The light arriving from a point is the frame's own color where the point is on screen and is
+what the frame shows there, the game's lit vertex color at the hit (interpolated from the RSP's
+shaded colors) scaled by what a texture takes on average where it is not, and the pixel's fog
+color where the ray left the scene, which is the game's own horizon.
+
+The composite gains its second output: the reflections and the scatter are light added to the
+frame, which a factor cannot carry, so the compose shader writes them to a second target and a
+second post process draw adds them onto the color target with an additive blend, after the
+multiply.
+
+Pinned edits, each marked "patch 0007": a visualization mode; the scatter texture in the common
+set, the compose set and the shader's register block; the compose pipeline's second target and
+the additive post process pipeline; the bounce dispatch before the direct pass and the scatter
+dispatch after it with their timer spans, the reflection dispatch timed; the compose barriers and
+the second post process draw; the debug view.
+
+diff --git a/src/render/rt64_descriptor_sets.h b/src/render/rt64_descriptor_sets.h
+index 68ee26e..b13a4fe 100644
+--- a/src/render/rt64_descriptor_sets.h
++++ b/src/render/rt64_descriptor_sets.h
+@@ -214,6 +214,7 @@ namespace RT64 {
+         uint32_t gBlueNoise;
+         uint32_t gOcclusion;    // patch 0006
+         uint32_t gLocalLight;   // patch 0006
++        uint32_t gScatter;      // patch 0007
+ 
+         FramebufferRendererDescriptorCommonSet(const SamplerLibrary &samplerLibrary, bool raytracing, RenderDevice *device = nullptr) {
+             builder.begin();
+@@ -286,6 +287,7 @@ namespace RT64 {
+             gBlueNoise = builder.addTexture(67);
+             gOcclusion = builder.addReadWriteTexture(68);    // patch 0006
+             gLocalLight = builder.addReadWriteTexture(69);   // patch 0006
++            gScatter = builder.addReadWriteTexture(70);      // patch 0007
+             builder.end();
+ 
+             if (device != nullptr) {
+@@ -442,6 +444,7 @@ namespace RT64 {
+         uint32_t gReflection;
+         uint32_t gRefraction;
+         uint32_t gTransparent;
++        uint32_t gScatter;   // patch 0007
+ 
+         RaytracingComposeDescriptorSet(const SamplerLibrary &samplerLibrary, RenderDevice *device = nullptr) {
+             builder.begin();
+@@ -453,6 +456,7 @@ namespace RT64 {
+             gReflection = builder.addTexture(5);
+             gRefraction = builder.addTexture(6);
+             gTransparent = builder.addTexture(7);
++            gScatter = builder.addTexture(8);   // patch 0007
+             builder.end();
+ 
+             if (device != nullptr) {
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 4e84a9e..92dd72f 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -372,6 +372,7 @@ namespace RT64 {
+             descCommonSet->setBuffer(descCommonSet->instanceExtraParams, drawBuffers->extraParamsBuffer.get(), RenderBufferStructuredView(sizeof(interop::ExtraParams)));
+             descCommonSet->setTexture(descCommonSet->gOcclusion, rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL);     // patch 0006
+             descCommonSet->setTexture(descCommonSet->gLocalLight, rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL);   // patch 0006
++            descCommonSet->setTexture(descCommonSet->gScatter, rtResources->scatterTexture.get(), RenderTextureLayout::GENERAL);         // patch 0007
+             descCommonSet->setBuffer(descCommonSet->RtParams, rtResources->rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
+         }
+ #   endif
+@@ -783,7 +784,8 @@ namespace RT64 {
+                 RenderTextureBarrier(rtResources->filteredIndirectLightTexture[0].get(), RenderTextureLayout::GENERAL),
+                 RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
+                 RenderTextureBarrier(rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL),    // patch 0006
+-                RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL)    // patch 0006
++                RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL),   // patch 0006
++                RenderTextureBarrier(rtResources->scatterTexture.get(), RenderTextureLayout::GENERAL)       // patch 0007
+             };
+ 
+             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCreationBarriers, uint32_t(std::size(afterCreationBarriers)));
+@@ -847,9 +849,17 @@ namespace RT64 {
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+         rtResources->timerEnd(worker, RaytracingResources::Span::Lights);
+ 
++        // The bounce (patch 0007), which the direct pass reads as well.
++        RT64_LOG_PRINTF("Dispatching indirect light rays");
++        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 2;
++        rtResources->timerBegin(worker, RaytracingResources::Span::Bounce);
++        worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++        rtResources->timerEnd(worker, RaytracingResources::Span::Bounce);
++
+         RenderTextureBarrier factorInputBarriers[] = {
+             RenderTextureBarrier(rtResources->occlusionTexture.get(), RenderTextureLayout::GENERAL),
+-            RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL)
++            RenderTextureBarrier(rtResources->localLightTexture.get(), RenderTextureLayout::GENERAL),
++            RenderTextureBarrier(rtResources->indirectLightTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL)   // patch 0007
+         };
+ 
+         worker->commandList->barriers(RenderBarrierStage::COMPUTE, factorInputBarriers, uint32_t(std::size(factorInputBarriers)));
+@@ -861,15 +871,14 @@ namespace RT64 {
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+         rtResources->timerEnd(worker, RaytracingResources::Span::Shadows);
+ 
+-        // Dispatch rays for indirect light.
+-        RT64_LOG_PRINTF("Dispatching indirect light rays");
+-        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 2;
++        // The volumetric pass (patch 0007). The bounce moved before the direct pass, which reads
++        // it; this reads the primary pass alone and nothing reads it before the composite.
++        RT64_LOG_PRINTF("Dispatching scatter rays");
++        rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 7;
++        rtResources->timerBegin(worker, RaytracingResources::Span::Scatter);
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+-
+-        // Wait until indirect light is done before dispatching reflection or refraction rays.
+-        // TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
+-        // This barrier can be removed if this no longer happens, resulting in less serialization of the commands.
+-        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rtResources->indirectLightTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL));
++        rtResources->timerEnd(worker, RaytracingResources::Span::Scatter);
++        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rtResources->scatterTexture.get(), RenderTextureLayout::GENERAL));
+ 
+         // Dispatch rays for refraction.
+         RT64_LOG_PRINTF("Dispatching refraction rays");
+@@ -887,7 +896,9 @@ namespace RT64 {
+             // Dispatch rays for reflection.
+             RT64_LOG_PRINTF("Dispatching reflection rays");
+             rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 3;
++            rtResources->timerBegin(worker, RaytracingResources::Span::Reflections);   // patch 0007
+             worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++            rtResources->timerEnd(worker, RaytracingResources::Span::Reflections);
+             reflections--;
+ 
+             // Add a barrier to wait for the input UAVs to be finished if there's more passes left to be done.
+@@ -978,6 +989,8 @@ namespace RT64 {
+         // Barriers for shading buffers after rays are finished.
+         RenderTextureBarrier afterDispatchBarriers[] = {
+             RenderTextureBarrier(rtOutputCur, RenderTextureLayout::COLOR_WRITE),
++            RenderTextureBarrier(rtResources->additiveTexture.get(), RenderTextureLayout::COLOR_WRITE),   // patch 0007
++            RenderTextureBarrier(rtResources->scatterTexture.get(), RenderTextureLayout::SHADER_READ),     // patch 0007
+             RenderTextureBarrier(colorTarget->texture.get(), RenderTextureLayout::COLOR_WRITE),
+             RenderTextureBarrier(rtResources->diffuseTexture.get(), RenderTextureLayout::SHADER_READ),
+             RenderTextureBarrier(rtResources->reflectionTexture.get(), RenderTextureLayout::SHADER_READ),
+@@ -1006,6 +1019,7 @@ namespace RT64 {
+         // Switch resources to the correct states after composing the image
+         RenderTextureBarrier afterComposeBarriers[] = {
+             RenderTextureBarrier(rtOutputCur, RenderTextureLayout::SHADER_READ),
++            RenderTextureBarrier(rtResources->additiveTexture.get(), RenderTextureLayout::SHADER_READ),   // patch 0007
+             RenderTextureBarrier(rtResources->filteredDirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
+             RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
+             RenderTextureBarrier(rtResources->flowTexture.get(), RenderTextureLayout::SHADER_READ),
+@@ -1161,6 +1175,13 @@ namespace RT64 {
+         worker->commandList->setGraphicsDescriptorSet(rtResources->postProcessSet->get(), 0);
+         worker->commandList->drawInstanced(3, 1, 0, 0);
+ 
++        // The added light (patch 0007): the same quad once more through the additive pipeline,
++        // reading the composite's second output.
++        worker->commandList->setPipeline(shaderLibrary->postProcessAdd.pipeline.get());
++        worker->commandList->setGraphicsPipelineLayout(postProcess.pipelineLayout.get());
++        worker->commandList->setGraphicsDescriptorSet(rtResources->postProcessAddSet->get(), 0);
++        worker->commandList->drawInstanced(3, 1, 0, 0);
++
+         // Draw debug view on top.
+         if (rtResources->rtParams.visualizationMode != interop::VisualizationMode::Final) {
+             const ShaderRecord &debugShader = shaderLibrary->debug;
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index bc92fc1..f967822 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -243,8 +243,9 @@ namespace RT64 {
+             const uint32_t i = uint32_t(span);
+             return (spanFrames[i] > 0) ? (spanMilliseconds[i] / spanFrames[i]) : 0.0;
+         };
+-        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao %.3f lights %.3f gi 0.000 reflect 0.000 scatter 0.000 filter 0.000 ms (gpu), recording %.3f ms, %u frames\n",
+-            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), spanMs(Span::Occlusion), spanMs(Span::Lights), recordingMs, buildFrames);
++        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao %.3f lights %.3f gi %.3f reflect %.3f scatter %.3f filter 0.000 ms (gpu), recording %.3f ms, %u frames\n",
++            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), spanMs(Span::Occlusion), spanMs(Span::Lights),
++            spanMs(Span::Bounce), spanMs(Span::Reflections), spanMs(Span::Scatter), recordingMs, buildFrames);
+ 
+         // The scene's lights as the passes see them (patch 0005), beside the budget line.
+         std::fprintf(stderr, "[rt] light sun (%.2f %.2f %.2f) toward (%.2f %.2f %.2f) ambient (%.2f %.2f %.2f) point lights %u\n",
+@@ -388,6 +389,8 @@ namespace RT64 {
+         retire(lockMaskTexture);
+         retire(occlusionTexture);
+         retire(localLightTexture);
++        retire(scatterTexture);
++        retire(additiveTexture);
+         retire(lumaAverageTexture);
+         retire(downscaledOutputTexture);
+         retire(upscaledOutputTexture);
+@@ -428,6 +431,11 @@ namespace RT64 {
+         // at it (patch 0006), both read by the shadow pass for its factor.
+         occlusionTexture = makeStorage(device, width, height, RenderFormat::R16_FLOAT);
+         localLightTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++
++        // Patch 0007: the scatter pass's output, and the composite's additive output, which is
++        // the second attachment of the output framebuffers below.
++        scatterTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        additiveTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT, RenderTextureFlag::RENDER_TARGET);
+         lumaAverageTexture = makeStorage(device, 1, 1, RenderFormat::R32_FLOAT);
+         downscaledOutputTexture = makeStorage(device, std::max(width / 8, 1u), std::max(height / 8, 1u), RenderFormat::R32G32B32A32_FLOAT);
+         upscaledOutputTexture = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::RENDER_TARGET);
+@@ -443,8 +451,8 @@ namespace RT64 {
+             // The compose pass draws into this one, so its format is the compose pipeline's
+             // (rt64_shader_library.cpp: R32G32B32A32_FLOAT) and it is a render target too.
+             outputTexture[i] = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::RENDER_TARGET);
+-            const RenderTexture *attachment = outputTexture[i].get();
+-            outputFramebuffer[i] = device->createFramebuffer(RenderFramebufferDesc(&attachment, 1));
++            const RenderTexture *attachments[] = { outputTexture[i].get(), additiveTexture.get() };   // the factor and the added light (patch 0007)
++            outputFramebuffer[i] = device->createFramebuffer(RenderFramebufferDesc(attachments, uint32_t(std::size(attachments))));
+         }
+ 
+         // The any hit buffers: MaxHitQueries records per pixel, each of the width its view says.
+@@ -487,6 +495,7 @@ namespace RT64 {
+             lumaSet = std::make_unique<LuminanceHistogramDescriptorSet>(device);
+             lumaSetSet = std::make_unique<HistogramSetDescriptorSet>(device);
+             postProcessSet = std::make_unique<PostProcessDescriptorSet>(shaderLibrary->samplerLibrary, device);
++            postProcessAddSet = std::make_unique<PostProcessDescriptorSet>(shaderLibrary->samplerLibrary, device);   // patch 0007
+             setsCreated = true;
+         }
+ 
+@@ -505,6 +514,7 @@ namespace RT64 {
+         composeSet->setTexture(composeSet->gReflection, reflectionTexture.get(), RenderTextureLayout::SHADER_READ);
+         composeSet->setTexture(composeSet->gRefraction, refractionTexture.get(), RenderTextureLayout::SHADER_READ);
+         composeSet->setTexture(composeSet->gTransparent, transparentTexture.get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gScatter, scatterTexture.get(), RenderTextureLayout::SHADER_READ);   // patch 0007
+ 
+         // The filter alternates between the two filtered slots: set 0 reads the first and writes
+         // the second, set 1 the other way, which is the order the renderer's loop and its
+@@ -531,6 +541,12 @@ namespace RT64 {
+         postProcessSet->setTexture(postProcessSet->gInput, outputCur, RenderTextureLayout::SHADER_READ);
+         postProcessSet->setTexture(postProcessSet->gFlow, flowTexture.get(), RenderTextureLayout::SHADER_READ);
+         postProcessSet->setTexture(postProcessSet->gLumaAvg, lumaAverageTexture.get(), RenderTextureLayout::SHADER_READ);
++
++        // The second post process draw reads the composite's added light (patch 0007).
++        postProcessAddSet->setBuffer(postProcessAddSet->RtParams, rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
++        postProcessAddSet->setTexture(postProcessAddSet->gInput, additiveTexture.get(), RenderTextureLayout::SHADER_READ);
++        postProcessAddSet->setTexture(postProcessAddSet->gFlow, flowTexture.get(), RenderTextureLayout::SHADER_READ);
++        postProcessAddSet->setTexture(postProcessAddSet->gLumaAvg, lumaAverageTexture.get(), RenderTextureLayout::SHADER_READ);
+     }
+ 
+     void RaytracingResources::updateMultisampling() {
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index c552999..eab299f 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -175,6 +175,12 @@ namespace RT64 {
+         // color, read by the direct pass for its factor.
+         std::unique_ptr<RenderTexture> occlusionTexture;
+         std::unique_ptr<RenderTexture> localLightTexture;
++
++        // The volumetric pass's in-scattered light (patch 0007), and the composite's second
++        // output: the light added to the frame (reflections, scatter) that a factor cannot carry,
++        // drawn onto the color target by a second post process draw with an additive blend.
++        std::unique_ptr<RenderTexture> scatterTexture;
++        std::unique_ptr<RenderTexture> additiveTexture;
+         std::unique_ptr<RenderTexture> downscaledOutputTexture;
+         std::unique_ptr<RenderTexture> lumaAverageTexture;
+         std::unique_ptr<RenderTexture> upscaledOutputTexture;
+@@ -199,6 +205,7 @@ namespace RT64 {
+         std::unique_ptr<LuminanceHistogramDescriptorSet> lumaSet;
+         std::unique_ptr<HistogramSetDescriptorSet> lumaSetSet;
+         std::unique_ptr<PostProcessDescriptorSet> postProcessSet;
++        std::unique_ptr<PostProcessDescriptorSet> postProcessAddSet;   // the added light's draw (patch 0007)
+ 
+         // The targets the interleaved raster scenes draw to.
+         std::vector<std::unique_ptr<RenderTarget>> interleavedColorTargetVector;
+@@ -267,6 +274,9 @@ namespace RT64 {
+             Shadows,
+             Occlusion,   // patch 0006
+             Lights,      // patch 0006
++            Bounce,      // patch 0007
++            Reflections, // patch 0007
++            Scatter,     // patch 0007
+             Count
+         };
+ 
+diff --git a/src/render/rt64_raytracing_shader_cache.cpp b/src/render/rt64_raytracing_shader_cache.cpp
+index 7748cf7..b5798c6 100644
+--- a/src/render/rt64_raytracing_shader_cache.cpp
++++ b/src/render/rt64_raytracing_shader_cache.cpp
+@@ -65,6 +65,7 @@ namespace RT64 {
+             RenderRaytracingPipelineLibrarySymbol("RefractionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
+             RenderRaytracingPipelineLibrarySymbol("OcclusionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
+             RenderRaytracingPipelineLibrarySymbol("LightsRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("ScatterRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
+             RenderRaytracingPipelineLibrarySymbol("SurfaceMiss", RenderRaytracingPipelineLibrarySymbolType::MISS),
+             RenderRaytracingPipelineLibrarySymbol("ShadowMiss", RenderRaytracingPipelineLibrarySymbolType::MISS),
+             RenderRaytracingPipelineLibrarySymbol("SurfaceClosestHit", RenderRaytracingPipelineLibrarySymbolType::CLOSEST_HIT),
+@@ -100,6 +101,7 @@ namespace RT64 {
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Refraction)] = state.pipeline->getProgram("RefractionRayGen");
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Occlusion)] = state.pipeline->getProgram("OcclusionRayGen");
+         state.rayGenPrograms[uint32_t(RaytracingRayGen::Lights)] = state.pipeline->getProgram("LightsRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Scatter)] = state.pipeline->getProgram("ScatterRayGen");
+         state.missPrograms[uint32_t(RaytracingMiss::Surface)] = state.pipeline->getProgram("SurfaceMiss");
+         state.missPrograms[uint32_t(RaytracingMiss::Shadow)] = state.pipeline->getProgram("ShadowMiss");
+ 
+diff --git a/src/render/rt64_raytracing_shader_cache.h b/src/render/rt64_raytracing_shader_cache.h
+index 3c4f04f..1623316 100644
+--- a/src/render/rt64_raytracing_shader_cache.h
++++ b/src/render/rt64_raytracing_shader_cache.h
+@@ -49,6 +49,7 @@ namespace RT64 {
+         Refraction = 4,
+         Occlusion = 5,   // patch 0006: after the pinned five, whose indices the renderer's dispatch names
+         Lights = 6,      // patch 0006
++        Scatter = 7,     // patch 0007
+         Count
+     };
+ 
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index f877f12..9e1cf26 100644
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -295,7 +295,10 @@ namespace RT64 {
+             pipelineDesc.pipelineLayout = compose.pipelineLayout.get();
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+             pipelineDesc.renderTargetFormat[0] = RenderFormat::R32G32B32A32_FLOAT;
+-            pipelineDesc.renderTargetCount = 1;
++            // The second output: the light added to the frame (patch 0007).
++            pipelineDesc.renderTargetBlend[1] = RenderBlendDesc::Copy();
++            pipelineDesc.renderTargetFormat[1] = RenderFormat::R16G16B16A16_FLOAT;
++            pipelineDesc.renderTargetCount = 2;
+             pipelineDesc.vertexShader = fullScreenVertexShader.get();
+             pipelineDesc.pixelShader = pixelShader.get();
+             compose.pipeline = device->createGraphicsPipeline(pipelineDesc);
+@@ -861,6 +864,19 @@ namespace RT64 {
+             pipelineDesc.pixelShader = pixelShader.get();
+             pipelineDesc.multisampling = multisampling;
+             postProcess.pipeline = device->createGraphicsPipeline(pipelineDesc);
++
++            // Patch 0007: the same shader once more with an additive blend, for the composite's
++            // added light (the reflections, the scatter). It shares the post process layout.
++            RenderBlendDesc additive;
++            additive.blendEnabled = true;
++            additive.srcBlend = RenderBlend::ONE;
++            additive.dstBlend = RenderBlend::ONE;
++            additive.blendOp = RenderBlendOperation::ADD;
++            additive.srcBlendAlpha = RenderBlend::ZERO;
++            additive.dstBlendAlpha = RenderBlend::ONE;
++            additive.blendOpAlpha = RenderBlendOperation::ADD;
++            pipelineDesc.renderTargetBlend[0] = additive;
++            postProcessAdd.pipeline = device->createGraphicsPipeline(pipelineDesc);
+         }
+         
+         // Raytracing debug.
+diff --git a/src/render/rt64_shader_library.h b/src/render/rt64_shader_library.h
+index 641f3ec..edc0a8f 100644
+--- a/src/render/rt64_shader_library.h
++++ b/src/render/rt64_shader_library.h
+@@ -41,6 +41,7 @@ namespace RT64 {
+         ShaderRecord im3dTriangle;
+         ShaderRecord luminanceHistogram;
+         ShaderRecord postProcess;
++        ShaderRecord postProcessAdd;   // patch 0007: the added light's draw, an additive blend over the same layout
+         ShaderRecord rspModify;
+         ShaderRecord rspProcess;
+         ShaderRecord rspSmoothNormal;
+diff --git a/src/shaders/ComposePS.hlsl b/src/shaders/ComposePS.hlsl
+index 03e832c..369b2f2 100644
+--- a/src/shaders/ComposePS.hlsl
++++ b/src/shaders/ComposePS.hlsl
+@@ -14,6 +14,7 @@ Texture2D<float4> gIndirectLight : register(t4);
+ Texture2D<float4> gReflection : register(t5);
+ Texture2D<float4> gRefraction : register(t6);
+ Texture2D<float4> gTransparent : register(t7);
++Texture2D<float4> gScatter : register(t8);   // patch 0007
+ 
+ // OoT: Recompiled, patch 0005: the composite is a factor over the rasterized frame, not a color
+ // of its own. The rasterizer has already drawn every traced call with the game's own blender,
+@@ -22,13 +23,28 @@ Texture2D<float4> gTransparent : register(t7);
+ // the fraction of the game's shading that stands where the sun is blocked, one per channel, and
+ // the post process multiplies the frame by it (rt64_shader_library.cpp). A pixel no ray reached
+ // keeps its color.
+-float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
++//
++// Patch 0007 adds the second output: the light ADDED to the frame, which a factor cannot carry
++// (the reflections on water, the air catching light), in sRGB since the frame is, drawn onto
++// the color target by a second post process draw with an additive blend.
++struct ComposeOutput {
++    float4 factor : SV_Target0;
++    float4 added : SV_Target1;
++};
++
++ComposeOutput PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) {
++    ComposeOutput output;
+     float4 diffuse = gDiffuse.SampleLevel(gSampler, uv, 0);
+     if (diffuse.a > EPSILON) {
+         float3 directLight = gDirectLight.SampleLevel(gSampler, uv, 0).rgb;
+-        return float4(saturate(directLight), 1.0f);
++        output.factor = float4(saturate(directLight), 1.0f);
+     }
+     else {
+-        return float4(1.0f, 1.0f, 1.0f, 1.0f);
++        output.factor = float4(1.0f, 1.0f, 1.0f, 1.0f);
+     }
+-}
+\ No newline at end of file
++
++    const float3 reflection = gReflection.SampleLevel(gSampler, uv, 0).rgb;
++    const float3 scatter = gScatter.SampleLevel(gSampler, uv, 0).rgb;
++    output.added = float4(LinearToSrgb(saturate(reflection + scatter)), 1.0f);
++    return output;
++}
+diff --git a/src/shaders/DebugPS.hlsl b/src/shaders/DebugPS.hlsl
+index a11f5e1..9020138 100644
+--- a/src/shaders/DebugPS.hlsl
++++ b/src/shaders/DebugPS.hlsl
+@@ -120,6 +120,11 @@ float4 getLocalLight(float2 pos) {
+     return float4(LinearToSrgb(gLocalLight[pos].rgb), 1.0f);
+ }
+ 
++// Patch 0007: the volumetric pass's in-scattered light.
++float4 getScatter(float2 pos) {
++    return float4(LinearToSrgb(gScatter[pos].rgb), 1.0f);
++}
++
+ float4 getDepth(float2 pos) {
+     float d = gDepth[pos].r;
+     return float4(d, d, d, 1.0f);
+@@ -163,6 +168,8 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
+         return getAmbientOcclusion(uv * RtParams.resolution.xy);
+     case VisualizationMode::LocalLight:
+         return getLocalLight(uv * RtParams.resolution.xy);
++    case VisualizationMode::Scatter:
++        return getScatter(uv * RtParams.resolution.xy);
+     default:
+         return float4(0.5f, 0.5f, 0.5f, 1.0f);
+     }
+diff --git a/src/shaders/FbRendererRT.hlsli b/src/shaders/FbRendererRT.hlsli
+index e6c12b3..0d77559 100644
+--- a/src/shaders/FbRendererRT.hlsli
++++ b/src/shaders/FbRendererRT.hlsli
+@@ -56,6 +56,7 @@ RWTexture2D<float4> gFilteredIndirectLight : register(u66, space0);
+ Texture2D<float4> gBlueNoise : register(t67, space0);
+ RWTexture2D<float> gOcclusion : register(u68, space0);      // patch 0006
+ RWTexture2D<float4> gLocalLight : register(u69, space0);    // patch 0006
++RWTexture2D<float4> gScatter : register(u70, space0);       // patch 0007
+ 
+ // Set 3 - Framebuffer.
+ Texture2D<float4> gBackgroundColor : register(t1, space3);
+\ No newline at end of file
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+index 419c6c3..39febab 100644
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -31,11 +31,13 @@
+ static const uint DepthRayQueryMask = 0x1;
+ static const uint NoDepthRayQueryMask = 0x2;
+ static const uint ShadowCatcherRayQueryMask = 0x4;
++static const uint TranslucentRayQueryMask = 0x8;   // patch 0006: the XLU z mode, which only the water probe traces
+ 
+ struct SurfacePayload {
+     float hitDistance;      // RayTCurrent() at the closest hit, 0 on a miss
+     int instanceId;         // InstanceID(), which is the frame's instance draw call index, -1 on a miss
+     float3 hitNormal;       // the triangle's geometric normal, facing the ray
++    float3 shadedColor;     // the game's own lit vertex color at the hit, interpolated (patch 0007)
+ };
+ 
+ struct ShadowPayload {
+@@ -91,6 +93,7 @@ void clearOutputs(uint2 launchIndex) {
+     gDepth[launchIndex] = 0.0f;
+     gOcclusion[launchIndex] = 1.0f;
+     gLocalLight[launchIndex] = 0.0f;
++    gScatter[launchIndex] = 0.0f;
+ }
+ 
+ [shader("raygeneration")]
+@@ -119,6 +122,7 @@ void PrimaryRayGen() {
+     payload.hitDistance = 0.0f;
+     payload.instanceId = -1;
+     payload.hitNormal = 0.0f;
++    payload.shadedColor = 0.0f;
+     // Only the instances that take part in depth (rt64_common.h, DepthRayQueryMask): a draw
+     // call with depth test and write both off is the game painting a backdrop, and this game
+     // draws its sky as a box around the eye that way, which would otherwise stand in front of
+@@ -126,6 +130,24 @@ void PrimaryRayGen() {
+     TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
+ 
+     gViewDirection[launchIndex] = float4(direction, 0.0f);
++
++    // A second probe for the translucent draws no other ray sees (patch 0007): where the nearest
++    // one is a horizontal surface in front of the opaque hit, it is water, and the reflection
++    // pass takes its normal and distance from gShadingSpecular (zero where there is none).
++    if (RtParams.level >= 3) {
++        RayDesc probe = ray;
++        probe.TMax = (payload.instanceId >= 0) ? payload.hitDistance : ray.TMax;
++
++        SurfacePayload water;
++        water.hitDistance = 0.0f;
++        water.instanceId = -1;
++        water.hitNormal = 0.0f;
++        water.shadedColor = 0.0f;
++        TraceRay(SceneBVH, RAY_FLAG_NONE, TranslucentRayQueryMask, 0, 0, 0, probe, water);
++        if ((water.instanceId >= 0) && (abs(water.hitNormal.y) > 0.9f)) {
++            gShadingSpecular[launchIndex] = float4(water.hitNormal, water.hitDistance);
++        }
++    }
+     if (payload.instanceId >= 0) {
+         // A hit is lit by the passes: the diffuse alpha is what the composite reads to apply the
+         // direct light to the raster color (ComposePS.hlsl); a miss keeps alpha zero and the
+@@ -282,6 +304,66 @@ void LightsRayGen() {
+     gLocalLight[launchIndex] = float4(sum, 1.0f);
+ }
+ 
++// THE LIGHT ARRIVING FROM A POINT, for the bounce and the reflections (phase 56, patch 0007).
++// The frame's own color where the point is on screen and is the surface the frame shows there
++// (the raster picture, with the game's lighting and textures); the game's lit vertex color at
++// the hit, scaled by what a texture takes on average, where it is not; and the pixel's fog color
++// where the ray left the scene, which is the game's own horizon.
++static const float TextureAverage = 0.6f;     // what a texture multiplies the lit vertex color by, on average
++static const float BounceStrength = 0.25f;    // how much of the bounced light joins the game's own ambient
++static const float BounceRange = 1500.0f;     // world units a bounce ray travels
++static const float ReflectionRange = 4000.0f; // world units a reflection ray travels
++static const float ReflectionStrength = 0.8f;
++
++float3 fogColorOf(int instanceId) {
++    if (instanceId < 0) {
++        return RtParams.ambientBaseColor.rgb;
++    }
++
++    return instanceRDPParams[instanceRenderIndices[uint(instanceId)].instanceIndex].fogColor.rgb;
++}
++
++// The traced viewport's pixel of a world position, or false when it lies outside it or behind
++// the eye. The parameter block's matrices are written for row vectors; HLSL reads the same bytes
++// column major, so the product is taken on the left.
++bool viewportPixel(float3 position, out int2 pixel) {
++    const float4 clip = mul(RtParams.viewProj, float4(position, 1.0f));
++    if (clip.w <= 0.0f) {
++        pixel = int2(0, 0);
++        return false;
++    }
++
++    const float2 ndc = clip.xy / clip.w;
++    const float2 viewportOrigin = RtParams.viewport.xy;
++    const float2 viewportSize = RtParams.viewport.zw;
++    const float2 inViewport = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * viewportSize;
++    if (any(inViewport < 0.0f) || any(inViewport >= viewportSize)) {
++        pixel = int2(0, 0);
++        return false;
++    }
++
++    pixel = int2(viewportOrigin + inViewport);
++    return true;
++}
++
++float3 radianceFrom(float3 hitPosition, float3 shadedColor, bool hit, int pixelInstance) {
++    if (!hit) {
++        return fogColorOf(pixelInstance);
++    }
++
++    int2 pixel;
++    if (viewportPixel(hitPosition, pixel) && (gInstanceId[pixel] >= 0)) {
++        // The frame shows this point if what it shows at that pixel is the point itself.
++        const float3 shown = gShadingPosition[pixel].xyz;
++        const float tolerance = 4.0f + 0.02f * length(hitPosition - eyePosition());
++        if (length(shown - hitPosition) < tolerance) {
++            return SrgbToLinear(gBackgroundColor.Load(int3(pixel, 0)).rgb);
++        }
++    }
++
++    return shadedColor * TextureAverage;
++}
++
+ // THE DIRECT PASS: the factor the composite multiplies the game's own picture by. The game lit
+ // each surface with its ambient plus its directional light times the cosine (the denominator,
+ // which is what the raster color already holds); the numerator is the same light with the
+@@ -321,27 +403,197 @@ void DirectRayGen() {
+ 
+     const float occlusion = (RtParams.level >= 2) ? gOcclusion[launchIndex] : 1.0f;
+     const float3 local = (RtParams.level >= 2) ? gLocalLight[launchIndex].rgb : float3(0.0f, 0.0f, 0.0f);
++    const float3 bounce = (RtParams.level >= 3) ? gIndirectLightAccum[launchIndex].rgb * BounceStrength : float3(0.0f, 0.0f, 0.0f);
+     const float3 lit = ambient + sunColor * ndl;
+-    const float3 shaded = ambient * occlusion + sunColor * (ndl * visibility) + local;
++    const float3 shaded = ambient * occlusion + sunColor * (ndl * visibility) + local + bounce;
+     float3 factor;
+     factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;
+     factor.y = (lit.y > 1.0e-4f) ? (shaded.y / lit.y) : 1.0f;
+     factor.z = (lit.z > 1.0e-4f) ? (shaded.z / lit.z) : 1.0f;
++
++    // Water (patch 0007): the reflection pass adds what the surface reflects, so what it lets
++    // through is dimmed by the same Fresnel weight, and the two make one surface.
++    const float4 water = gShadingSpecular[launchIndex];
++    if ((RtParams.level >= 3) && (water.w > 0.0f)) {
++        float3 origin;
++        float3 direction;
++        if (primaryRay(launchIndex, origin, direction)) {
++            const float cosTheta = saturate(dot(-direction, normalize(water.xyz)));
++            const float fresnel = 0.02f + 0.98f * pow(1.0f - cosTheta, 5.0f);
++            factor *= 1.0f - fresnel * ReflectionStrength;
++        }
++    }
++
+     gDirectLightAccum[launchIndex] = float4(factor, 1.0f);
+ }
+ 
+-// The three passes that arrive with phases 55 and 56. Their records exist in the binding table
+-// from the start, so dispatching them is already the shape it will keep.
+-
++// THE BOUNCE PASS (phase 56, patch 0007). One cosine weighted ray per pixel; the light arriving
++// from what it hits is the estimate of the light bounced onto the surface, which the direct pass
++// adds to the game's ambient through the surface's own color at BounceStrength. Phase 57
++// accumulates the frames.
+ [shader("raygeneration")]
+-void IndirectRayGen() { }
++void IndirectRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    const int instance = gInstanceId[launchIndex];
++    if (instance < 0) {
++        return;
++    }
++
++    if (RtParams.level < 3) {
++        gIndirectLightAccum[launchIndex] = 0.0f;
++        return;
++    }
++
++    const float3 position = gShadingPosition[launchIndex].xyz;
++    const float3 normal = gShadingNormal[launchIndex].xyz;
++    const float3 direction = getCosHemisphereSampleBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 29, normal);
++
++    RayDesc ray;
++    ray.Origin = rayOrigin(position, normal);
++    ray.Direction = direction;
++    ray.TMin = 0.0f;
++    ray.TMax = BounceRange;
++
++    SurfacePayload payload;
++    payload.hitDistance = 0.0f;
++    payload.instanceId = -1;
++    payload.hitNormal = 0.0f;
++    payload.shadedColor = 0.0f;
++    TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++
++    // A ray that leaves the scene brings nothing: the sky's light is what the game's ambient
++    // already is, and adding the horizon's color again washed the open field out.
++    float3 radiance = 0.0f;
++    if (payload.instanceId >= 0) {
++        radiance = radianceFrom(ray.Origin + direction * payload.hitDistance, payload.shadedColor, true, instance);
++    }
++
++    gIndirectLightAccum[launchIndex] = float4(radiance, 1.0f);
++}
+ 
++// THE REFLECTION PASS (phase 56, patch 0007). Where the primary probe found water (a horizontal
++// translucent surface in front of the opaque hit), one ray reflected off it; the light arriving
++// from what it hits, weighted by Fresnel for water, is added to the frame.
+ [shader("raygeneration")]
+-void ReflectionRayGen() { }
++void ReflectionRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    const float4 water = gShadingSpecular[launchIndex];
++    if ((RtParams.level < 3) || (water.w <= 0.0f)) {
++        gReflection[launchIndex] = 0.0f;
++        return;
++    }
++
++    float3 origin;
++    float3 direction;
++    if (!primaryRay(launchIndex, origin, direction)) {
++        gReflection[launchIndex] = 0.0f;
++        return;
++    }
++
++    const float3 normal = normalize(water.xyz);
++    const float3 surface = origin + direction * water.w;
++    const float3 reflected = reflect(direction, normal);
++
++    RayDesc ray;
++    ray.Origin = surface + normal * ShadowBiasBase;
++    ray.Direction = reflected;
++    ray.TMin = 0.0f;
++    ray.TMax = ReflectionRange;
++
++    SurfacePayload payload;
++    payload.hitDistance = 0.0f;
++    payload.instanceId = -1;
++    payload.hitNormal = 0.0f;
++    payload.shadedColor = 0.0f;
++    TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++
++    float3 radiance;
++    if (payload.instanceId >= 0) {
++        radiance = radianceFrom(ray.Origin + reflected * payload.hitDistance, payload.shadedColor, true, gInstanceId[launchIndex]);
++    }
++    else {
++        // The sky: the frame's own where the reflected direction meets a pixel the frame shows
++        // sky in, else the pixel's fog color, the game's horizon.
++        int2 skyPixel;
++        if (viewportPixel(surface + reflected * RtParams.farDist, skyPixel) && (gInstanceId[skyPixel] < 0)) {
++            radiance = SrgbToLinear(gBackgroundColor.Load(int3(skyPixel, 0)).rgb);
++        }
++        else {
++            radiance = fogColorOf(gInstanceId[launchIndex]);
++        }
++    }
++
++    const float cosTheta = saturate(dot(-direction, normal));
++    const float fresnel = 0.02f + 0.98f * pow(1.0f - cosTheta, 5.0f);
++    gReflection[launchIndex] = float4(radiance * (fresnel * ReflectionStrength), 1.0f);
++}
+ 
+ [shader("raygeneration")]
+ void RefractionRayGen() { }
+ 
++// THE VOLUMETRIC PASS (phase 56b, patch 0007, the user's ask of 2026-09-23). The eye's ray to
++// the surface (or as far as ScatterRange) is marched in a few jittered steps; at each, the sun
++// reaches the air or does not (a shadow ray, so the shafts are the sun's own occluders' work,
++// under a sky only), and each local light's glow falls off as the game's lights do. The sum is
++// light added to the frame. The densities are design constants, small on purpose: the game has
++// its own fog, and this is the air catching light, not a second fog.
++static const uint ScatterSteps = 8;
++static const float ScatterRange = 2500.0f;     // world units
++static const float SunScatter = 0.000002f;     // per world unit of sunlit air: half a percent over the whole range
++static const float LightScatter = 0.0004f;     // per world unit at a light's center
++
++[shader("raygeneration")]
++void ScatterRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    if (RtParams.level < 3) {
++        gScatter[launchIndex] = 0.0f;
++        return;
++    }
++
++    float3 origin;
++    float3 direction;
++    if (!primaryRay(launchIndex, origin, direction)) {
++        gScatter[launchIndex] = 0.0f;
++        return;
++    }
++
++    // Only the air in front of a surface: the sky the game drew has its own haze in it, and a
++    // march to the range over every sky pixel lightened the whole sky evenly.
++    const int instance = gInstanceId[launchIndex];
++    if (instance < 0) {
++        gScatter[launchIndex] = 0.0f;
++        return;
++    }
++
++    const float end = min(ScatterRange, length(gShadingPosition[launchIndex].xyz - origin));
++
++    const bool sun = (RtParams.sunShadows != 0) && any(RtParams.sunColor.rgb > 0.0f);
++    const uint lights = min(RtParams.lightsCount, RtParams.maxLights);
++    const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 41);
++    const float step = end / float(ScatterSteps);
++    float3 sum = 0.0f;
++    for (uint s = 0; s < ScatterSteps; s++) {
++        const float3 p = origin + direction * ((float(s) + noise.x) * step);
++        if (sun) {
++            float hitDistance;
++            const float visibility = traceVisibility(p, RtParams.sunDirection.xyz, 1.0e6f, hitDistance);
++            sum += RtParams.sunColor.rgb * (visibility * SunScatter * step);
++        }
++
++        for (uint i = 0; i < lights; i++) {
++            const PointLight light = SceneLights[i];
++            const float3 toLight = light.position - p;
++            const float distance2 = dot(toLight, toLight);
++            const float radius2 = light.attenuationRadius * light.attenuationRadius;
++            if (distance2 < radius2) {
++                sum += light.diffuseColor * ((1.0f - distance2 / radius2) * LightScatter * step);
++            }
++        }
++    }
++
++    gScatter[launchIndex] = float4(sum, 1.0f);
++}
++
+ [shader("closesthit")]
+ void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
+     payload.hitDistance = RayTCurrent();
+@@ -363,6 +615,14 @@ void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersect
+     }
+ 
+     payload.hitNormal = normal;
++
++    // The game's own lit vertex color at the hit (the RSP's shaded colors, one float4 per
++    // vertex), for the bounce and the reflections where the frame cannot supply the color.
++    const float4 c0 = asfloat(shadedColBuffer.Load4(indices.x * 16));
++    const float4 c1 = asfloat(shadedColBuffer.Load4(indices.y * 16));
++    const float4 c2 = asfloat(shadedColBuffer.Load4(indices.z * 16));
++    const float2 b = attributes.barycentrics;
++    payload.shadedColor = (c0 * (1.0f - b.x - b.y) + c1 * b.x + c2 * b.y).rgb;
+ }
+ 
+ [shader("anyhit")]
+@@ -375,6 +635,7 @@ void SurfaceMiss(inout SurfacePayload payload) {
+     payload.hitDistance = 0.0f;
+     payload.instanceId = -1;
+     payload.hitNormal = 0.0f;
++    payload.shadedColor = 0.0f;
+ }
+ 
+ [shader("anyhit")]
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+index 6d81083..4aece46 100644
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -29,6 +29,7 @@ namespace interop {
+         Depth,
+         AmbientOcclusion,   // patch 0006
+         LocalLight,         // patch 0006
++        Scatter,            // patch 0007
+         Count
+     };
+ 

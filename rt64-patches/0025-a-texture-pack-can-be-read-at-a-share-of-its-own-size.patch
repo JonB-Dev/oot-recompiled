@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 7 Oct 2026 16:27:32 -0400
+Subject: [PATCH] A texture pack can be read at a share of its own size
+
+Patch 0025 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-07: "maybe don't start with a full like 4K texture pack ... have a 1080p
+version, a 2K version and a 4K version ... when you enable it, then it adds an additional option
+right underneath it for the resolution". And, on whether that would mean rewriting the pack: "Not
+possible to show it in a lower quality without actually updating the resolution of the real
+texture pack itself, then maybe we just need to find a different way to load it".
+
+It is possible without touching the pack. The renderer takes a replacement's scale from the
+texture it is actually given (TextureMap::replace: the replacement's width over the original's),
+so a PNG read at half its size maps exactly where the full one did. This patch reads each PNG
+replacement through stb_image_resize2 (already in contrib) at a share of its width and height,
+set by TextureCache::setReplacementDetail, which the streaming threads, the stall path and the
+debugger's replace path all pass to loadTextureFromBytes. The video memory a texture takes falls
+with the square, so half its size is a quarter of the memory; the user's pack, 35.5 GB when every
+texture is decoded, is about 8.9 GB at half.
+
+Resized in sRGB with straight alpha (STBIR_RGBA), so a cut-out's transparent texels do not bleed
+their color into its edge. A texture 64 texels or smaller on its longest side is read as made: it
+costs nothing worth saving and the game's own texture under it is often that small. A DDS
+replacement is read as made too: it carries its own mipmaps and is already a quarter of a PNG's
+size, and skipping its top levels is a separate change for when a DDS pack exists to test it with.
+
+The setting reaches textures loaded after it is made; the program reloads the pack when the row
+changes, which evicts every replacement so each is streamed again at the new size.
+RT64_REPLACEMENT_DETAIL is defined so the program can tell a renderer with this patch from one
+without it.
+
+At 100, which is the default and what every pack used before, the PNG path is unchanged.
+---
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -3,9 +3,12 @@
+ //
+ 
+ #define STB_IMAGE_IMPLEMENTATION
++// Patch 0025: the resizer the Texture detail row reads a PNG replacement through.
++#define STB_IMAGE_RESIZE_IMPLEMENTATION
+ 
+ #include "ddspp/ddspp.h"
+ #include "stb/stb_image.h"
++#include "stb/stb_image_resize2.h"
+ #include "xxHash/xxh3.h"
+ 
+ // Needs to be included before other headers.
+@@ -436,7 +439,7 @@ namespace RT64 {
+ 
+                 if (fileLoaded) {
+                     worker->commandList->begin();
+-                    Texture *texture = TextureCache::loadTextureFromBytes(worker->device, worker->commandList.get(), replacementBytes, uploadResource);
++                    Texture *texture = TextureCache::loadTextureFromBytes(worker->device, worker->commandList.get(), replacementBytes, uploadResource, nullptr, nullptr, textureCache->replacementDetail.load());
+                     worker->commandList->end();
+ 
+                     // Only execute the command list and wait if the texture was loaded successfully.
+@@ -929,7 +932,7 @@ namespace RT64 {
+         return true;
+     }
+ 
+-    Texture *TextureCache::loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool, std::mutex *uploadResourcePoolMutex) {
++    Texture *TextureCache::loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool, std::mutex *uploadResourcePoolMutex, uint32_t detailPercent) {
+         const uint32_t PNG_MAGIC = 0x474E5089;
+         Texture *replacementTexture = new Texture();
+         uint32_t magicNumber = *reinterpret_cast<const uint32_t *>(fileBytes.data());
+@@ -942,9 +945,41 @@ namespace RT64 {
+             int width, height;
+             stbi_uc *data = stbi_load_from_memory(fileBytes.data(), fileBytes.size(), &width, &height, nullptr, 4);
+             if (data != nullptr) {
+-                uint32_t rowPitch = uint32_t(width) * 4;
+-                size_t byteCount = uint32_t(height) * rowPitch;
+-                TextureCache::setRGBA32(replacementTexture, device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool);
++                // THE TEXTURE DETAIL ROW (patch 0025, OoT: Recompiled). A PNG replacement is read
++                // at a share of its own width and height, so a pack made for a 4K screen can be
++                // played at half its size, which is a quarter of the video memory, without a
++                // single file of the person's pack being rewritten. The renderer takes the
++                // replacement's scale from the texture it is actually given (TextureMap::replace,
++                // its width over the original's), so a smaller texture maps correctly with no
++                // other change.
++                //
++                // In sRGB, with alpha treated as straight rather than premultiplied (STBIR_RGBA),
++                // so a cut-out's transparent texels do not bleed their color into its edge.
++                //
++                // A texture 64 texels or smaller on its longest side is read as made: it costs
++                // nothing worth saving, and the game's own texture under it is often that small,
++                // so shrinking it would read worse than the original. A DDS replacement is read as
++                // made too: it carries its own mipmaps and is already a quarter of a PNG's size.
++                std::vector<uint8_t> reduced;
++                const uint8_t *pixels = data;
++                uint32_t outWidth = uint32_t(width);
++                uint32_t outHeight = uint32_t(height);
++                if ((detailPercent < 100) && (std::max(width, height) > 64)) {
++                    outWidth = std::max(1U, (uint32_t(width) * detailPercent + 50) / 100);
++                    outHeight = std::max(1U, (uint32_t(height) * detailPercent + 50) / 100);
++                    reduced.resize(size_t(outWidth) * outHeight * 4);
++                    if (stbir_resize_uint8_srgb(data, width, height, 0, reduced.data(), int(outWidth), int(outHeight), 0, STBIR_RGBA) != nullptr) {
++                        pixels = reduced.data();
++                    }
++                    else {
++                        outWidth = uint32_t(width);
++                        outHeight = uint32_t(height);
++                    }
++                }
++
++                uint32_t rowPitch = outWidth * 4;
++                size_t byteCount = outHeight * rowPitch;
++                TextureCache::setRGBA32(replacementTexture, device, commandList, pixels, byteCount, outWidth, outHeight, rowPitch, dstUploadResource, resourcePool);
+                 stbi_image_free(data);
+                 loadedTexture = true;
+             }
+@@ -1161,7 +1196,7 @@ namespace RT64 {
+                         // Load the texture directly on this thread (operation was defined as Stall).
+                         else if (textureMap.replacementMap.fileSystems[resolvedPath.fileSystemIndex]->load(resolvedPath.relativePath, replacementBytes)) {
+                             replacementUploadResources.emplace_back();
+-                            replacementTexture = TextureCache::loadTextureFromBytes(copyWorker->device, copyWorker->commandList.get(), replacementBytes, replacementUploadResources.back());
++                            replacementTexture = TextureCache::loadTextureFromBytes(copyWorker->device, copyWorker->commandList.get(), replacementBytes, replacementUploadResources.back(), nullptr, nullptr, replacementDetail.load());
+                             textureMapMutex.lock();
+                             textureMap.replacementMap.addLoadedTexture(replacementTexture, resolvedPath.fileSystemIndex, resolvedPath.relativePath, true);
+                             textureMapMutex.unlock();
+@@ -1347,7 +1382,7 @@ namespace RT64 {
+         if (newTexture == nullptr) {
+             std::unique_ptr<RenderBuffer> dstUploadBuffer;
+             loaderCommandList->begin();
+-            newTexture = TextureCache::loadTextureFromBytes(copyWorker->device, loaderCommandList.get(), replacementBytes, dstUploadBuffer);
++            newTexture = TextureCache::loadTextureFromBytes(copyWorker->device, loaderCommandList.get(), replacementBytes, dstUploadBuffer, nullptr, nullptr, replacementDetail.load());
+             loaderCommandList->end();
+ 
+             if (newTexture != nullptr) {
+@@ -1782,6 +1817,10 @@ namespace RT64 {
+         textureMap.replacementMap.maxTexturePoolSize = maxSize;
+     }
+ 
++    void TextureCache::setReplacementDetail(uint32_t percent) {
++        replacementDetail.store(std::clamp(percent, 1U, 100U));
++    }
++
+     void TextureCache::getReplacementPoolStats(uint64_t &usedSize, uint64_t &cachedSize, uint64_t &maxSize) {
+         std::unique_lock lock(textureMapMutex);
+         usedSize = textureMap.replacementMap.usedTexturePoolSize;
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -22,6 +22,11 @@
+ #include "rt64_shader_library.h"
+ #include "rt64_texture.h"
+ 
++// Patch 0025 (OoT: Recompiled): the texture cache can read a pack's PNG textures at a share of
++// their own size. Defined so the program can tell a renderer built with the series from one
++// built without it.
++#define RT64_REPLACEMENT_DETAIL 1
++
+ namespace interop {
+     struct alignas(16) TextureDecodeCB {
+         uint2 Resolution;
+@@ -229,6 +234,10 @@ namespace RT64 {
+         std::mutex uploadResourcePoolMutex;
+         uint32_t lockCounter;
+         bool developerMode;
++        // Patch 0025: the share of its own width and height, in percent, that a PNG replacement
++        // is read at. Read by the streaming threads as each texture loads, so a change reaches
++        // textures loaded after it; the caller reloads the pack to apply it to all of them.
++        std::atomic<uint32_t> replacementDetail = 100;
+ 
+         TextureCache(RenderWorker *directWorker, RenderWorker *copyWorker, uint32_t threadCount, const ShaderLibrary *shaderLibrary);
+         ~TextureCache();
+@@ -258,11 +267,12 @@ namespace RT64 {
+         void addStreamLoadTime(uint64_t streamLoadTime);
+         uint64_t getAverageStreamLoadTime();
+         void setReplacementPoolMaxSize(uint64_t maxSize);
++        void setReplacementDetail(uint32_t percent);
+         void getReplacementPoolStats(uint64_t &usedSize, uint64_t &cachedSize, uint64_t &maxSize);
+         Texture *getTexture(uint32_t textureIndex);
+         static void setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+         static bool setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+         static bool setLowMipCache(RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, std::unordered_map<std::string, LowMipCacheTexture> &dstTextureMap, uint64_t &totalMemory);
+-        static Texture *loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
++        static Texture *loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr, uint32_t detailPercent = 100);
+     };
+ };
+\ No newline at end of file

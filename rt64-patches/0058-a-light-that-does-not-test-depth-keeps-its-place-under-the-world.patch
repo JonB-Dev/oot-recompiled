@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Mon, 12 Oct 2026 19:26:03 -0400
+Subject: [PATCH] A light that does not test depth keeps its place under the world
+
+Patch 0058 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-12, a frame of Hyrule Field at dusk: "this regressed the sun spot issue we
+fixed". 0056 moved every see-through draw it takes as light after the composite, the sun's glow
+with it: blended, with no depth test, drawn after the sky and before the rooms, so only the world
+drawn over it ever hid it behind a hill. 0040 keeps such a draw in place for that reason. Now a draw
+is taken as light only when it tests depth, which is what keeps it behind the world once moved.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 7da53ec..8ad248a 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2999,9 +2999,18 @@ namespace RT64 {
+                         // SEE-THROUGH LIGHT CASTS NO SHADOW (patch 0056, above seeThroughIsLight).
+                         // A blended draw that writes no depth counts as see-through here whatever its
+                         // z mode, a decal excepted (a shadow under a figure is a decal).
++                        //
++                        // ONLY A DRAW THAT TESTS DEPTH (patch 0058, the user, 2026-10-12, a frame of
++                        // Hyrule Field at dusk: "this regressed the sun spot issue we fixed"). Being light
++                        // moves a draw after the composite, where what keeps it behind the world is its
++                        // own depth test. The sun and its glow are blended with no depth test at all and
++                        // drawn right after the sky, BEFORE the rooms, so the world drawn over them is the
++                        // only thing that hides them behind a hill; 0040 keeps such a draw in place for
++                        // exactly that reason, and 0056 moved it anyway, so the sun floated mid screen in
++                        // front of everything again. A draw that does not test depth keeps its place.
+                         const bool blendedOver = otherMode.forceBlend() && !otherMode.zUpd() && (otherMode.zMode() != ZMODE_DEC);
+-                        if ((wasTranslucent || blendedOver) && !depthlessOverlay && defaultFamily && (raytracing.queryMask != TranslucentRayQueryMask) &&
+-                            seeThroughIsLight(drawData, call)) {
++                        if ((wasTranslucent || blendedOver) && otherMode.zCmp() && !depthlessOverlay && defaultFamily &&
++                            (raytracing.queryMask != TranslucentRayQueryMask) && seeThroughIsLight(drawData, call)) {
+                             raytracing.queryMask = TranslucentRayQueryMask;
+                         }
+ 

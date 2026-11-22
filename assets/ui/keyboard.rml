@@ -1,0 +1,31 @@
+<rml>
+<head>
+    <title>Keyboard</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="keyboard.rcss"/>
+</head>
+<!-- THE ON-SCREEN KEYBOARD (the menus plan, phase 110): so a pad can type a path in the ROM
+     browser. A layer over the menu: the layout engine moves among its keys by where they are
+     (src/ui/nav/), and the navigation check checks it at every size. The keys are
+     src/ui/keyboard/keyboard.cpp's rows, in its order; a key's id is its row and column there. -->
+<body class="kb-doc">
+    <div class="kb is-open" id="kb" data-nav="layer" data-back="close">
+        <div class="kb-line"><span id="kb-line">|</span></div>
+        <div class="kb-row" data-nav="group">
+            <div class="key" id="key-0-0" data-act="type"><span>1</span></div><div class="key" id="key-0-1" data-act="type"><span>2</span></div><div class="key" id="key-0-2" data-act="type"><span>3</span></div><div class="key" id="key-0-3" data-act="type"><span>4</span></div><div class="key" id="key-0-4" data-act="type"><span>5</span></div><div class="key" id="key-0-5" data-act="type"><span>6</span></div><div class="key" id="key-0-6" data-act="type"><span>7</span></div><div class="key" id="key-0-7" data-act="type"><span>8</span></div><div class="key" id="key-0-8" data-act="type"><span>9</span></div><div class="key" id="key-0-9" data-act="type"><span>0</span></div><div class="key" id="key-0-10" data-act="type"><span>-</span></div><div class="key" id="key-0-11" data-act="type"><span>_</span></div>
+        </div>
+        <div class="kb-row" data-nav="group">
+            <div class="key" id="key-1-0" data-act="type"><span>q</span></div><div class="key" id="key-1-1" data-act="type"><span>w</span></div><div class="key" id="key-1-2" data-act="type"><span>e</span></div><div class="key" id="key-1-3" data-act="type"><span>r</span></div><div class="key" id="key-1-4" data-act="type"><span>t</span></div><div class="key" id="key-1-5" data-act="type"><span>y</span></div><div class="key" id="key-1-6" data-act="type"><span>u</span></div><div class="key" id="key-1-7" data-act="type"><span>i</span></div><div class="key" id="key-1-8" data-act="type"><span>o</span></div><div class="key" id="key-1-9" data-act="type"><span>p</span></div><div class="key" id="key-1-10" data-act="type"><span>\</span></div><div class="key" id="key-1-11" data-act="type"><span>/</span></div>
+        </div>
+        <div class="kb-row" data-nav="group">
+            <div class="key" id="key-2-0" data-act="type"><span>a</span></div><div class="key" id="key-2-1" data-act="type"><span>s</span></div><div class="key" id="key-2-2" data-act="type"><span>d</span></div><div class="key" id="key-2-3" data-act="type"><span>f</span></div><div class="key" id="key-2-4" data-act="type"><span>g</span></div><div class="key" id="key-2-5" data-act="type"><span>h</span></div><div class="key" id="key-2-6" data-act="type"><span>j</span></div><div class="key" id="key-2-7" data-act="type"><span>k</span></div><div class="key" id="key-2-8" data-act="type"><span>l</span></div><div class="key" id="key-2-9" data-act="type"><span>:</span></div><div class="key" id="key-2-10" data-act="type"><span>.</span></div><div class="key" id="key-2-11" data-act="type"><span>,</span></div>
+        </div>
+        <div class="kb-row" data-nav="group">
+            <div class="key wide" id="key-3-0" data-act="type"><span>Shift</span></div><div class="key" id="key-3-1" data-act="type"><span>z</span></div><div class="key" id="key-3-2" data-act="type"><span>x</span></div><div class="key" id="key-3-3" data-act="type"><span>c</span></div><div class="key" id="key-3-4" data-act="type"><span>v</span></div><div class="key" id="key-3-5" data-act="type"><span>b</span></div><div class="key" id="key-3-6" data-act="type"><span>n</span></div><div class="key" id="key-3-7" data-act="type"><span>m</span></div><div class="key" id="key-3-8" data-act="type"><span>(</span></div><div class="key" id="key-3-9" data-act="type"><span>)</span></div><div class="key" id="key-3-10" data-act="type"><span>'</span></div><div class="key wide" id="key-3-11" data-act="type"><span>Backspace</span></div>
+        </div>
+        <div class="kb-row" data-nav="group">
+            <div class="key wide" id="key-4-0" data-act="type"><span>Space</span></div><div class="key wide" id="key-4-1" data-act="type"><span>Done</span></div>
+        </div>
+    </div>
+</body>
+</rml>

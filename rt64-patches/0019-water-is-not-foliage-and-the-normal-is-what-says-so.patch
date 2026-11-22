@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 20:45:00 +0100
+Subject: [PATCH] Water is not foliage, and the normal is what says so
+
+Patch 0019 of the renderer series (OoT: Recompiled).
+
+Four frames from the user named this between them. The default and the wider probe put a shadow ON
+the water's surface and showed no reflections; the rung that reclassifies without casting put the
+shadow on the bed under the water, correctly, and still showed no reflections; the old rule showed
+real reflections and no foliage shadows.
+
+All four follow from one thing: water is being reclassified as solid. Solid water is what the
+primary ray stops at, so a shadow lands on its surface instead of passing through to the bed. And
+the reflections cannot work at all while it is solid, because the probe looks for a translucent
+surface IN FRONT of the opaque hit and water IS that hit, which is why widening the probe's mask
+found nothing and was aimed at the wrong thing entirely.
+
+So water must stay as it was and foliage must not, and on the CPU the two are identical: both in
+the translucent z mode, both reading depth, neither writing it, both with plenty of triangles.
+What differs is the NORMAL, which is unknown when an instance is classified and known at the hit.
+The water probe has relied on exactly that since it was written.
+
+A horizontal face of a depthless translucent draw is now passed through at the hit, by both the
+surface ray and the shadow ray so the two agree, with the same threshold the probe uses. Water
+behaves as it did before any of this work, the probe finds it again, and foliage is untouched.
+
+On a rung, because the user asked for the reflection work to be cycled rather than applied and
+because the default is the state he confirmed.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -64,6 +64,13 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+ // because the primary ray's cut-out compare needs it long before those buffers exist.
+ bool hitWritesDepth(int instanceId);
+ 
++// Is this triangle of this instance a HORIZONTAL face of a draw in the translucent z mode that
++// never writes depth? That is water in this game, and it is the one thing the classification
++// cannot tell from foliage, because the two are identical in everything the CPU can see: both
++// translucent, both reading depth, neither writing it, both plenty of triangles. They differ in
++// their NORMAL, which is not known when an instance is classified and is known here.
++bool hitIsWaterLike(uint instanceId, uint primitiveIndex);
++
+ // IS A LADDER RUNG BELOW `rung` SELECTED (patch 0017)? The foliage work was settled on the
+ // Experiment row and then made the DEFAULT, because a fix nobody can find is not shipped: that
+ // row is for debugging and no player will ever cycle to its twenty-fifth option.
+@@ -1372,6 +1379,27 @@ bool hitWritesDepth(int instanceId) {
+     return true;
+ }
+ 
++bool hitIsWaterLike(uint instanceId, uint primitiveIndex) {
++    const RenderIndices ri = instanceRenderIndices[instanceId];
++    const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
++    const OtherMode otherMode = { rp.omL, rp.omH };
++    if ((otherMode.zMode() != ZMODE_XLU) || otherMode.zUpd()) {
++        return false;
++    }
++    const uint3 indices = indexBuffer.Load3((ri.faceIndicesStart + primitiveIndex * 3) * 4);
++    const float3 p0 = asfloat(posBuffer.Load3(indices.x * 16));
++    const float3 p1 = asfloat(posBuffer.Load3(indices.y * 16));
++    const float3 p2 = asfloat(posBuffer.Load3(indices.z * 16));
++    const float3 n = cross(p1 - p0, p2 - p0);
++    const float len2 = dot(n, n);
++    if (len2 <= 0.0f) {
++        return false;
++    }
++    // The same threshold the water probe has used since it was written, so the two agree about
++    // what water is rather than each having an opinion.
++    return abs(n.y * rsqrt(len2)) > 0.9f;
++}
++
+ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, bool primary) {
+     const RenderIndices ri = instanceRenderIndices[instanceId];
+     const RenderParams rp = DynamicRenderParams[ri.instanceIndex];
+@@ -1515,6 +1543,21 @@ float alphaCoverage(uint instanceId, uint primitiveIndex, float2 barycentrics, b
+ 
+ [shader("anyhit")]
+ void SurfaceAnyHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    // WATER IS NOT A SURFACE THESE RAYS STOP AT (patch 0019, rung 30). The foliage rule cannot
++    // tell water from foliage, because on the CPU they are identical, so it reclassifies both;
++    // and a solid water surface is what the user saw as a shadow lying ON the water instead of on
++    // the bed, and as reflections disappearing entirely. The reflections cannot work while water
++    // is solid at all: the probe looks for a translucent surface IN FRONT of the opaque hit, and
++    // when water IS that hit there is nothing in front of it, which no mask can repair.
++    //
++    // Decided here because the normal is known here and is not known when an instance is
++    // classified. A horizontal face of a depthless translucent draw is passed through exactly as
++    // it was before the foliage work, so the primary reaches the bed, the shadow lands on the bed,
++    // and the probe finds the water in front of it. A vertical one is foliage and is unaffected.
++    if (hitIsWaterLike(InstanceID(), PrimitiveIndex()) && (RtParams.tuneExperiment.x == 30.0f)) {
++        IgnoreHit();
++        return;
++    }
+     // Nothing of the surface in this pixel: the ray goes on. Anything of it: the hit stands, and
+     // the closest hit records how much (a partial cover far away weights the shading).
+     if (alphaCoverage(InstanceID(), PrimitiveIndex(), attributes.barycentrics, true) <= 0.0f) {
+@@ -1534,6 +1577,12 @@ void SurfaceMiss(inout SurfacePayload payload) {
+ 
+ [shader("anyhit")]
+ void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    // Water casts nothing either (patch 0019, rung 30), for the same reason and so that the two
++    // rays agree about what water is.
++    if (hitIsWaterLike(InstanceID(), PrimitiveIndex()) && (RtParams.tuneExperiment.x == 30.0f)) {
++        IgnoreHit();
++        return;
++    }
+     // A transparent texel casts no shadow (patch 0008): a tree line's quad shadowed as a slab.
+     if (alphaCoverage(InstanceID(), PrimitiveIndex(), attributes.barycentrics, false) <= 0.0f) {
+         IgnoreHit();
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1926,6 +1926,12 @@ namespace RT64 {
+                             case 27:
+                             case 28:
+                             case 29: solidDraw = otherMode.zCmp() && manyTriangles; break;
++                            // 30 is the default's classification plus the translucent bit, with
++                            // the shader passing a HORIZONTAL face of such a draw straight
++                            // through at the hit (patch 0019). So water behaves exactly as it
++                            // did before the foliage work, the probe finds it again, and foliage
++                            // is untouched.
++                            case 30: solidDraw = otherMode.zCmp() && manyTriangles; break;
+                             // THE DEFAULT IS NOW THE RULE THAT WON (patch 0017), which is rung 25:
+                             // a draw in the translucent z mode that READS depth and is more than a
+                             // sprite is solid, and it casts. The user, 2026-09-30, on that rung:
+@@ -1966,7 +1972,7 @@ namespace RT64 {
+                         // all the fixes for trees back"). Reading the code did not explain how, so
+                         // it is offered as something to observe rather than as a fix.
+                         if ((wasTranslucent && solidDraw) &&
+-                            ((cutoutRule == 27) || (cutoutRule == 29))) {
++                            ((cutoutRule == 27) || (cutoutRule == 29) || (cutoutRule == 30))) {
+                             raytracing.queryMask |= TranslucentRayQueryMask;
+                         }
+                         if (drawData.extraParams[call.callDesc.callIndex].shadowCatcherFactor > 0.0f) {

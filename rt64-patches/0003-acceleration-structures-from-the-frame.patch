@@ -1,0 +1,1413 @@
+From 0774b8c81edde899a7ccf76b1e586fda13d262c3 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 24 Sep 2026 01:12:36 -0400
+Subject: [PATCH] Acceleration structures from the frame, and the primary ray
+ that sees them
+
+Patch 0003 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md).
+
+The two headers patch 0002 declared are filled in. Every frame with ray tracing on builds one
+bottom level structure per traced draw call from the world space positions the vertex processor
+already writes and the draw call's own indices, into a pool that grows to the busiest frame,
+and one top level structure over them with the renderer's own query masks and hit groups; the
+output and history textures are made at the traced scene's size; the binding table, the lights
+and the instance records rotate through a ring as deep as the workload queue so the CPU never
+writes what the GPU is still reading; the descriptor sets of the compose, filter, luminance and
+post process passes are bound to those textures.
+
+The shader cache builds a pipeline over the raster path's four descriptor sets from one DXIL
+library, src/shaders/Raytracing.hlsl, with the five ray generation entries the renderer
+dispatches, two miss shaders and two hit groups. Only the primary ray does work: it walks the
+structures (the instances that take part in depth; the sky box around the eye carries the
+no-depth mask) and writes the hit distance, the world position, the geometric normal and the
+instance, and hands the raster color of the pixel to the diffuse buffer for the passes that
+come. The pinned composite lights that buffer and no pass writes a light yet, so the final view
+is black at this phase; the depth view draws the scene as the rays see it, which is what this
+phase proves, and phase 54 composites into the raster output. The build is traced once a second.
+
+Three changes to the pinned renderer ride along, each marked "patch 0003" where it sits: the
+projection pass runs whenever ray tracing is on, because the traced scene reads the transforms
+only it fills; the binding table is built after the descriptor sets exist rather than before;
+and the traced scene is the perspective projection with the most draw calls plus everything
+sharing its matrices, because this game draws its sky first under a view of its own and the
+first-perspective-projection heuristic traced four sky quads and rasterized the world.
+
+Buffers that grow (a structure, a scratch) are retired for as many frames as the queue keeps in
+flight rather than freed at once, and the top level structure is built even when the frame has
+no instances, so the descriptor that names it is never left unwritten.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fbcd20c..bb2fb47 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -509,6 +509,12 @@ if (${WIN32})
+     build_library_shader(rt64 "src/shaders/RasterVS.hlsl" "src/shaders/RasterVSLibrary.hlsl")
+ endif()
+ 
++# The ray tracing library (patch 0003): every ray generation, miss and hit shader in one DXIL
++# library, only when the path is built. This renderer is D3D12 only, so no SPIR-V is compiled.
++if (${RT64_RAYTRACING} AND ${WIN32})
++    build_shader_dxil(rt64 "src/shaders/Raytracing.hlsl" "${DXC_LB_OPTS}")
++endif()
++
+ build_pixel_shader(  rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSDynamic.hlsl" "-D DYNAMIC_RENDER_PARAMS")
+ build_pixel_shader(  rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSDynamicMS.hlsl" "-D DYNAMIC_RENDER_PARAMS" "-D MULTISAMPLING")
+ build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstant.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS")
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 5a331aa..d546d24 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -303,7 +303,12 @@ namespace RT64 {
+         rendererCPUProfiler.start();
+ 
+         const bool aspectRatioAdjustment = (abs(workloadConfig.aspectRatioScale - 1.0f) > 1e-6f);
+-        const bool processProjections = aspectRatioAdjustment || prevFrame.matched|| curFrame.isDebuggerCameraEnabled(*this);
++        bool processProjections = aspectRatioAdjustment || prevFrame.matched|| curFrame.isDebuggerCameraEnabled(*this);
++#   if RT_ENABLED
++        // The traced scene reads the modified and the previous transforms, and only this pass
++        // fills them (patch 0003). Without it the first traced frames read empty vectors.
++        processProjections = processProjections || workloadConfig.raytracingEnabled;
++#   endif
+         bool uploadProjections = false;
+         if (processProjections) {
+             ProjectionProcessor::ProcessParams projParams;
+@@ -387,7 +392,12 @@ namespace RT64 {
+                 rspProcessor->process(rspParams);
+             }
+ 
+-            const bool processWorldVertices = prevFrame.matched;
++            bool processWorldVertices = prevFrame.matched;
++#   if RT_ENABLED
++            // The traced structures are built from the world positions this pass writes, so it
++            // runs on every traced frame, matched or not (patch 0003).
++            processWorldVertices = processWorldVertices || workloadConfig.raytracingEnabled;
++#   endif
+             if (processWorldVertices) {
+                 workload.resetWorldOutputBuffers();
+ 
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 9fae0d4..405afef 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -118,7 +118,10 @@ namespace RT64 {
+     }
+ 
+     hlslpp::float3 viewDirectionFrom(hlslpp::float4x4 viewI) {
+-        return hlslpp::normalize(viewI[2].xyz);
++        // The third row of the inverse view is the world direction of the view space's
++        // positive Z, and the camera looks down its NEGATIVE Z (fovFromProj reads the same
++        // projection's -m[2][3]), so the direction is that row negated (patch 0003).
++        return -hlslpp::normalize(viewI[2].xyz);
+     }
+ 
+     RenderColor toRenderColor(hlslpp::float4 v) {
+@@ -747,12 +750,9 @@ namespace RT64 {
+         rtParams.binaryLockMask = (rtResources->upscalerMode != UpscaleMode::FSR);
+         rtParams.interleavedRastersCount = interleavedRastersCount;
+         
+-        Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
+-        RenderDescriptorSet *descRealDepthSet = framebuffer.descRealFbSet->get();
+-        RenderDescriptorSet *descriptorSets[] = { descCommonSet->get(), descTextureSet->get(), descTextureSet->get(), descRealDepthSet };
+         rtResources->updateTopLevelASResources(worker, instanceDrawCallVector, rtScene.instanceIndices);
+-        rtResources->createShaderBindingTable(worker, rtState, descriptorSets, uint32_t(std::size(descriptorSets)), hitGroupVector);
+         rtResources->updateLightsBuffer(worker, rtScene);
++        // The binding table is built in endFramebuffers, after the descriptor sets exist (patch 0003).
+     }
+     
+     void FramebufferRenderer::submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene) {
+@@ -1335,6 +1335,12 @@ namespace RT64 {
+         }
+ 
+         Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
++
++        // This slot is reused every frame and its transition set is only ever added to (the
++        // traced scene's interleaved targets, endFramebuffers), so it kept every pointer it had
++        // ever been given, targets since remade included (patch 0003).
++        framebuffer.transitionRenderTargetSet.clear();
++
+         void *paramBufferBytes = framebuffer.paramsBuffer->map();
+         memcpy(paramBufferBytes, &fbParams, sizeof(interop::FramebufferParams));
+         framebuffer.paramsBuffer->unmap();
+@@ -1450,6 +1456,25 @@ namespace RT64 {
+         uint32_t vertexTestZFaceIndicesStart = 0;
+         int32_t vertexTestZCallIndex = -1;
+         RenderViewport viewportClip;
++#       if RT_ENABLED
++        // THE TRACED SCENE IS THE PERSPECTIVE PROJECTION WITH THE MOST DRAW CALLS, and everything
++        // that shares its matrices (patch 0003). The heuristic below otherwise locks the scene
++        // onto the first perspective projection of the pair; this game draws its sky first, under
++        // a view of its own, so the scene would hold the four sky quads and the world after them
++        // would be judged incompatible and rasterized.
++        int32_t rtMainTransforms = -1;
++        uint32_t rtMainCalls = 0;
++        if (p.rtEnabled) {
++            for (uint32_t pr = 0; pr < fbPair.projectionCount; pr++) {
++                const Projection &candidate = fbPair.projections[pr];
++                if ((candidate.type == Projection::Type::Perspective) && !candidate.scissorRect.isNull() && (candidate.gameCallCount > rtMainCalls)) {
++                    rtMainCalls = candidate.gameCallCount;
++                    rtMainTransforms = int32_t(candidate.transformsIndex);
++                }
++            }
++        }
++#       endif
++
+         for (uint32_t pr = 0; (pr < fbPair.projectionCount) && (globalCallIndex < p.maxGameCall); pr++) {
+             const Projection &proj = fbPair.projections[pr];
+             if (proj.scissorRect.isNull()) {
+@@ -1462,6 +1487,14 @@ namespace RT64 {
+             const bool perspProj = (proj.type == Projection::Type::Perspective);
+             bool rtProj = p.rtEnabled && perspProj && fbPair.depthWrite && targetDrawCall.rtScenes.empty(); // TODO: Remove the last condition once multiple heaps per RT scene are supported.
+ 
++            // Only a projection that shares the main one's matrices starts or joins the traced
++            // scene (patch 0003, see the choice above the loop).
++            if (rtProj && (rtMainTransforms >= 0)) {
++                const float MainThreshold = 1e-6f;
++                rtProj = (matrixDifference(drawData.modViewTransforms[proj.transformsIndex], drawData.modViewTransforms[rtMainTransforms]) < MainThreshold) &&
++                         (matrixDifference(drawData.modProjTransforms[proj.transformsIndex], drawData.modProjTransforms[rtMainTransforms]) < MainThreshold);
++            }
++
+             // Make sure the matrices are compatible if we're switching to a new projection.
+             bool rtProjCompatible = true;
+             if (rtProj && (!rtScene.instanceIndices.empty())) {
+@@ -1718,7 +1751,12 @@ namespace RT64 {
+                         rtScene.prevProjMatrix = drawData.prevProjTransforms[proj.transformsIndex];
+ 
+                         const auto &viewport = drawData.rspViewports[proj.transformsIndex];
+-                        rtScene.viewport = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0.0f, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
++                        // The viewport itself, not the clip bound (patch 0003): rect(viewportClipRatios) is
++                        // the RSP viewport expanded by the game's clip ratio, the guard band the raster
++                        // path uses only to clip triangles. This game sets a ratio of 2, so the traced
++                        // scene's viewport (the compose quad, the ray mapping) covered twice the screen.
++                        static const int16_t RtViewportRatios[4] = { 1, 1, -1, -1 };
++                        rtScene.viewport = convertViewportRect(viewport.rect(RtViewportRatios), p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0.0f, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
+                         rtScene.scissor = convertFixedRect(proj.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
+ 
+                         rtScene.presetScene = p.presetScene;
+@@ -1818,6 +1856,17 @@ namespace RT64 {
+ 
+         shaderUploader->submit(worker, shaderUploads);
+         updateShaderViews(worker, drawBuffers, outputBuffers, shaderViewRtEnabled);
++
++#   if RT_ENABLED
++        // The binding table carries the descriptor sets' handles, so it is built once the sets
++        // exist and are up to date, which is here and not in updateRaytracingScene (patch 0003):
++        // the texture set is made in updateShaderViews on the first frame, and remade whenever
++        // the texture cache grows.
++        if (chosenRtScene != nullptr) {
++            RenderDescriptorSet *descriptorSets[] = { descCommonSet->get(), descTextureSet->get(), descTextureSet->get(), chosenFramebuffer->descRealFbSet->get() };
++            rtResources->createShaderBindingTable(worker, rtState, descriptorSets, uint32_t(std::size(descriptorSets)), hitGroupVector);
++        }
++#   endif
+     }
+ 
+     void FramebufferRenderer::advanceFrame(bool rtEnabled) {
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index 8b9c6af..853204b 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -1,15 +1,51 @@
+ //
+-// RT64, the renderer's patch series (OoT: Recompiled), patch 0002.
++// RT64, the renderer's patch series (OoT: Recompiled), patches 0002 and 0003.
+ //
+-// Every method is a no-op and creates nothing. See the header for which patch fills each in.
++// See the header for what each part is and the two notes about timing.
+ //
+ 
+ #include "rt64_raytracing_resources.h"
+ 
++#if RT_ENABLED
++
++#include <algorithm>
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++
+ namespace RT64 {
++    namespace {
++        // Every buffer size is rounded up to this, so a structure that grows by a few bytes a
++        // frame does not remake its buffer every frame.
++        constexpr uint64_t SizeGranule = 64 * 1024;
++
++        uint64_t granule(uint64_t size) {
++            return ((size + SizeGranule - 1) / SizeGranule) * SizeGranule;
++        }
++
++        // Ensures a default heap buffer of at least `size` with `flags`; true when it was remade.
++        // The one it replaces goes to `retired` rather than away (see the header's note).
++        bool ensureDefault(RenderDevice *device, std::unique_ptr<RenderBuffer> &buffer, uint64_t &have, uint64_t size, RenderBufferFlags flags, std::vector<std::unique_ptr<RenderBuffer>> &retired) {
++            if ((buffer != nullptr) && (have >= size)) {
++                return false;
++            }
++            if (buffer != nullptr) {
++                retired.push_back(std::move(buffer));
++            }
++            have = granule(std::max<uint64_t>(size, 1));
++            buffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(have, flags));
++            return true;
++        }
++
++        std::unique_ptr<RenderTexture> makeStorage(RenderDevice *device, uint32_t width, uint32_t height, RenderFormat format, RenderTextureFlags extraFlags = RenderTextureFlag::NONE) {
++            return device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, format, RenderTextureFlag::UNORDERED_ACCESS | extraFlags));
++        }
++    }
++
+     RaytracingResources::RaytracingResources(RenderWorker *worker, UserConfiguration::GraphicsAPI graphicsAPI) {
+         this->worker = worker;
+         this->graphicsAPI = graphicsAPI;
++        lastTrace = std::chrono::steady_clock::now();
+     }
+ 
+     RaytracingResources::~RaytracingResources() { }
+@@ -19,86 +55,466 @@ namespace RT64 {
+         return nullptr;
+     }
+ 
++    // ---- the ring of CPU written buffers ------------------------------------------------------
++
++    std::unique_ptr<RenderBuffer> &RaytracingResources::ringSlot(std::unique_ptr<RenderBuffer> *ring, uint64_t *sizes, uint64_t size, RenderBufferFlags flags) {
++        std::unique_ptr<RenderBuffer> &slot = ring[ringIndex % RingDepth];
++        uint64_t &have = sizes[ringIndex % RingDepth];
++        if ((slot == nullptr) || (have < size)) {
++            have = granule(std::max<uint64_t>(size, 1));
++            slot = worker->device->createBuffer(RenderBufferDesc::UploadBuffer(have, flags));
++        }
++        return slot;
++    }
++
++    // ---- bottom level -------------------------------------------------------------------------
++
+     void RaytracingResources::resetBottomLevelAS() {
+         bottomLevelASVector.clear();
+     }
+ 
+     void RaytracingResources::addBottomLevelASMesh(const RenderBottomLevelASMesh &mesh) {
+-        // Recorded so the frame's traced draw calls are known; the structures themselves arrive
+-        // with patch 0003.
+         bottomLevelASVector.push_back(mesh);
+     }
+ 
+     void RaytracingResources::updateBottomLevelASResources(RenderWorker *worker) {
+-        (void)worker;
++        const auto start = std::chrono::steady_clock::now();
++        RenderDevice *device = worker->device;
++
++        // A new frame's worth of CPU written buffers, and the buffers retired RingDepth frames
++        // ago can go now: the GPU has finished the frame that read them.
++        ringIndex++;
++        std::vector<std::unique_ptr<RenderBuffer>> &retired = retiredRing[ringIndex % RingDepth];
++        retired.clear();
++        graveyardRing[ringIndex % RingDepth].clear();
++
++        if (bottomLevelPool.size() < bottomLevelASVector.size()) {
++            bottomLevelPool.resize(bottomLevelASVector.size());
++        }
++
++        for (size_t i = 0; i < bottomLevelASVector.size(); i++) {
++            BottomLevelStructure &blas = bottomLevelPool[i];
++            blas.buildInfo = RenderBottomLevelASBuildInfo();
++
++            // Rebuilt every frame, so fast build over fast trace: the game animates most of what
++            // it draws and a refit needs the identity of a draw call across frames, which the
++            // renderer does not keep yet. Phase 57 revisits this with the temporal work.
++            device->setBottomLevelASBuildInfo(blas.buildInfo, &bottomLevelASVector[i], 1, true, false);
++
++            if ((blas.buffer == nullptr) || (blas.bufferSize < blas.buildInfo.accelerationStructureSize)) {
++                if (blas.buffer != nullptr) {
++                    retired.push_back(std::move(blas.buffer));
++                }
++                blas.bufferSize = granule(blas.buildInfo.accelerationStructureSize);
++                blas.buffer = device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(blas.bufferSize));
++                blas.structure = device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::BOTTOM_LEVEL, blas.buffer->at(0), blas.bufferSize));
++            }
++
++            ensureDefault(device, blas.scratch, blas.scratchSize, blas.buildInfo.scratchSize, RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::UNORDERED_ACCESS, retired);
++        }
++
++        lastBlasCount = uint32_t(bottomLevelASVector.size());
++        buildTime += std::chrono::steady_clock::now() - start;
+     }
+ 
+     void RaytracingResources::submitBottomLevelASCreation(RenderWorker *worker) {
+-        (void)worker;
++        const auto start = std::chrono::steady_clock::now();
++        thread_local std::vector<RenderBufferBarrier> barriers;
++        barriers.clear();
++
++        // The last frame's rays may still be reading these structures; the build writes them.
++        for (size_t i = 0; i < bottomLevelASVector.size(); i++) {
++            barriers.emplace_back(RenderBufferBarrier(bottomLevelPool[i].buffer.get(), RenderBufferAccess::WRITE));
++        }
++
++        if (!barriers.empty()) {
++            worker->commandList->barriers(RenderBarrierStage::COMPUTE, barriers);
++        }
++
++        for (size_t i = 0; i < bottomLevelASVector.size(); i++) {
++            BottomLevelStructure &blas = bottomLevelPool[i];
++            worker->commandList->buildBottomLevelAS(blas.structure.get(), blas.scratch->at(0), blas.buildInfo);
++        }
++
++        // And the top level build reads them.
++        barriers.clear();
++        for (size_t i = 0; i < bottomLevelASVector.size(); i++) {
++            barriers.emplace_back(RenderBufferBarrier(bottomLevelPool[i].buffer.get(), RenderBufferAccess::READ));
++        }
++
++        if (!barriers.empty()) {
++            worker->commandList->barriers(RenderBarrierStage::COMPUTE, barriers);
++        }
++
++        buildTime += std::chrono::steady_clock::now() - start;
+     }
+ 
++    // ---- top level ----------------------------------------------------------------------------
++
+     void RaytracingResources::updateTopLevelASResources(RenderWorker *worker, const std::vector<InstanceDrawCall> &instanceDrawCalls, const std::vector<uint32_t> &instanceIndices) {
+-        (void)worker;
+-        (void)instanceDrawCalls;
+-        (void)instanceIndices;
++        const auto start = std::chrono::steady_clock::now();
++        RenderDevice *device = worker->device;
++        topLevelInstances.clear();
++
++        // The j-th traced instance of the scene is the j-th mesh the renderer queued: both are
++        // pushed in the same step of the same loop (rt64_framebuffer_renderer.cpp, addFramebuffer).
++        const size_t count = std::min(instanceIndices.size(), bottomLevelASVector.size());
++        for (size_t j = 0; j < count; j++) {
++            const uint32_t instanceIndex = instanceIndices[j];
++            if (instanceIndex >= instanceDrawCalls.size()) {
++                continue;
++            }
++
++            const InstanceDrawCall &call = instanceDrawCalls[instanceIndex];
++            if (call.type != InstanceDrawCall::Type::Raytracing) {
++                continue;
++            }
++
++            // World space already, so the transform is the identity.
++            topLevelInstances.emplace_back(RenderTopLevelASInstance(bottomLevelPool[j].buffer->at(0), instanceIndex, call.raytracing.queryMask,
++                call.raytracing.hitGroupIndex, call.raytracing.cullDisable, RenderAffineTransform()));
++        }
++
++        lastInstanceCount = uint32_t(topLevelInstances.size());
++        topLevelBuildInfo = RenderTopLevelASBuildInfo();
++
++        // Built even with no instances: the shaders trace whatever the common set's slot names,
++        // and plume writes nothing into a descriptor for a null structure, so a frame without one
++        // would trace through an uninitialized descriptor (a page fault at address zero on the
++        // first dispatch, 2026-09-24). An empty structure is legal and every ray misses it.
++        device->setTopLevelASBuildInfo(topLevelBuildInfo, topLevelInstances.data(), uint32_t(topLevelInstances.size()), true, false);
++
++        // The instance records go to the GPU through this frame's slot of the ring.
++        std::unique_ptr<RenderBuffer> &instances = ringSlot(instancesRing, instancesRingSize, topLevelBuildInfo.instancesBufferData.size(), RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT);
++        void *mapped = instances->map();
++        std::memcpy(mapped, topLevelBuildInfo.instancesBufferData.data(), topLevelBuildInfo.instancesBufferData.size());
++        instances->unmap();
++
++        std::vector<std::unique_ptr<RenderBuffer>> &retired = retiredRing[ringIndex % RingDepth];
++        if ((topLevelBuffer == nullptr) || (topLevelBufferSize < topLevelBuildInfo.accelerationStructureSize)) {
++            if (topLevelBuffer != nullptr) {
++                retired.push_back(std::move(topLevelBuffer));
++            }
++            topLevelBufferSize = granule(topLevelBuildInfo.accelerationStructureSize);
++            topLevelBuffer = device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(topLevelBufferSize));
++            topLevelAS = device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::TOP_LEVEL, topLevelBuffer->at(0), topLevelBufferSize));
++        }
++
++        ensureDefault(device, topLevelScratch, topLevelScratchSize, topLevelBuildInfo.scratchSize, RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::UNORDERED_ACCESS, retired);
++        buildTime += std::chrono::steady_clock::now() - start;
+     }
+ 
+     void RaytracingResources::submitTopLevelASCreation(RenderWorker *worker) {
+-        (void)worker;
++        const auto start = std::chrono::steady_clock::now();
++        if (topLevelAS != nullptr) {
++            std::unique_ptr<RenderBuffer> &instances = instancesRing[ringIndex % RingDepth];
++            worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(topLevelBuffer.get(), RenderBufferAccess::WRITE));
++            worker->commandList->buildTopLevelAS(topLevelAS.get(), topLevelScratch->at(0), instances->at(0), topLevelBuildInfo);
++            worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(topLevelBuffer.get(), RenderBufferAccess::READ));
++        }
++
++        buildTime += std::chrono::steady_clock::now() - start;
++        buildFrames++;
++
++        // The first traced frames, each on its own line: the once a second trace below comes
++        // too late when the first dispatch is the one that hangs.
++        if (framesTraced < 3) {
++            framesTraced++;
++            std::fprintf(stderr, "[rt] frame %u: blas %u, instances %u, tlas %s\n", framesTraced, lastBlasCount, lastInstanceCount,
++                (topLevelAS != nullptr) ? "built" : "none");
++        }
++        traceBuild();
++    }
++
++    void RaytracingResources::traceBuild() {
++        const auto now = std::chrono::steady_clock::now();
++        if ((now - lastTrace) < std::chrono::seconds(1)) {
++            return;
++        }
++
++        const double ms = std::chrono::duration<double, std::milli>(buildTime).count() / std::max(buildFrames, 1u);
++        std::fprintf(stderr, "[rt] tlas %u blas %u build %.3f ms (cpu, recording, %u frames)\n",
++            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, ms, buildFrames);
++        lastTrace = now;
++        buildTime = std::chrono::steady_clock::duration{};
++        buildFrames = 0;
+     }
+ 
++    // ---- binding table and lights -------------------------------------------------------------
++
+     void RaytracingResources::createShaderBindingTable(RenderWorker *worker, const RaytracingState *rtState, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount, const std::vector<RenderPipelineProgram> &hitGroups) {
+-        (void)worker;
+-        (void)rtState;
+-        (void)descriptorSets;
+-        (void)descriptorSetCount;
+-        (void)hitGroups;
++        assert(rtState != nullptr);
++        assert(rtState->pipeline != nullptr);
++
++        const RenderShaderBindingGroups groups(
++            RenderShaderBindingGroup(rtState->rayGenPrograms, uint32_t(RaytracingRayGen::Count)),
++            RenderShaderBindingGroup(rtState->missPrograms, uint32_t(RaytracingMiss::Count)),
++            RenderShaderBindingGroup(hitGroups.data(), uint32_t(hitGroups.size())));
++
++        worker->device->setShaderBindingTableInfo(shaderBindingTableInfo, groups, rtState->pipeline.get(), descriptorSets, descriptorSetCount);
++
++        // This frame's slot of the ring becomes the table the renderer dispatches with; the slot
++        // it held last frame goes back to the ring.
++        const uint32_t slot = ringIndex % RingDepth;
++        if (shaderBindingTableBuffer != nullptr) {
++            bindingTableRing[(ringIndex + RingDepth - 1) % RingDepth] = std::move(shaderBindingTableBuffer);
++        }
++        std::unique_ptr<RenderBuffer> &table = ringSlot(bindingTableRing, bindingTableRingSize, shaderBindingTableInfo.tableBufferData.size(), RenderBufferFlag::SHADER_BINDING_TABLE);
++        void *mapped = table->map();
++        std::memcpy(mapped, shaderBindingTableInfo.tableBufferData.data(), shaderBindingTableInfo.tableBufferData.size());
++        table->unmap();
++        shaderBindingTableBuffer = std::move(bindingTableRing[slot]);
+     }
+ 
+     void RaytracingResources::updateLightsBuffer(RenderWorker *worker, const RaytracingScene &rtScene) {
+         (void)worker;
+-        (void)rtScene;
++        const uint32_t count = (rtScene.pointLights != nullptr) ? rtScene.lightCount : 0;
++        rtParams.lightsCount = count;
++
++        const uint64_t size = sizeof(interop::PointLight) * std::max(count, 1u);
++        const uint32_t slot = ringIndex % RingDepth;
++        if (lightsBuffer != nullptr) {
++            lightsRing[(ringIndex + RingDepth - 1) % RingDepth] = std::move(lightsBuffer);
++        }
++        std::unique_ptr<RenderBuffer> &lights = ringSlot(lightsRing, lightsRingSize, size, RenderBufferFlag::STORAGE);
++        void *mapped = lights->map();
++        if (count > 0) {
++            std::memcpy(mapped, rtScene.pointLights, sizeof(interop::PointLight) * count);
++        }
++        else {
++            std::memset(mapped, 0, sizeof(interop::PointLight));
++        }
++        lights->unmap();
++        lightsBuffer = std::move(lightsRing[slot]);
++    }
++
++    // ---- the textures and the sets ------------------------------------------------------------
++
++    void RaytracingResources::createOutputBuffers(RenderWorker *worker, uint32_t width, uint32_t height) {
++        RenderDevice *device = worker->device;
++        width = std::max(width, 1u);
++        height = std::max(height, 1u);
++
++        // Whatever exists goes to the graveyard first, not away: the frames in flight still read
++        // it, and the descriptor sets still name it until updateShaderViews runs this frame.
++        retire(viewDirectionTexture);
++        retire(shadingPositionTexture);
++        retire(shadingNormalTexture);
++        retire(shadingSpecularTexture);
++        retire(instanceIdTexture);
++        retire(diffuseTexture);
++        retire(reflectionTexture);
++        retire(refractionTexture);
++        retire(transparentTexture);
++        retire(flowTexture);
++        retire(reactiveMaskTexture);
++        retire(lockMaskTexture);
++        retire(lumaAverageTexture);
++        retire(downscaledOutputTexture);
++        retire(upscaledOutputTexture);
++        for (uint32_t i = 0; i < 2; i++) {
++            retire(directLightTexture[i]);
++            retire(indirectLightTexture[i]);
++            retire(normalRoughnessTexture[i]);
++            retire(filteredDirectLightTexture[i]);
++            retire(filteredIndirectLightTexture[i]);
++            retire(depthTexture[i]);
++            retire(outputFramebuffer[i]);
++            retire(outputTexture[i]);
++        }
++        retire(hitVelocityDistanceBufferView);
++        retire(hitColorBufferView);
++        retire(hitNormalFogBufferView);
++        retire(hitInstanceIdBufferView);
++        retire(hitVelocityDistanceBuffer);
++        retire(hitColorBuffer);
++        retire(hitNormalFogBuffer);
++        retire(hitInstanceIdBuffer);
++        retire(lumaHistogramBuffer);
++
++        viewDirectionTexture = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT);
++        shadingPositionTexture = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT);
++        shadingNormalTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        shadingSpecularTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        instanceIdTexture = makeStorage(device, width, height, RenderFormat::R32_SINT);
++        diffuseTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        reflectionTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        refractionTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        transparentTexture = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++        flowTexture = makeStorage(device, width, height, RenderFormat::R32G32_FLOAT);
++        reactiveMaskTexture = makeStorage(device, width, height, RenderFormat::R16_FLOAT);
++        lockMaskTexture = makeStorage(device, width, height, RenderFormat::R16_FLOAT);
++        lumaAverageTexture = makeStorage(device, 1, 1, RenderFormat::R32_FLOAT);
++        downscaledOutputTexture = makeStorage(device, std::max(width / 8, 1u), std::max(height / 8, 1u), RenderFormat::R32G32B32A32_FLOAT);
++        upscaledOutputTexture = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::RENDER_TARGET);
++
++        for (uint32_t i = 0; i < 2; i++) {
++            directLightTexture[i] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++            indirectLightTexture[i] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++            normalRoughnessTexture[i] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++            filteredDirectLightTexture[i] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++            filteredIndirectLightTexture[i] = makeStorage(device, width, height, RenderFormat::R16G16B16A16_FLOAT);
++            depthTexture[i] = makeStorage(device, width, height, RenderFormat::R32_FLOAT);
++
++            // The compose pass draws into this one, so its format is the compose pipeline's
++            // (rt64_shader_library.cpp: R32G32B32A32_FLOAT) and it is a render target too.
++            outputTexture[i] = makeStorage(device, width, height, RenderFormat::R32G32B32A32_FLOAT, RenderTextureFlag::RENDER_TARGET);
++            const RenderTexture *attachment = outputTexture[i].get();
++            outputFramebuffer[i] = device->createFramebuffer(RenderFramebufferDesc(&attachment, 1));
++        }
++
++        // The any hit buffers: MaxHitQueries records per pixel, each of the width its view says.
++        const uint64_t hitCount = uint64_t(width) * height * MaxHitQueries;
++        const RenderBufferFlags hitFlags = RenderBufferFlag::FORMATTED | RenderBufferFlag::UNORDERED_ACCESS;
++        hitVelocityDistanceBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(hitCount * 16, hitFlags));
++        hitColorBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(hitCount * 4, hitFlags));
++        hitNormalFogBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(hitCount * 8, hitFlags));
++        hitInstanceIdBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(hitCount * 2, hitFlags));
++        hitVelocityDistanceBufferView = hitVelocityDistanceBuffer->createBufferFormattedView(RenderFormat::R32G32B32A32_FLOAT);
++        hitColorBufferView = hitColorBuffer->createBufferFormattedView(RenderFormat::R8G8B8A8_UNORM);
++        hitNormalFogBufferView = hitNormalFogBuffer->createBufferFormattedView(RenderFormat::R16G16B16A16_SNORM);
++        hitInstanceIdBufferView = hitInstanceIdBuffer->createBufferFormattedView(RenderFormat::R16_UINT);
++
++        // The luminance histogram: 256 bins of a 32 bit count.
++        lumaHistogramBuffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(256 * sizeof(uint32_t), RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS));
++
++        textureWidth = width;
++        textureHeight = height;
++        rtParams.resolution = hlslpp::float4(float(width), float(height), 1.0f / float(width), 1.0f / float(height));
++
++        // Everything above is in its initial layout; the renderer transitions the set it uses on
++        // the first submit when this is true.
++        transitionOutputBuffers = true;
++        swapBuffers = false;
++        skipReprojection = true;
++        interleavedDirty = true;
+     }
+ 
+     void RaytracingResources::updateShaderSets(RenderWorker *worker, const ShaderLibrary *shaderLibrary) {
+-        (void)worker;
+-        (void)shaderLibrary;
++        assert(shaderLibrary != nullptr);
++        RenderDevice *device = worker->device;
++        if (!setsCreated) {
++            composeSet = std::make_unique<RaytracingComposeDescriptorSet>(shaderLibrary->samplerLibrary, device);
++            downscaleSet = std::make_unique<BicubicScalingDescriptorSet>(shaderLibrary->samplerLibrary, device);
++            indirectFilterSets[0] = std::make_unique<GaussianFilterDescriptorSet>(shaderLibrary->samplerLibrary, device);
++            indirectFilterSets[1] = std::make_unique<GaussianFilterDescriptorSet>(shaderLibrary->samplerLibrary, device);
++            lumaAvgSet = std::make_unique<HistogramAverageDescriptorSet>(device);
++            lumaClearSet = std::make_unique<HistogramClearDescriptorSet>(device);
++            lumaSet = std::make_unique<LuminanceHistogramDescriptorSet>(device);
++            lumaSetSet = std::make_unique<HistogramSetDescriptorSet>(device);
++            postProcessSet = std::make_unique<PostProcessDescriptorSet>(shaderLibrary->samplerLibrary, device);
++            setsCreated = true;
++        }
++
++        if (outputTexture[0] == nullptr) {
++            return;
++        }
++
++        RenderTexture *outputCur = outputTexture[swapBuffers ? 1 : 0].get();
++
++        // The compose reads the filtered light in the second slot, which is where the copy of
++        // the raw light and an odd number of filter passes both leave it.
++        composeSet->setTexture(composeSet->gFlow, flowTexture.get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gDiffuse, diffuseTexture.get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gDirectLight, filteredDirectLightTexture[1].get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gIndirectLight, filteredIndirectLightTexture[1].get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gReflection, reflectionTexture.get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gRefraction, refractionTexture.get(), RenderTextureLayout::SHADER_READ);
++        composeSet->setTexture(composeSet->gTransparent, transparentTexture.get(), RenderTextureLayout::SHADER_READ);
++
++        // The filter alternates between the two filtered slots: set 0 reads the first and writes
++        // the second, set 1 the other way, which is the order the renderer's loop and its
++        // barriers assume.
++        indirectFilterSets[0]->setTexture(indirectFilterSets[0]->gInput, filteredIndirectLightTexture[0].get(), RenderTextureLayout::SHADER_READ);
++        indirectFilterSets[0]->setTexture(indirectFilterSets[0]->gOutput, filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL);
++        indirectFilterSets[1]->setTexture(indirectFilterSets[1]->gInput, filteredIndirectLightTexture[1].get(), RenderTextureLayout::SHADER_READ);
++        indirectFilterSets[1]->setTexture(indirectFilterSets[1]->gOutput, filteredIndirectLightTexture[0].get(), RenderTextureLayout::GENERAL);
++
++        // Auto exposure: the composed output downscaled, its histogram, the average, the clear,
++        // and the fixed value used when the scene sets no luminance range.
++        downscaleSet->setTexture(downscaleSet->gInput, outputCur, RenderTextureLayout::SHADER_READ);
++        downscaleSet->setTexture(downscaleSet->gOutput, downscaledOutputTexture.get(), RenderTextureLayout::GENERAL);
++        lumaSet->setTexture(lumaSet->HDRTexture, downscaledOutputTexture.get(), RenderTextureLayout::SHADER_READ);
++        lumaSet->setBuffer(lumaSet->LuminanceHistogram, lumaHistogramBuffer.get(), 256 * sizeof(uint32_t));
++        lumaAvgSet->setBuffer(lumaAvgSet->LuminanceHistogram, lumaHistogramBuffer.get(), 256 * sizeof(uint32_t));
++        lumaAvgSet->setTexture(lumaAvgSet->LuminanceOutput, lumaAverageTexture.get(), RenderTextureLayout::GENERAL);
++        lumaClearSet->setBuffer(lumaClearSet->LuminanceHistogram, lumaHistogramBuffer.get(), 256 * sizeof(uint32_t));
++        lumaSetSet->setTexture(lumaSetSet->LuminanceOutput, lumaAverageTexture.get(), RenderTextureLayout::GENERAL);
++
++        // The post process reads the composed output of this frame and draws it into the game's
++        // color target.
++        postProcessSet->setBuffer(postProcessSet->RtParams, rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
++        postProcessSet->setTexture(postProcessSet->gInput, outputCur, RenderTextureLayout::SHADER_READ);
++        postProcessSet->setTexture(postProcessSet->gFlow, flowTexture.get(), RenderTextureLayout::SHADER_READ);
++        postProcessSet->setTexture(postProcessSet->gLumaAvg, lumaAverageTexture.get(), RenderTextureLayout::SHADER_READ);
+     }
+ 
+     void RaytracingResources::updateMultisampling() {
+-        // Nothing depends on the sample count yet. This is the one method the renderer calls at
+-        // level Off, so it must stay a no-op until the textures it would recreate exist.
++        // The interleaved raster targets carry the multisampling; they are remade on the next
++        // frame that needs them.
++        interleavedDirty = true;
+     }
+ 
+     void RaytracingResources::setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged) {
+-        // The values the renderer reads back are kept in step so the inspector's edits are
+-        // visible; no texture is made or remade for them yet.
+         upscalerMode = rtConfig.upscalerMode;
+         upscalerReactiveMask = rtConfig.upscalerReactiveMask;
+         upscalerLockMask = rtConfig.upscalerLockMask;
+         denoiserEnabled = rtConfig.denoiserEnabled;
+         maxReflections = rtConfig.maxReflections;
+-        rtParams.diSamples = uint32_t(rtConfig.diSamples);
+-        rtParams.giSamples = uint32_t(rtConfig.giSamples);
+-        rtParams.maxLights = uint32_t(rtConfig.maxLights);
++        rtParams.diSamples = uint32_t(std::max(rtConfig.diSamples, 0));
++        rtParams.giSamples = uint32_t(std::max(rtConfig.giSamples, 0));
++        rtParams.maxLights = uint32_t(std::max(rtConfig.maxLights, 0));
+         rtParams.motionBlurStrength = rtConfig.motionBlurStrength;
+-        rtParams.motionBlurSamples = uint32_t(rtConfig.motionBlurSamples);
++        rtParams.motionBlurSamples = uint32_t(std::max(rtConfig.motionBlurSamples, 0));
+         rtParams.visualizationMode = rtConfig.visualizationMode;
+-        (void)resolutionChanged;
+-    }
+-
+-    void RaytracingResources::createOutputBuffers(RenderWorker *worker, uint32_t width, uint32_t height) {
+-        (void)worker;
+-        textureWidth = width;
+-        textureHeight = height;
++        if (resolutionChanged) {
++            updateOutputBuffers = true;
++        }
+     }
+ 
+     void RaytracingResources::updateInterleavedRenderTargets(RenderWorker *worker, uint32_t width, uint32_t height, uint32_t count, const RenderMultisampling &multisampling, bool usesHDR) {
+-        (void)worker;
+-        (void)width;
+-        (void)height;
+-        (void)count;
+-        (void)multisampling;
+-        (void)usesHDR;
++        // A traced scene whose size moved since the textures were made: remake them next frame.
++        if ((width != textureWidth) || (height != textureHeight)) {
++            updateOutputBuffers = true;
++        }
++
++        if (interleavedDirty) {
++            // To the graveyard, not away: see the header. The storage first, since it names the
++            // targets' textures.
++            for (auto &storage : interleavedFramebufferStorageVector) {
++                retire(storage);
++            }
++            for (auto &target : interleavedColorTargetVector) {
++                retire(target);
++            }
++            for (auto &target : interleavedDepthTargetVector) {
++                retire(target);
++            }
++            interleavedColorTargetVector.clear();
++            interleavedDepthTargetVector.clear();
++            interleavedFramebufferStorageVector.clear();
++            interleavedDirty = false;
++        }
++
++        while (interleavedColorTargetVector.size() < count) {
++            interleavedColorTargetVector.emplace_back(std::make_unique<RenderTarget>(0, Framebuffer::Type::Color, multisampling, usesHDR));
++            interleavedDepthTargetVector.emplace_back(std::make_unique<RenderTarget>(0, Framebuffer::Type::Depth, multisampling, usesHDR));
++            interleavedFramebufferStorageVector.emplace_back(std::make_unique<RenderFramebufferStorage>());
++        }
++
++        for (uint32_t i = 0; i < count; i++) {
++            RenderTarget *color = interleavedColorTargetVector[i].get();
++            RenderTarget *depth = interleavedDepthTargetVector[i].get();
++            const bool colorMade = color->resize(worker, width, height);
++            const bool depthMade = depth->resize(worker, width, height);
++            RenderFramebufferStorage *storage = interleavedFramebufferStorageVector[i].get();
++            if (colorMade || depthMade || (storage->colorDepthWrite == nullptr)) {
++                RenderFramebufferKey key;
++                key.modifierKey = i;
++                storage->setup(worker->device, key, color, depth);
++            }
++        }
+     }
+ };
++
++#endif
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index e12310a..79a739e 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -1,22 +1,36 @@
+ //
+-// RT64, the renderer's patch series (OoT: Recompiled), patch 0002.
++// RT64, the renderer's patch series (OoT: Recompiled), patches 0002 and 0003.
+ //
+ // The per frame ray tracing resources the pinned renderer names and does not ship: the
+ // configuration the inspector edits, the scene a traced projection becomes, and the buffers,
+ // textures, descriptor sets and acceleration structures the framebuffer renderer binds when it
+ // records a traced scene.
+ //
+-// THIS IS THE SMALLEST THING THAT COMPILES. Every member the renderer touches is declared with
+-// the type the renderer expects and left empty: no texture, buffer, view, descriptor set or
+-// acceleration structure is created, and every method is a no-op. With the ray tracing level Off
+-// (the only level until patch 0008) the renderer never reaches into any of it past construction
+-// and updateMultisampling(), so Off stays byte identical to the baseline. The passes fill this in
+-// from patch 0003 (the acceleration structures) on. Nothing here is edited then; a later patch
+-// changes it.
++// PATCH 0003 MAKES THEM REAL. Every frame with ray tracing on: one bottom level structure per
++// traced draw call, built from the world space positions the vertex processor already writes
++// and the draw call's own indices, into a pool of buffers that grows to the busiest frame and
++// is reused after; one top level structure over them, one instance per traced draw call with
++// the renderer's own query mask and hit group; the output and history textures at the traced
++// scene's size, made once and remade when the size changes; the shader binding table for the
++// active state; the lights the game set; and the descriptor sets of the compose, filter,
++// luminance and post process passes, bound to those textures.
++//
++// TWO THINGS ABOUT TIMING, because the renderer keeps several workloads in flight:
++//
++// - The GPU executes the workloads in order on one queue, so a structure rebuilt into the same
++//   buffer every frame is safe as long as a barrier sits between the last read and the next
++//   build, and one does (submitBottomLevelASCreation, submitTopLevelASCreation).
++// - The CPU writes ahead of the GPU, so a buffer the CPU fills each frame (the binding table,
++//   the instances, the lights) must not be the one the GPU is still reading. Those rotate
++//   through a ring as deep as the workload queue.
++//
++// The build is measured on the CPU (recording time) and traced once a second as
++// `[rt] tlas <n> blas <m> build <ms>`; the GPU time joins it with the frame budget in phase 58.
+ //
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <memory>
+ #include <vector>
+@@ -43,12 +57,13 @@
+ namespace RT64 {
+     // What the inspector's ray tracing panel edits and the shared queue resources carry to the
+     // workload queue. The defaults are the ones the passes are designed against; the settings
+-    // row (patch 0008) maps its levels onto these.
++    // row (patch 0008) maps its levels onto these. No indirect samples and no denoiser until the
++    // passes that fill them exist, so the composite has nothing to filter.
+     struct RaytracingConfiguration {
+         int diSamples = 1;
+-        int giSamples = 1;
++        int giSamples = 0;
+         int maxLights = 16;
+-        int maxReflections = 1;
++        int maxReflections = 0;
+         int motionBlurSamples = 0;
+         float motionBlurStrength = 0.0f;
+         interop::VisualizationMode visualizationMode = interop::VisualizationMode::Final;
+@@ -59,7 +74,7 @@ namespace RT64 {
+         float resolutionScale = 1.0f;
+         bool upscalerReactiveMask = true;
+         bool upscalerLockMask = true;
+-        bool denoiserEnabled = true;
++        bool denoiserEnabled = false;
+     };
+ 
+     // One traced projection of one framebuffer pair: the instances that went into it, the
+@@ -83,8 +98,13 @@ namespace RT64 {
+     };
+ 
+     struct RaytracingResources {
+-        // Hit records per pixel the any hit buffers are sized for.
+-        static const uint32_t MaxHitQueries = 16;
++        // Hit records per pixel the any hit buffers are sized for; GlobalHitBuffers.hlsli says
++        // the same number.
++        static const uint32_t MaxHitQueries = 24;
++
++        // How many workloads the queue keeps in flight (rt64_workload_queue.h), which is how deep
++        // a ring of CPU written buffers has to be.
++        static const uint32_t RingDepth = 4;
+ 
+         RenderWorker *worker = nullptr;
+         UserConfiguration::GraphicsAPI graphicsAPI = UserConfiguration::GraphicsAPI::OptionCount;
+@@ -95,13 +115,18 @@ namespace RT64 {
+         interop::RaytracingParams rtParams;
+         BufferPair rtParamsBuffer;
+ 
+-        // The lights the game set for the frame.
++        // The lights the game set for the frame, rotated through the ring (see the header note).
+         std::unique_ptr<RenderBuffer> lightsBuffer;
+ 
+-        // The shader binding table and the acceleration structures.
++        // The shader binding table for the active state, rotated through the ring.
+         std::unique_ptr<RenderBuffer> shaderBindingTableBuffer;
+         RenderShaderBindingTableInfo shaderBindingTableInfo;
++
++        // The top level structure over the frame's instances.
+         std::unique_ptr<RenderAccelerationStructure> topLevelAS;
++
++        // The meshes queued this frame, one per traced draw call, in the order the renderer
++        // added them, which is the order of the traced instances in the scene.
+         std::vector<RenderBottomLevelASMesh> bottomLevelASVector;
+ 
+         // The any hit buffers, one record per pixel per query.
+@@ -139,6 +164,9 @@ namespace RT64 {
+         std::unique_ptr<RenderTexture> outputTexture[2];
+         std::unique_ptr<RenderFramebuffer> outputFramebuffer[2];
+ 
++        // The luminance histogram the auto exposure passes accumulate into.
++        std::unique_ptr<RenderBuffer> lumaHistogramBuffer;
++
+         // The descriptor sets of the compose, filter, luminance and post process passes.
+         std::unique_ptr<RaytracingComposeDescriptorSet> composeSet;
+         std::unique_ptr<BicubicScalingDescriptorSet> downscaleSet;
+@@ -161,7 +189,7 @@ namespace RT64 {
+         bool skipReprojection = true;
+         bool swapBuffers = false;
+         bool transitionOutputBuffers = false;
+-        bool updateOutputBuffers = false;
++        bool updateOutputBuffers = true;
+         bool upscalerReactiveMask = false;
+         bool upscalerLockMask = false;
+         uint32_t textureWidth = 0;
+@@ -174,20 +202,20 @@ namespace RT64 {
+         // The upscaler for a mode, or nullptr when none is built (which is every mode, for now).
+         Upscaler *getUpscaler(UpscaleMode mode);
+ 
+-        // The bottom level structures: one per traced draw call, queued per frame (patch 0003).
++        // The bottom level structures: one per traced draw call, queued per frame.
+         void resetBottomLevelAS();
+         void addBottomLevelASMesh(const RenderBottomLevelASMesh &mesh);
+         void updateBottomLevelASResources(RenderWorker *worker);
+         void submitBottomLevelASCreation(RenderWorker *worker);
+ 
+-        // The top level structure over the frame's instances (patch 0003).
++        // The top level structure over the frame's instances.
+         void updateTopLevelASResources(RenderWorker *worker, const std::vector<InstanceDrawCall> &instanceDrawCalls, const std::vector<uint32_t> &instanceIndices);
+         void submitTopLevelASCreation(RenderWorker *worker);
+ 
+-        // The shader binding table for the active state and its hit groups (patch 0004).
++        // The shader binding table for the active state and its hit groups.
+         void createShaderBindingTable(RenderWorker *worker, const RaytracingState *rtState, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount, const std::vector<RenderPipelineProgram> &hitGroups);
+ 
+-        // The lights buffer from the scene's point lights (patch 0005).
++        // The lights buffer from the scene's point lights.
+         void updateLightsBuffer(RenderWorker *worker, const RaytracingScene &rtScene);
+ 
+         // The descriptor sets of the compose and filter passes, rebound to the current textures.
+@@ -200,10 +228,73 @@ namespace RT64 {
+         // output size moved and the textures have to be made again.
+         void setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged);
+ 
+-        // The output textures at the traced scene's size (patch 0004).
++        // The output textures at the traced scene's size.
+         void createOutputBuffers(RenderWorker *worker, uint32_t width, uint32_t height);
+ 
+-        // The interleaved raster targets, one pair per interleaved scene (patch 0004).
++        // The interleaved raster targets, one pair per interleaved scene.
+         void updateInterleavedRenderTargets(RenderWorker *worker, uint32_t width, uint32_t height, uint32_t count, const RenderMultisampling &multisampling, bool usesHDR);
++
++    private:
++        // One bottom level structure's buffers, kept from frame to frame and grown when a mesh
++        // needs more than it has.
++        struct BottomLevelStructure {
++            RenderBottomLevelASBuildInfo buildInfo;
++            std::unique_ptr<RenderBuffer> buffer;
++            std::unique_ptr<RenderAccelerationStructure> structure;
++            std::unique_ptr<RenderBuffer> scratch;
++            uint64_t bufferSize = 0;
++            uint64_t scratchSize = 0;
++        };
++
++        std::vector<BottomLevelStructure> bottomLevelPool;
++        std::vector<RenderTopLevelASInstance> topLevelInstances;
++        RenderTopLevelASBuildInfo topLevelBuildInfo;
++        std::unique_ptr<RenderBuffer> topLevelBuffer;
++        std::unique_ptr<RenderBuffer> topLevelScratch;
++        uint64_t topLevelBufferSize = 0;
++        uint64_t topLevelScratchSize = 0;
++
++        // A structure or a scratch buffer that grew is replaced while the GPU may still be
++        // reading the old one, and plume releases a buffer the moment its owner does; freed
++        // under a dispatch, that is a removed device. The old ones wait here for RingDepth
++        // frames, which is how long the queue can still be executing the frame that used them.
++        std::vector<std::unique_ptr<RenderBuffer>> retiredRing[RingDepth];
++
++        // The same for everything else that is remade while the GPU may still use it, or while
++        // the renderer still holds a pointer to it: the output textures and their framebuffers
++        // when the traced scene changes size (the pause menu is a different size), the
++        // interleaved targets and their storage when the size or the multisampling moves. The
++        // renderer keeps the interleaved targets in a framebuffer's transition set that it never
++        // clears (patch 0003 clears it when the slot is reused), so an interleaved target freed
++        // at once was a barrier on freed memory two frames later (the pause race, 2026-09-24).
++        std::vector<std::shared_ptr<void>> graveyardRing[RingDepth];
++
++        template <typename T>
++        void retire(std::unique_ptr<T> &object) {
++            if (object != nullptr) {
++                graveyardRing[ringIndex % RingDepth].emplace_back(std::shared_ptr<void>(std::move(object)));
++            }
++        }
++
++        std::unique_ptr<RenderBuffer> instancesRing[RingDepth];
++        uint64_t instancesRingSize[RingDepth] = {};
++        std::unique_ptr<RenderBuffer> bindingTableRing[RingDepth];
++        uint64_t bindingTableRingSize[RingDepth] = {};
++        std::unique_ptr<RenderBuffer> lightsRing[RingDepth];
++        uint64_t lightsRingSize[RingDepth] = {};
++        uint32_t ringIndex = 0;
++        bool interleavedDirty = true;
++        bool setsCreated = false;
++
++        // The trace, once a second.
++        std::chrono::steady_clock::time_point lastTrace{};
++        std::chrono::steady_clock::duration buildTime{};
++        uint32_t buildFrames = 0;
++        uint32_t lastBlasCount = 0;
++        uint32_t lastInstanceCount = 0;
++        uint32_t framesTraced = 0;
++
++        std::unique_ptr<RenderBuffer> &ringSlot(std::unique_ptr<RenderBuffer> *ring, uint64_t *sizes, uint64_t size, RenderBufferFlags flags);
++        void traceBuild();
+     };
+ };
+diff --git a/src/render/rt64_raytracing_shader_cache.cpp b/src/render/rt64_raytracing_shader_cache.cpp
+index fb60060..e69f39c 100644
+--- a/src/render/rt64_raytracing_shader_cache.cpp
++++ b/src/render/rt64_raytracing_shader_cache.cpp
+@@ -1,9 +1,18 @@
+ //
+-// RT64, the renderer's patch series (OoT: Recompiled), patch 0002.
++// RT64, the renderer's patch series (OoT: Recompiled), patches 0002 and 0003.
+ //
+ 
+ #include "rt64_raytracing_shader_cache.h"
+ 
++#if RT_ENABLED
++
++#include <cassert>
++#include <cstdio>
++
++#include "rt64_descriptor_sets.h"
++
++#include "shaders/Raytracing.hlsl.dxil.h"
++
+ namespace RT64 {
+     RaytracingShaderCache::RaytracingShaderCache(RenderDevice *device, RenderShaderFormat shaderFormat, const ShaderLibrary *shaderLibrary) {
+         this->device = device;
+@@ -18,9 +27,86 @@ namespace RT64 {
+     }
+ 
+     void RaytracingShaderCache::setup() {
+-        // The pipeline layout, the ray generation, miss and hit shaders, and the two states'
+-        // pipelines are built here from patch 0004 on. Until then setting up records only that
+-        // it happened, so the queue does not ask again every frame.
++        if (setupDone) {
++            return;
++        }
++
++        assert(device != nullptr);
++        assert(shaderLibrary != nullptr);
++
++        // The layout is the raster path's, set for set, so the shaders bind the same names at
++        // the same registers (FbRendererCommon.hlsli, FbRendererRT.hlsli): the common set built
++        // WITH the acceleration structure slot, the texture cache twice, the framebuffer.
++        FramebufferRendererDescriptorCommonSet commonSet(shaderLibrary->samplerLibrary, true);
++        FramebufferRendererDescriptorTextureSet textureSet;
++        FramebufferRendererDescriptorFramebufferSet framebufferSet;
++        RenderPipelineLayoutBuilder layoutBuilder;
++        // Global, as a compute pass's: the framebuffer renderer binds this layout and its four
++        // sets on the command list before it dispatches, and the state object (plume, patch 0003)
++        // takes it as the global root signature for exactly that reason.
++        layoutBuilder.begin(false, false);
++        layoutBuilder.addDescriptorSet(commonSet);
++        layoutBuilder.addDescriptorSet(textureSet);
++        layoutBuilder.addDescriptorSet(textureSet);
++        layoutBuilder.addDescriptorSet(framebufferSet);
++        layoutBuilder.end();
++        pipelineLayout = layoutBuilder.create(device);
++
++        // The one library. This renderer is D3D12 only (stack.md), so the DXIL blob is the only
++        // one compiled; a second graphics API would add its blob here and nowhere else.
++        assert((shaderFormat == RenderShaderFormat::DXIL) && "The ray tracing library is compiled to DXIL only.");
++        library = device->createShader(RaytracingBlobDXIL, std::size(RaytracingBlobDXIL), "", shaderFormat);
++
++        const RenderRaytracingPipelineLibrarySymbol symbols[] = {
++            RenderRaytracingPipelineLibrarySymbol("PrimaryRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("DirectRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("IndirectRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("ReflectionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("RefractionRayGen", RenderRaytracingPipelineLibrarySymbolType::RAYGEN),
++            RenderRaytracingPipelineLibrarySymbol("SurfaceMiss", RenderRaytracingPipelineLibrarySymbolType::MISS),
++            RenderRaytracingPipelineLibrarySymbol("ShadowMiss", RenderRaytracingPipelineLibrarySymbolType::MISS),
++            RenderRaytracingPipelineLibrarySymbol("SurfaceClosestHit", RenderRaytracingPipelineLibrarySymbolType::CLOSEST_HIT),
++            RenderRaytracingPipelineLibrarySymbol("SurfaceAnyHit", RenderRaytracingPipelineLibrarySymbolType::ANY_HIT),
++            RenderRaytracingPipelineLibrarySymbol("ShadowAnyHit", RenderRaytracingPipelineLibrarySymbolType::ANY_HIT),
++        };
++
++        const RenderRaytracingPipelineHitGroup hitGroups[] = {
++            RenderRaytracingPipelineHitGroup("SurfaceHitGroup", "SurfaceClosestHit", "SurfaceAnyHit"),
++            RenderRaytracingPipelineHitGroup("ShadowHitGroup", nullptr, "ShadowAnyHit"),
++        };
++
++        const RenderRaytracingPipelineLibrary pipelineLibrary(library.get(), symbols, uint32_t(std::size(symbols)));
++        RenderRaytracingPipelineDesc pipelineDesc;
++        pipelineDesc.libraries = &pipelineLibrary;
++        pipelineDesc.librariesCount = 1;
++        pipelineDesc.hitGroups = hitGroups;
++        pipelineDesc.hitGroupsCount = uint32_t(std::size(hitGroups));
++        pipelineDesc.pipelineLayout = pipelineLayout.get();
++        // SurfacePayload in Raytracing.hlsl is five floats; rounded up so a later pass can grow it
++        // without a layout change.
++        pipelineDesc.maxPayloadSize = 32;
++        pipelineDesc.maxAttributeSize = 2 * sizeof(float);
++        pipelineDesc.maxRecursionDepth = 1;
++        pipelineDesc.stateUpdateEnabled = false;
++
++        RaytracingState &state = states[0];
++        state.pipeline = device->createRaytracingPipeline(pipelineDesc);
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Primary)] = state.pipeline->getProgram("PrimaryRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Direct)] = state.pipeline->getProgram("DirectRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Indirect)] = state.pipeline->getProgram("IndirectRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Reflection)] = state.pipeline->getProgram("ReflectionRayGen");
++        state.rayGenPrograms[uint32_t(RaytracingRayGen::Refraction)] = state.pipeline->getProgram("RefractionRayGen");
++        state.missPrograms[uint32_t(RaytracingMiss::Surface)] = state.pipeline->getProgram("SurfaceMiss");
++        state.missPrograms[uint32_t(RaytracingMiss::Shadow)] = state.pipeline->getProgram("ShadowMiss");
++
++        RaytracingShaderPrograms programs;
++        programs.surface = state.pipeline->getProgram("SurfaceHitGroup");
++        programs.shadow = state.pipeline->getProgram("ShadowHitGroup");
++        state.shaderProgramsMap[UberShaderHash] = programs;
++
++        std::fprintf(stderr, "[rt] pipeline built: %u ray generation, %u miss, %u hit groups\n",
++            uint32_t(RaytracingRayGen::Count), uint32_t(RaytracingMiss::Count), uint32_t(std::size(hitGroups)));
++
+         setupDone = true;
+     }
+ 
+@@ -34,6 +120,8 @@ namespace RT64 {
+     }
+ 
+     void RaytracingShaderCache::setNextState() {
+-        activeState = (activeState + 1) % int32_t(states.size());
++        // One state until a pipeline is ever rebuilt; see the header.
+     }
+ };
++
++#endif
+diff --git a/src/render/rt64_raytracing_shader_cache.h b/src/render/rt64_raytracing_shader_cache.h
+index 979b8b4..18d2a09 100644
+--- a/src/render/rt64_raytracing_shader_cache.h
++++ b/src/render/rt64_raytracing_shader_cache.h
+@@ -1,5 +1,5 @@
+ //
+-// RT64, the renderer's patch series (OoT: Recompiled), patch 0002.
++// RT64, the renderer's patch series (OoT: Recompiled), patches 0002 and 0003.
+ //
+ // The ray tracing shader cache the pinned renderer names and does not ship. The application
+ // creates one at setup when the device reports the capability; the workload queue asks it to
+@@ -7,12 +7,19 @@
+ // description to it, and advances its state each frame; the framebuffer renderer reads the active
+ // state's pipeline and hit groups when it records a traced scene.
+ //
+-// THIS IS THE SMALLEST THING THAT COMPILES. Every member the renderer touches is here with the
+-// type the renderer expects, and nothing is created: no pipeline layout, no pipeline, no hit
+-// group. With the ray tracing level Off (the only level until patch 0008) none of these methods
+-// runs past construction, which is what keeps Off byte identical to the baseline. Patch 0004
+-// onward fills them in as the passes arrive, and nothing here is edited then; a later patch
+-// changes it.
++// PATCH 0003 GIVES IT A PIPELINE. setup() builds the pipeline layout over the renderer's four
++// descriptor sets (the common set with the scene structure and every output, the texture cache
++// twice, the framebuffer), loads the one DXIL library src/shaders/Raytracing.hlsl compiles to,
++// names its symbols, and creates the pipeline with two hit groups: the surface (closest hit and
++// any hit) and the shadow (any hit only). The programs the binding table needs are kept here:
++// the five ray generation entries in the order the renderer dispatches them, the two miss
++// shaders, and the two hit groups under UberShaderHash, which is the one the renderer looks up
++// for every draw call until specialized hit groups exist.
++//
++// ONE STATE, FOR NOW. The renderer is written for two states so a pipeline can be rebuilt with
++// new specialized shaders while the current one records; nothing rebuilds yet, so the active
++// state is always the first and setNextState() changes nothing. The second state's members exist
++// so the renderer's indexing compiles, and stay empty.
+ //
+ 
+ #pragma once
+@@ -32,6 +39,24 @@ namespace RT64 {
+     // groups exist. It looks this up by name in the active state's map.
+     static const uint64_t UberShaderHash = 0;
+ 
++    // The ray generation entries, in the order the framebuffer renderer dispatches them
++    // (rt64_framebuffer_renderer.cpp, submitRaytracingScene: startIndex 0 to 4).
++    enum class RaytracingRayGen : uint32_t {
++        Primary = 0,
++        Direct = 1,
++        Indirect = 2,
++        Reflection = 3,
++        Refraction = 4,
++        Count
++    };
++
++    // The miss shaders, in the order the ray generation shaders index them.
++    enum class RaytracingMiss : uint32_t {
++        Surface = 0,
++        Shadow = 1,
++        Count
++    };
++
+     struct RaytracingShaderPrograms {
+         RenderPipelineProgram surface;
+         RenderPipelineProgram shadow;
+@@ -40,6 +65,8 @@ namespace RT64 {
+     struct RaytracingState {
+         std::unique_ptr<RenderPipeline> pipeline;
+         std::unordered_map<uint64_t, RaytracingShaderPrograms> shaderProgramsMap;
++        RenderPipelineProgram rayGenPrograms[uint32_t(RaytracingRayGen::Count)];
++        RenderPipelineProgram missPrograms[uint32_t(RaytracingMiss::Count)];
+     };
+ 
+     struct RaytracingShaderCache {
+@@ -47,6 +74,7 @@ namespace RT64 {
+         RenderShaderFormat shaderFormat{};
+         const ShaderLibrary *shaderLibrary = nullptr;
+         std::unique_ptr<RenderPipelineLayout> pipelineLayout;
++        std::unique_ptr<RenderShader> library;
+ 
+         // Two states so a frame can record against one while the next is being prepared. The
+         // renderer keeps a pointer into this array across a frame, so it is an array and never a
+@@ -62,7 +90,7 @@ namespace RT64 {
+         void setup();
+ 
+         // A traced draw call's shader description, so a specialized hit group can be built for
+-        // it later. Nothing is built yet.
++        // it later. Nothing is built from it yet.
+         void submit(const ShaderDescription &shaderDesc);
+ 
+         int32_t getActiveState() const;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+new file mode 100644
+index 0000000..0dbadcc
+--- /dev/null
++++ b/src/shaders/Raytracing.hlsl
+@@ -0,0 +1,198 @@
++//
++// RT64, the renderer's patch series (OoT: Recompiled), patch 0003.
++//
++// THE RAY TRACING LIBRARY: every ray generation, miss and hit shader the pipeline names, in one
++// file, compiled once as a DXIL library. The shader cache (rt64_raytracing_shader_cache.cpp)
++// imports these symbols by name and builds the two hit groups from them, and the framebuffer
++// renderer dispatches the five ray generation entries in the order it always has: primary,
++// direct, indirect, reflection, refraction.
++//
++// PHASE 53 IS THE PRIMARY RAY AND NOTHING ELSE. It walks the acceleration structures the frame
++// built and writes what it hit into the buffers every later pass reads: the hit distance (the
++// depth view draws it), the world position, the geometric normal, the instance, the view
++// direction. The diffuse buffer takes the raster color of the pixel for the passes that come.
++// The pinned composite LIGHTS that buffer, and no pass writes a light yet, so the final view is
++// black at this phase and the phase is judged in the distance view; phase 54 composites into the
++// raster output instead. Every other buffer is written to zero so the composite and the filters
++// have defined inputs. The four other ray generation shaders exist so the binding table has
++// their records and return at once; the passes fill them in from phase 54.
++//
++// Bindings are the renderer's own (FbRendererCommon.hlsli, FbRendererRT.hlsli): descriptor set
++// 0 is the common set with the scene structure and every output, sets 1 and 2 the texture
++// cache, set 3 the framebuffer's own background color and depth.
++//
++
++#include "Color.hlsli"
++#include "FbRendererCommon.hlsli"
++#include "FbRendererRT.hlsli"
++
++// The instance masks the renderer assigns (rt64_common.h): the same three bits, by the same names.
++static const uint DepthRayQueryMask = 0x1;
++static const uint NoDepthRayQueryMask = 0x2;
++static const uint ShadowCatcherRayQueryMask = 0x4;
++
++struct SurfacePayload {
++    float hitDistance;      // RayTCurrent() at the closest hit, 0 on a miss
++    int instanceId;         // InstanceID(), which is the frame's instance draw call index, -1 on a miss
++    float3 hitNormal;       // the triangle's geometric normal, facing the ray
++};
++
++struct ShadowPayload {
++    float visibility;       // 1 when the ray escaped, 0 when something stood in the way
++};
++
++// The eye, from the inverse view matrix. The parameter block is written by hlslpp on the CPU
++// with row vectors, so its translation is the fourth row there; HLSL packs the same bytes as a
++// column major matrix, which reads that row as the fourth column.
++float3 eyePosition() {
++    return float3(RtParams.viewI[0][3], RtParams.viewI[1][3], RtParams.viewI[2][3]);
++}
++
++// A pinhole ray for a pixel of the traced viewport. cameraU, cameraV and cameraW are the
++// renderer's own (rt64_framebuffer_renderer.cpp, updateRaytracingScene): W points down the view
++// for the focal distance, U and V span the half width and the half height of the view at that
++// distance. U is scaled by the aspect ratio here because the renderer leaves it square.
++bool primaryRay(uint2 launchIndex, out float3 origin, out float3 direction) {
++    const float2 viewportOrigin = RtParams.viewport.xy;
++    const float2 viewportSize = RtParams.viewport.zw;
++    const float2 pixel = float2(launchIndex) + 0.5f - viewportOrigin;
++    if (any(pixel < 0.0f) || any(pixel >= viewportSize)) {
++        origin = 0.0f;
++        direction = 0.0f;
++        return false;
++    }
++
++    float2 d = (pixel / viewportSize) * 2.0f - 1.0f;
++    d.x *= viewportSize.x / viewportSize.y;
++    d.y = -d.y;
++    origin = eyePosition();
++    direction = normalize(RtParams.cameraW.xyz + RtParams.cameraU.xyz * d.x + RtParams.cameraV.xyz * d.y);
++    return true;
++}
++
++void clearOutputs(uint2 launchIndex) {
++    gViewDirection[launchIndex] = 0.0f;
++    gShadingPosition[launchIndex] = 0.0f;
++    gShadingNormal[launchIndex] = 0.0f;
++    gShadingSpecular[launchIndex] = 0.0f;
++    gDiffuse[launchIndex] = 0.0f;
++    gInstanceId[launchIndex] = -1;
++    gDirectLightAccum[launchIndex] = 0.0f;
++    gIndirectLightAccum[launchIndex] = 0.0f;
++    gReflection[launchIndex] = 0.0f;
++    gRefraction[launchIndex] = 0.0f;
++    gTransparent[launchIndex] = 0.0f;
++    gFlow[launchIndex] = 0.0f;
++    gReactiveMask[launchIndex] = 0.0f;
++    gLockMask[launchIndex] = 0.0f;
++    gNormalRoughness[launchIndex] = 0.0f;
++    gDepth[launchIndex] = 0.0f;
++}
++
++[shader("raygeneration")]
++void PrimaryRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    clearOutputs(launchIndex);
++
++    // The raster color of this pixel, for the passes that come: the composite converts linear
++    // to sRGB, so the color goes in linear. Alpha zero tells it there is no lighting to apply.
++    const float3 raster = gBackgroundColor.Load(int3(launchIndex, 0)).rgb;
++    gDiffuse[launchIndex] = float4(SrgbToLinear(raster), 0.0f);
++
++    float3 origin;
++    float3 direction;
++    if (!primaryRay(launchIndex, origin, direction)) {
++        return;
++    }
++
++    RayDesc ray;
++    ray.Origin = origin;
++    ray.Direction = direction;
++    ray.TMin = max(RtParams.nearDist, 1.0f);
++    ray.TMax = RtParams.farDist * 4.0f;
++
++    SurfacePayload payload;
++    payload.hitDistance = 0.0f;
++    payload.instanceId = -1;
++    payload.hitNormal = 0.0f;
++    // Only the instances that take part in depth (rt64_common.h, DepthRayQueryMask): a draw
++    // call with depth test and write both off is the game painting a backdrop, and this game
++    // draws its sky as a box around the eye that way, which would otherwise stand in front of
++    // every ray. The no-depth instances are the background passes' concern.
++    TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++
++    gViewDirection[launchIndex] = float4(direction, 0.0f);
++    if (payload.instanceId >= 0) {
++        const float3 hitPosition = origin + direction * payload.hitDistance;
++        gShadingPosition[launchIndex] = float4(hitPosition, 1.0f);
++        gShadingNormal[launchIndex] = float4(payload.hitNormal, 0.0f);
++        gNormalRoughness[launchIndex] = float4(payload.hitNormal, 1.0f);
++        gInstanceId[launchIndex] = payload.instanceId;
++
++        // The depth view draws this as gray, so it is the hit distance over the far plane: near
++        // is dark, the far plane white, the sky (a miss) stays at zero. The square root, because
++        // the game's far plane is several thousand units and everything a player looks at sits
++        // in the first few hundred, which a linear ramp shows as one shade of black.
++        gDepth[launchIndex] = sqrt(saturate(payload.hitDistance / RtParams.farDist));
++    }
++}
++
++// The four passes that arrive with phases 54 to 56. Their records exist in the binding table
++// from the start, so dispatching them is already the shape it will keep.
++[shader("raygeneration")]
++void DirectRayGen() { }
++
++[shader("raygeneration")]
++void IndirectRayGen() { }
++
++[shader("raygeneration")]
++void ReflectionRayGen() { }
++
++[shader("raygeneration")]
++void RefractionRayGen() { }
++
++[shader("closesthit")]
++void SurfaceClosestHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    payload.hitDistance = RayTCurrent();
++    payload.instanceId = int(InstanceID());
++
++    // The triangle's own normal from the world positions the vertex processor wrote, found
++    // through the instance's index range: every instance is one draw call, its indices start
++    // where the renderer says (instanceRenderIndices), and the primitive index counts from there.
++    const uint faceStart = instanceRenderIndices[InstanceID()].faceIndicesStart;
++    const uint3 indices = indexBuffer.Load3((faceStart + PrimitiveIndex() * 3) * 4);
++    const float3 p0 = asfloat(posBuffer.Load3(indices.x * 16));
++    const float3 p1 = asfloat(posBuffer.Load3(indices.y * 16));
++    const float3 p2 = asfloat(posBuffer.Load3(indices.z * 16));
++    float3 normal = cross(p1 - p0, p2 - p0);
++    const float length2 = dot(normal, normal);
++    normal = (length2 > 0.0f) ? (normal * rsqrt(length2)) : float3(0.0f, 1.0f, 0.0f);
++    if (dot(normal, WorldRayDirection()) > 0.0f) {
++        normal = -normal;
++    }
++
++    payload.hitNormal = normal;
++}
++
++[shader("anyhit")]
++void SurfaceAnyHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    // Every surface is solid until the alpha test arrives with the shading (phase 54).
++}
++
++[shader("miss")]
++void SurfaceMiss(inout SurfacePayload payload) {
++    payload.hitDistance = 0.0f;
++    payload.instanceId = -1;
++    payload.hitNormal = 0.0f;
++}
++
++[shader("anyhit")]
++void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attributes) {
++    payload.visibility = 0.0f;
++    AcceptHitAndEndSearch();
++}
++
++[shader("miss")]
++void ShadowMiss(inout ShadowPayload payload) {
++    payload.visibility = 1.0f;
++}

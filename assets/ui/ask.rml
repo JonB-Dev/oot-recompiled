@@ -1,0 +1,48 @@
+<rml>
+<head>
+    <title>Ask</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body>
+    <div class="scrim" id="ask-scrim">
+        <div class="case">
+
+            <div class="lid">
+                <div class="head">
+                    <div class="mark"></div>
+                    <div class="title" id="ask-title">A question</div>
+                </div>
+            </div>
+
+            <!-- One question at a time, filled by the shell: the two first run questions, and
+                 since 2026-09-26 any confirmation the interface needs (the way into the Debugging
+                 menu, and switching the frame recorder on). The first run pair are asked ONCE and
+                 the answer is a setting afterward: nothing here nags, and neither has a default
+                 that acts before it is answered.
+
+                 A SCRIM AND A CASE, not the launcher's own window chrome. It had the chrome
+                 because the questions are the only thing on screen at first run; the moment a
+                 confirmation was raised during play it was drawn at the top left with the rest of
+                 the window black behind it. There is also no close button on purpose: a question
+                 is answered by one of its two buttons, or by Escape, which counts as No. -->
+            <div class="ask-body">
+                <p class="ask-q" id="ask-question"></p>
+                <p class="prose" id="ask-detail"></p>
+            </div>
+
+            <div class="actions">
+                <div class="act-btn act-quit" id="ask-no"><span class="act-label" id="ask-no-label">No</span></div>
+                <div class="act-btn act-play" id="ask-yes"><span class="act-label" id="ask-yes-label">Yes</span></div>
+            </div>
+
+            <div class="foot">
+                <span id="ask-foot">You can change this at any time in the settings</span>
+            </div>
+
+        </div>
+    </div>
+</body>
+</rml>

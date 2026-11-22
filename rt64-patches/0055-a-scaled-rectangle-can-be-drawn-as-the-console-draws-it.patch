@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Fri, 9 Oct 2026 18:45:00 -0400
+Subject: [PATCH] A scaled rectangle can be drawn as the console draws it
+
+Patch 0055 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-09, of the magic meter at a HUD size under 100%: "the green bar in the magic bar
+is too tall", and after two fixes in the game's own patches, "test is better but not fixed".
+
+A rectangle whose texture steps are 1:1 is drawn with its texture coordinates snapped to the
+console's pixels (RasterPS.hlsl, lowResUV), so each console pixel reads the texel the console
+read. A scaled one is sampled continuously under Upscale2D ScaledOnly, which for the HUD's
+bilinear filter blends texels the console never reached into the edge of the rectangle: the
+magic meter's fill took its dark row 7 and the bytes after its eight rows, and its frame's thin
+borders were washed out. The program scales HUD pieces that the game drew 1:1, and wants them to
+look as they do at their own size.
+
+G_EX_FORCEUPSCALE2D_V1 now reads two bits: 0 neither, 1 force the upscaled path as before, 2
+force the console's own texture coordinates for every rectangle drawn while it stands
+(DrawExtendedFlags::forceNative2D). The macro writes one bit, so every existing use reads as
+before, and the flag is cleared with the other extended flags.
+
+diff --git a/src/hle/rt64_draw_call.h b/src/hle/rt64_draw_call.h
+--- a/src/hle/rt64_draw_call.h
++++ b/src/hle/rt64_draw_call.h
+@@ -65,6 +65,9 @@ namespace RT64 {
+         uint32_t forceUpscale2D : 1;
+         uint32_t forceTrueBilerp : 2;
+         uint32_t forceScaleLOD : 1;
++        // A rectangle drawn with the console's own per-pixel texture coordinates even when its
++        // texture steps scale it (patch 0055): G_EX_FORCEUPSCALE2D_V1 with the value 2.
++        uint32_t forceNative2D : 1;
+     };
+ 
+     struct DrawCall {
+diff --git a/src/hle/rt64_rdp.h b/src/hle/rt64_rdp.h
+--- a/src/hle/rt64_rdp.h
++++ b/src/hle/rt64_rdp.h
+@@ -197,6 +197,7 @@ namespace RT64 {
+         void setScissorAlign(const ExtendedAlignment &extAlignment);
+         void setRectAspect(uint8_t aspect);
+         void forceUpscale2D(bool force);
++        void forceNative2D(bool force);
+         void forceTrueBilerp(uint8_t mode);
+         void forceScaleLOD(bool force);
+         void clearExtended();
+diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -1065,7 +1065,12 @@ namespace RT64 {
+         extended.drawExtendedFlags.forceUpscale2D = force;
+         state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
+     }
+-    
++
++    void RDP::forceNative2D(bool force) {
++        extended.drawExtendedFlags.forceNative2D = force;
++        state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
++    }
++
+     void RDP::forceTrueBilerp(uint8_t mode) {
+         extended.drawExtendedFlags.forceTrueBilerp = mode;
+         state->updateDrawStatusAttribute(DrawAttribute::ExtendedFlags);
+diff --git a/src/gbi/rt64_gbi_extended.cpp b/src/gbi/rt64_gbi_extended.cpp
+--- a/src/gbi/rt64_gbi_extended.cpp
++++ b/src/gbi/rt64_gbi_extended.cpp
+@@ -161,8 +161,12 @@ namespace RT64 {
+         }
+ 
+         void forceUpscale2DV1(State *state, DisplayList **dl) {
+-            const uint8_t force = (*dl)->p1(0, 1);
+-            state->rdp->forceUpscale2D(force);
++            // 0 neither, 1 force the upscaled path, 2 force the console's own per-pixel texture
++            // coordinates for a scaled rectangle (patch 0055). The macro writes one bit, so every
++            // existing use reads as before.
++            const uint8_t mode = (*dl)->p1(0, 2);
++            state->rdp->forceUpscale2D(mode == 1);
++            state->rdp->forceNative2D(mode == 2);
+         }
+ 
+         void forceTrueBilerpV1(State *state, DisplayList **dl) {
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -1013,6 +1013,11 @@ namespace RT64 {
+                     const bool forcedUpscale2D = (flags.rect == 0) || (upscale2D == UserConfiguration::Upscale2D::All) || callDesc.extendedFlags.forceUpscale2D;
+                     const bool upscaleIfScaledRect = (upscale2D == UserConfiguration::Upscale2D::ScaledOnly) && flags.rect && !callDesc.identityRectScale();
+                     flags.upscale2D = forcedUpscale2D || upscaleIfScaledRect;
++                    // A rectangle the game asked to draw as the console would (patch 0055): its
++                    // texture coordinates snapped to the console's pixels, scaled or not.
++                    if (flags.rect && callDesc.extendedFlags.forceNative2D) {
++                        flags.upscale2D = false;
++                    }
+ 
+                     if (proj.usesViewport()) {
+                         flags.culling = (callDesc.geometryMode & callDesc.cullBothMask) != 0;

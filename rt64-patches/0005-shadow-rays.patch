@@ -1,0 +1,936 @@
+From 41a7931a082d0252d59c3c5ff07163e87c5cdbf0 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 24 Sep 2026 04:23:54 -0400
+Subject: [PATCH] Ray traced shadows on the game's own lighting
+
+Patch 0005 of the renderer series (OoT: Recompiled, .scaffold/upgrades/lighting-design.md).
+
+The shadow pass: one ray per hit pixel toward a point on the sun's disc, placed by blue noise so
+neighbors and frames differ, and the result written as a multiplier on the raster color rather
+than as a light. The game lit each surface with its ambient plus the sun times the cosine; what
+the pass writes is what remains of that with the sun blocked, so shadows sit on the game's own
+vertex lighting and a surface the sun does not face keeps its color.
+
+The composite is a factor over the rasterized frame, never a color of its own: the compose
+shader writes the shadow's fraction (one where no ray hit) and the post process multiplies the
+color target by it. The traced calls are rasterized as well, so the frame the factor multiplies
+is the game's, and every raster call keeps its order against them (the pinned renderer's
+interleaved rasters are not made: a pre-rendered room draws its depth mesh and then copies the
+picture over it, and the copy was being lost).
+
+The sun is the strongest directional light among the game's own, searched across every
+projection of the frame because the game sets its lights under the sky's projection before it
+draws the world, with that projection's ambient. It is a sun only under a sky: the first
+perspective draw of the world's pair is the sky box, depth-free, when there is one, and a room's
+directional light traced against the room's own walls shadowed the whole room, so a frame
+without a sky has no sun and its interiors are left to the local lights of phase 55. The
+parameter block carries the sun with three words of padding before it: the shader aligns a
+float4 to sixteen bytes and the CPU side's float4 does not.
+
+The GPU timer: a timestamp pair per span per frame in a query pool per ring slot, read back when
+the slot comes round again, and the once a second trace becomes the frame budget line phase 58
+reads. The builds are stamped where they are recorded; the shadow dispatch is stamped around the
+direct light trace in the framebuffer renderer, the second pinned edit of this patch.
+
+The blue noise table is real: three 64 by 64 void and cluster masks generated offline by
+tools/blue_noise.py into a committed header, turned into the 64 slices the shaders index by
+frame through a golden ratio step per slice. The interleaved gradient placeholder of patch 0002
+is gone.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 405afef..8fd6866 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -831,7 +831,9 @@ namespace RT64 {
+         // Dispatch rays for direct light.
+         RT64_LOG_PRINTF("Dispatching direct light rays");
+         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 1;
++        rtResources->timerBegin(worker, RaytracingResources::Span::Shadows);   // patch 0005
+         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
++        rtResources->timerEnd(worker, RaytracingResources::Span::Shadows);
+ 
+         // Dispatch rays for indirect light.
+         RT64_LOG_PRINTF("Dispatching indirect light rays");
+@@ -1417,8 +1419,18 @@ namespace RT64 {
+ 
+ #   if RT_ENABLED
+         RaytracingScene rtScene;
++        RasterScene tracedRasterScene;   // the traced calls, rasterized too (patch 0005)
+         auto checkRtScene = [&](RaytracingScene &rtScene) {
+             if (!rtScene.instanceIndices.empty()) {
++                // The traced calls' own raster scene goes first, so the color target holds
++                // them when the traced pass reads it (patch 0005).
++                if (!tracedRasterScene.instanceIndices.empty()) {
++                    uint32_t rasterIndex = static_cast<uint32_t>(targetDrawCall.rasterScenes.size());
++                    targetDrawCall.rasterScenes.push_back(tracedRasterScene);
++                    targetDrawCall.sceneIndices.push_back({ rasterIndex, false });
++                    tracedRasterScene.instanceIndices.clear();
++                }
++
+                 uint32_t sceneIndex = static_cast<uint32_t>(targetDrawCall.rtScenes.size());
+                 targetDrawCall.rtScenes.push_back(rtScene);
+                 targetDrawCall.sceneIndices.push_back({ sceneIndex, true });
+@@ -1442,6 +1454,7 @@ namespace RT64 {
+         const bool adjustRatio = (abs((scissorRatio / p.aspectRatioSource) - 1.0f) < SimilarityPercentage);
+         const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
+         InstanceDrawCall instanceDrawCall;
++        InstanceDrawCall tracedCall;   // the second instance of a traced call (patch 0005)
+         interop::RenderIndices renderIndices;
+         uint32_t globalCallIndex = 0;
+         const float wideWidth = p.fbWidth * p.resolutionScale.x;
+@@ -1547,6 +1560,9 @@ namespace RT64 {
+                 renderIndices.rdpTileCount = call.callDesc.tileCount;
+                 renderIndices.highlightColor = call.debuggerDesc.highlightColor;
+                 renderIndicesVector.push_back(renderIndices);
++#           if RT_ENABLED
++                tracedCall.type = InstanceDrawCall::Type::Unknown;   // set again only by a traced call (patch 0005)
++#           endif
+ 
+                 uint32_t cycleType = call.callDesc.otherMode.cycleType();
+                 if (cycleType == G_CYC_FILL) {
+@@ -1604,8 +1620,13 @@ namespace RT64 {
+                 }
+                 else {
+ #               if RT_ENABLED
++                    // The traced calls are rasterized as well (patch 0005): the composite of this
++                    // series multiplies the passes onto the raster color, so the world has to be
++                    // in the color target when the traced pass reads it. The raster setup below
++                    // runs for every call; a traced call also gets a second instance of its own.
+                     if (rtProj) {
+-                        instanceDrawCall.type = InstanceDrawCall::Type::Raytracing;
++                        tracedCall = instanceDrawCall;
++                        tracedCall.type = InstanceDrawCall::Type::Raytracing;
+ 
+                         if (hitGroupVector.empty()) {
+                             // TODO: Support specialized shaders.
+@@ -1615,7 +1636,7 @@ namespace RT64 {
+                             hitGroupVector.emplace_back(shaderPrograms.shadow);
+                         }
+ 
+-                        auto &raytracing = instanceDrawCall.raytracing;
++                        auto &raytracing = tracedCall.raytracing;
+                         raytracing.hitGroupIndex = 0;
+                         raytracing.cullDisable = !call.shaderDesc.flags.culling;
+ 
+@@ -1635,7 +1656,6 @@ namespace RT64 {
+                             rspSmoothNormalVector.push_back(rspSmoothNormal);
+                         }
+                     }
+-                    else 
+ #               endif
+                     {
+                         triangles.shaderDesc = call.shaderDesc;
+@@ -1726,14 +1746,20 @@ namespace RT64 {
+                 // Determine to use the draw call either in the RT scene or the raster scene.
+                 const uint32_t instanceIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
+ #           if RT_ENABLED
+-                bool rtCall = instanceDrawCall.type == InstanceDrawCall::Type::Raytracing;
++                bool rtCall = rtProj && (tracedCall.type == InstanceDrawCall::Type::Raytracing);
+                 if (rtCall) {
+                     // If the current scene is not compatible, we submit it before the raster scene.
+                     if (!rtProjCompatible) {
+                         checkRtScene(rtScene);
+                     }
+ 
+-                    const bool addedRasterScene = checkRasterScene(rasterScene);
++                    // Every raster call pending since the last traced one goes before the traced
++                    // scene as well, in the game's order (patch 0005): the game leans on that order
++                    // (a pre-rendered room draws its depth mesh and then copies the picture over
++                    // it), and the pinned renderer's interleaved rasters, which took these calls
++                    // out of the color target for the traced shading to blend in, are not made.
++                    tracedRasterScene.instanceIndices.insert(tracedRasterScene.instanceIndices.end(), rasterScene.instanceIndices.begin(), rasterScene.instanceIndices.end());
++                    rasterScene.instanceIndices.clear();
+                     if (rtScene.instanceIndices.empty()) {
+                         float projRatioScale = 1.0f / aspectRatioScale;
+                         float invRatioScale = 1.0f / aspectRatioScale;
+@@ -1763,6 +1789,62 @@ namespace RT64 {
+                         rtScene.screenWidth = lround(static_cast<float>(p.fbWidth) * p.resolutionScale.x);
+                         rtScene.screenHeight = lround(static_cast<float>(p.fbHeight) * p.resolutionScale.y);
+ 
++                        // The scene's lights (patch 0005). The game sets its lights once, under
++                        // whichever projection is current, which in this game is the sky's, so the
++                        // pair's projections are searched for the strongest directional light and
++                        // that projection's sun and ambient are the scene's. The shadow pass leaves
++                        // the ambient standing where the sun is blocked. The sun is a sun only under
++                        // a sky: a room's directional light is a fill the game invents, and traced
++                        // against the room's own walls it shadowed the whole room, so a frame with
++                        // no sky draw has no sun and its interiors are left to the local lights.
++                        {
++                            const LightManager *lit = nullptr;
++                            const LightManager::Directional *sun = nullptr;
++                            bool hasSky = false;
++                            // Across every pair of the frame: the game sets its lights before it
++                            // draws anything, under whichever pair and projection is current then,
++                            // which is not the world's.
++                            for (uint32_t fp = 0; fp < p.curWorkload->fbPairCount; fp++) {
++                                const FramebufferPair &lightPair = p.curWorkload->fbPairs[fp];
++                                for (uint32_t lp = 0; lp < lightPair.projectionCount; lp++) {
++                                    const Projection &lightProj = lightPair.projections[lp];
++                                    const LightManager &manager = lightProj.lightManager;
++                                    for (const LightManager::Directional &directional : manager.directionalLights) {
++                                        if ((sun == nullptr) || (directional.intensityTotal > sun->intensityTotal)) {
++                                            sun = &directional;
++                                            lit = &manager;
++                                        }
++                                    }
++
++                                }
++                            }
++
++                            // The sky is the first thing the game draws in the world: the sky box,
++                            // with depth test and write both off, before the rooms; a room's own
++                            // depth-free draws (light beams, lamp glows) come after its walls. So
++                            // the first draw of the pair's first perspective projection says
++                            // whether there is a sky.
++                            for (uint32_t sp = 0; sp < fbPair.projectionCount; sp++) {
++                                const Projection &skyProj = fbPair.projections[sp];
++                                if ((skyProj.type == Projection::Type::Perspective) && !skyProj.scissorRect.isNull() && (skyProj.gameCallCount > 0)) {
++                                    const interop::OtherMode &firstMode = skyProj.gameCalls[0].callDesc.otherMode;
++                                    hasSky = !firstMode.zCmp() && !firstMode.zUpd();
++                                    break;
++                                }
++                            }
++
++                            rtScene.sunDirection = hlslpp::float3(0.0f, 0.0f, 0.0f);
++                            rtScene.sunColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
++                            rtScene.ambientColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
++                            if (hasSky && (sun != nullptr) && (sun->intensityTotal > 0.0f)) {
++                                rtScene.sunDirection = hlslpp::normalize(sun->dir);
++                                rtScene.sunColor = sun->colTotal / sun->intensityTotal;
++                                if (lit->ambientSum > 0) {
++                                    rtScene.ambientColor = lit->estimatedAmbientLight(1.0f);
++                                }
++                            }
++                        }
++
+                         if (proj.pointLightCount > 0) {
+                             rtScene.pointLights = proj.pointLights.data();
+                             rtScene.lightCount = proj.pointLightCount;
+@@ -1772,22 +1854,26 @@ namespace RT64 {
+                             rtScene.lightCount = 0;
+                         }
+                     }
+-                    else if (rtProjCompatible && addedRasterScene) {
+-                        targetDrawCall.sceneIndices.pop_back();
+-                        const uint32_t rasterSceneIndex = static_cast<uint32_t>(targetDrawCall.rasterScenes.size() - 1);
+-                        const auto &rasterScene = targetDrawCall.rasterScenes[rasterSceneIndex];
+-                        rtScene.interleavedRasters.push_back({ rasterSceneIndex, rasterScene.instanceIndices.back(), 0, 0 });
+-                    }
+ 
+-                    rtScene.instanceIndices.push_back(instanceIndex);
++                    // (The pinned interleaved raster of the calls between two traced ones is not
++                    // made: they went before the traced scene above, patch 0005.)
++
++                    // The raster copy at instanceIndex and the traced instance at the next index,
++                    // with the render indices duplicated so both line up (patch 0005).
++                    tracedRasterScene.instanceIndices.push_back(instanceIndex);
++                    instanceDrawCallVector.push_back(instanceDrawCall);
++                    renderIndicesVector.push_back(renderIndices);
++                    const uint32_t tracedIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
++                    instanceDrawCallVector.push_back(tracedCall);
++                    rtScene.instanceIndices.push_back(tracedIndex);
+                 }
+                 else 
+ #           endif
+                 {
+                     rasterScene.instanceIndices.push_back(instanceIndex);
++                    instanceDrawCallVector.push_back(instanceDrawCall);
+                 }
+ 
+-                instanceDrawCallVector.push_back(instanceDrawCall);
+                 globalCallIndex++;
+             }
+         }
+diff --git a/src/render/rt64_raytracing_bluenoise.cpp b/src/render/rt64_raytracing_bluenoise.cpp
+index 93906b7..c4480d4 100644
+--- a/src/render/rt64_raytracing_bluenoise.cpp
++++ b/src/render/rt64_raytracing_bluenoise.cpp
+@@ -1,34 +1,30 @@
+ //
+-// RT64, the renderer's patch series (OoT: Recompiled), patch 0002.
++// RT64, the renderer's patch series (OoT: Recompiled), patches 0002 and 0005.
+ //
+ 
+ #include "rt64_raytracing_bluenoise.h"
++#include "rt64_raytracing_bluenoise_table.h"
+ 
+ #include <cmath>
+ 
+ namespace RT64 {
+-    // Interleaved gradient noise (Jimenez), with the slice index folded into the x term so every
+-    // slice differs. A placeholder for the blue noise table phase 54 brings; see the header.
+-    static float gradientNoise(float x, float y, float slice) {
+-        const float shifted = x + 5.588238f * slice;
+-        const float inner = 0.06711056f * shifted + 0.00583715f * y;
+-        const float f = 52.9829189f * (inner - std::floor(inner));
+-        return f - std::floor(f);
+-    }
+-
+     const std::vector<uint8_t> &RaytracingBlueNoise::atlasBGRA8() {
+         static const std::vector<uint8_t> atlas = [] {
++            // Slice k is the mask advanced by k steps of the golden ratio and wrapped: blue in
++            // space on every slice, and for any one pixel a low discrepancy sequence over the
++            // slices, so a sample that accumulates over frames converges rather than flickers.
++            static_assert(BlueNoiseMaskSize == SliceSize, "the masks are the slice size");
++            static_assert(BlueNoiseMaskChannels == 3, "one mask per color channel");
++            const float GoldenStep = 0.61803398875f;
+             std::vector<uint8_t> bytes(AtlasWidth * AtlasHeight * 4);
+             for (uint32_t y = 0; y < AtlasHeight; y++) {
+                 for (uint32_t x = 0; x < AtlasWidth; x++) {
+                     const uint32_t slice = (y / SliceSize) * SlicesPerRow + (x / SliceSize);
+-                    const float px = float(x % SliceSize);
+-                    const float py = float(y % SliceSize);
++                    const uint32_t maskIndex = (y % SliceSize) * SliceSize + (x % SliceSize);
+                     const size_t at = (size_t(y) * AtlasWidth + x) * 4;
+                     for (uint32_t channel = 0; channel < 3; channel++) {
+-                        // Each channel is its own slice of the sequence, so the three read as
+-                        // three independent tables rather than one repeated.
+-                        const float value = gradientNoise(px, py, float(slice * 3 + channel));
++                        float value = float(BlueNoiseMasks[channel][maskIndex]) / 256.0f + GoldenStep * float(slice);
++                        value -= std::floor(value);
+                         bytes[at + (2 - channel)] = uint8_t(value * 255.0f + 0.5f);
+                     }
+ 
+diff --git a/src/render/rt64_raytracing_bluenoise.h b/src/render/rt64_raytracing_bluenoise.h
+index b97faa4..9eed5df 100644
+--- a/src/render/rt64_raytracing_bluenoise.h
++++ b/src/render/rt64_raytracing_bluenoise.h
+@@ -1,16 +1,17 @@
+ //
+-// RT64, the renderer's patch series (OoT: Recompiled), patch 0002.
++// RT64, the renderer's patch series (OoT: Recompiled), patches 0002 and 0005.
+ //
+-// The blue noise the ray tracing path samples for its dither and its sample offsets. The pinned
++// The blue noise the ray tracing path samples for its sample offsets and its dither. The pinned
+ // renderer uploaded a 512 by 512 atlas from a generated header that is not in the tree; this
+-// generates an atlas of the same shape at startup instead (64 slices of 64 by 64, laid out 8 by
+-// 8, BGRA8), so no patch carries a megabyte of bytes.
++// builds an atlas of the same shape at startup (64 slices of 64 by 64, laid out 8 by 8, BGRA8)
++// from three committed masks, so no patch carries a megabyte of bytes.
+ //
+-// PLACEHOLDER UNTIL PHASE 54. The table is interleaved gradient noise with a per slice offset:
+-// decorrelated and deterministic, not a true blue noise spectrum. Nothing reads it until the
+-// shadow pass exists, and that phase replaces the generator with a proper blue noise table
+-// (void and cluster, generated offline into a committed asset of ours). This file exists so the
+-// path builds and the upload at setup has bytes to upload.
++// THE MASKS ARE REAL BLUE NOISE (patch 0005): void and cluster, 64 by 64, one per color channel,
++// generated offline by tools/blue_noise.py into rt64_raytracing_bluenoise_table.h. Slice k of the
++// atlas is each mask advanced by k golden ratio steps and wrapped, which keeps every slice blue
++// in space and makes the sequence any one pixel sees over the frames a low discrepancy one, the
++// property a sample that accumulates over frames wants. Patch 0002 had interleaved gradient noise
++// here as a placeholder until the shadow pass needed the real thing.
+ //
+ 
+ #pragma once
+@@ -25,7 +26,7 @@ namespace RT64 {
+         static const uint32_t AtlasWidth = SliceSize * SlicesPerRow;
+         static const uint32_t AtlasHeight = SliceSize * SlicesPerRow;
+ 
+-        // The atlas, generated once on first use. AtlasWidth * AtlasHeight * 4 bytes, BGRA8.
++        // The atlas, built once on first use. AtlasWidth * AtlasHeight * 4 bytes, BGRA8.
+         static const std::vector<uint8_t> &atlasBGRA8();
+     };
+ };
+diff --git a/src/render/rt64_raytracing_bluenoise_table.h b/src/render/rt64_raytracing_bluenoise_table.h
+new file mode 100644
+index 0000000..559dea7
+--- /dev/null
++++ b/src/render/rt64_raytracing_bluenoise_table.h
+@@ -0,0 +1,216 @@
++//
++// RT64, the renderer's patch series (OoT: Recompiled), patch 0005.
++//
++// GENERATED by tools/blue_noise.py, which is where to look for the reasoning; do not edit.
++// Three 64 by 64 blue noise masks of 8 bit ranks, void and cluster with sigma 1.9,
++// seeds 0xee to 0xf0, one per color channel of the noise atlas.
++//
++
++#pragma once
++
++#include <cstdint>
++
++namespace RT64 {
++    static const uint32_t BlueNoiseMaskSize = 64;
++    static const uint32_t BlueNoiseMaskChannels = 3;
++    static const uint8_t BlueNoiseMasks[3][4096] = {
++        {
++            115,  27, 226,   8, 100, 152,  39,  92, 177, 131,  71, 252, 146,  42, 230,  92, 217, 117,  58, 162, 232, 184, 121,  86, 211, 231, 130, 108,   4,  86, 120,  32, 204, 131, 188, 219, 166, 111,  54, 187, 126,  87, 179,  53, 215, 154, 120, 224,  70, 107, 244,  64,  38, 225,  99,  20,  48, 220, 175,   4, 130, 182, 215,  15,
++            244, 175, 134,  46, 112, 202,  25, 236, 162, 110, 225,  99,  59,  18, 136,  29, 169, 144, 237,  98,  68,   9, 249,  36, 142, 199,  48, 177, 252, 161, 194,  16,  80,  52,  94,  19, 121, 205,   2, 237,  68, 202,  30, 135, 110, 198,  35, 251, 179, 149,   4,  91, 206,  12,  74, 167, 248, 136, 200,  77, 255, 105,  85, 154,
++             60,  97,  79, 210, 254, 141, 190,  81,  49, 199,  15, 184, 165, 206, 114, 250,  66, 182,  36,  17, 205, 148, 108, 173,  95,  11, 155,  76, 221,  56, 136, 103, 243, 227,  40, 158, 247,  83, 141, 103, 225,  41, 166, 240,  77,  16,  59,  98,  83,  25, 194, 162, 124, 178, 145, 112,  61,  27,  95, 148,  22,  47, 198, 221,
++             39, 188, 231, 156,  17,  70, 123,   3, 229, 139,  32,  88, 239,  78, 157, 102,  13, 197,  86, 136, 220,  45, 193,  24,  64, 246, 117,  22,  98,  40, 213, 182, 168, 115, 144, 196,  62,  35, 175,  23, 151, 119,  97,   6, 229, 188, 141, 166, 205, 231,  55, 110, 253,  45, 232, 209, 183,  38, 121, 229, 190, 168,  11, 128,
++            146,   0, 121,  34,  58, 170, 239,  94, 155,  66, 213, 125,  46,   1, 192,  53, 214, 123, 244, 111, 164,  74, 126, 232, 212, 137, 184, 203, 237, 147,  27,  65,   2,  74,  24, 100, 224, 127, 191, 252,  51, 209, 184,  61, 157, 122, 217,  46, 115, 135,  33, 213,  68,  24,  86,   1, 153, 240, 214,  71,  57, 113, 235,  75,
++            248, 164, 201,  87, 183, 103, 211,  41, 181, 113, 248, 174, 147, 226, 130, 235,  40,  76, 175,  27,  56, 241,  91, 159,  38,  82,  52,   5, 164,  85, 128, 230, 153, 253, 204, 180,   8,  72, 160,  92,  10,  79, 136, 248,  36,  88,  22, 246,  10,  77, 185, 171, 140, 101, 197, 130,  79, 105,  10, 139, 161,  32, 207, 100,
++             64,  24, 108, 241, 225, 148,  10, 133, 203,  55,  13, 101,  24,  70, 180,  94, 142,   7, 153, 225, 190,   1, 179,  18, 106, 226, 171, 124, 110,  59, 201, 190,  90, 122,  51, 137, 236,  43, 212, 116, 234, 173,  19, 197, 108, 177,  70, 193, 156, 234,  93,   6, 239, 159, 224,  55, 170, 203,  44, 180, 251,  87, 133, 175,
++            191, 218,  43, 130,  19,  51,  78, 252,  28, 166,  75, 195, 216, 117,  32, 164, 208, 250,  64, 103,  42, 142, 118, 207, 152,  69, 240,  33, 215, 249,  13,  41, 106,  30, 216, 170,  84, 107,  25, 199, 144,  67, 225,  48, 129, 222, 145, 102,  53, 127, 218,  62,  40, 120,  15, 187,  29, 244,  93, 119,  22, 221,   7,  49,
++            119,  82, 143,  68, 163, 196, 120, 219, 107, 144, 236,  90, 154, 246,  60,  17, 110,  85, 200, 132, 213,  80, 255,  58, 193,   8,  93, 187, 150,  73, 173, 134, 240, 161,  17,  61, 150, 245, 134,  57,  32, 102, 155,  82,   3, 239,  32, 207,  17, 180, 112, 150, 204, 249,  75, 109, 143,  65, 229, 157,  76, 199, 150, 237,
++            159,  12, 249, 214,  96, 178,  34,  87, 187,   6, 130,  37,  49, 189, 139, 232, 182,  46,  14, 167,  24, 233,  97,  29, 128, 217, 140,  48,  19, 102, 224,  52, 183,  78, 231,  97, 178,   1, 219, 185, 166, 250, 119, 212, 170,  58,  91, 162, 255,  43,  82,  26, 176,  92,  48, 165, 211, 127,   3, 189,  54, 109,  35,  94,
++            210,  30, 171, 112,   3, 229, 152,  57, 241,  68, 201, 222, 105,   4, 211,  72, 126, 152, 241, 119,  70, 148, 173,  46, 161,  78, 247, 114, 207, 158,  88,   4, 145, 116, 198,  37, 206, 119,  71,  90,  12,  41, 191,  24, 140, 201, 116,  69, 226, 141, 194, 236,  10, 136, 192, 233,  16, 100,  41, 216, 137, 247,  68, 182,
++             52, 135, 201,  61,  42, 246, 134,  15, 173, 158,  21, 118, 176,  82, 167,  96,  34, 195,  57, 218, 186,   4, 202, 225, 108,  14, 177,  64, 130,  29, 193, 250, 211,  68,  10, 131, 255,  47, 156, 227, 128, 235,  75,  94, 245,  15, 186, 132,   5, 104, 167,  64, 124, 222,  34,  59, 150, 254, 176,  84, 165,   9, 124, 233,
++            105,  76, 188,  90, 125, 206,  73, 104, 212,  95, 230,  53, 248, 135,  22, 223, 253,   9,  89, 107,  37,  82, 134,  60, 237, 196,  38, 222, 165, 233,  58, 124,  40, 100, 167, 148,  82,  23, 103, 196,  59, 147, 179,  50, 107, 158,  38,  82, 213,  54,  31, 206,  98, 160, 114,  87, 207,  71, 118,  28, 228, 203, 147,  23,
++            224, 254,  10, 149, 167,  25, 191,  47, 141,  32,  79, 149, 197,  38,  60, 158, 112, 143, 177, 228, 163, 250, 101,  22, 123,  86, 143,  96,  16,  80, 107, 174,  21, 236, 219,  57, 184, 234, 171,   6, 215, 111,  28, 204, 221,  64, 232, 172, 241, 119, 152, 251,  74,   1, 238, 182,  20, 132, 199,  48, 103,  62,  89, 174,
++            156, 118,  37, 217, 237,  83, 116, 221, 253, 126, 185,  10, 102, 235, 123, 188, 206,  67,  27, 129,  50, 145, 213, 188, 154,   6, 253, 181,  47, 214, 153, 188, 138,  86, 194,  31, 112, 209, 138,  39,  81, 160, 252, 135,   1, 122, 146,  20, 196,  90,  14, 175,  43, 216, 143,  51, 166, 243,   5, 157, 187, 239,  15,  45,
++            184,  65,  99, 137,  55,  14, 160, 178,   2,  63, 207, 166,  71, 214,  90,   0,  43,  81, 239, 209,  12,  74,  33, 170,  52,  69, 204, 116, 132, 242,   0,  71, 246,  49, 158, 125,  15,  67,  94, 242, 121,  16,  69, 174,  87, 191, 101,  49,  72, 137, 225, 190, 126,  83, 195,  30, 107,  91, 219, 141,  74, 114, 133, 215,
++             83,   1, 244, 173, 200,  69, 232,  39,  88, 106, 243,  47, 138,  17, 178, 246, 133, 168,  98, 191, 120, 230,  93, 244, 109, 223, 162,  27,  62, 195,  36,  95, 117,  11, 224,  76, 249, 164,  49, 180, 193, 224,  99,  42, 235,  30, 209, 249, 162,  35, 106,  60,  21, 101, 248,  66, 229, 122,  58,  35, 252, 170,  30, 198,
++            146, 125, 208,  31, 112,  94, 130, 145, 195, 155,  23, 118, 227, 154, 106,  53, 222, 149,  16,  59, 158, 177,   2, 200, 138,  39,  84, 234, 104, 171, 142, 228, 203, 180, 136, 102, 198, 147, 220,  22, 132,  56, 203, 165, 140,  61, 180, 115,   7, 203, 243, 147, 169, 208, 132, 157,  14, 174, 211, 193,  11,  96, 231,  52,
++            221,  19, 159,  48, 189, 248,  26, 214,  55, 237, 180,  81,  36, 194,  66,  28, 114, 197,  37, 252, 108,  45,  80, 126,  19, 191, 151,   9, 212,  78,  52, 160,  28,  65,  43, 173,   2,  35, 109,  85, 154,   7, 113, 243,  18,  78, 152, 228, 132,  83, 182,  48, 231,   5,  40, 186,  77, 146,  46,  86, 128, 151,  67, 110,
++            240,  92,  73, 228, 149,   5, 171, 119,  75,   8, 132, 217,  96, 254, 171, 210,  85, 235,  71, 139, 205, 220, 148, 238,  56,  97, 250, 120, 178,  22, 129, 254, 110, 214, 240,  91, 233,  61, 205, 254,  70, 229, 178,  89, 126, 216,  13,  43,  96,  64,  26, 122,  73,  91, 116, 220, 241,  25, 112, 235, 181, 207,  24, 166,
++             40, 139, 177, 105,  60,  83, 223,  45, 100, 204, 165,  60,  14, 142, 122,   6, 160, 126, 185,  10,  91,  23,  67, 183, 215, 169,  72,  44, 225,  93, 197,   6,  86, 151,  21, 128, 143, 186, 120, 166,  28, 141,  49,  34, 159, 252, 109, 196, 168, 240, 221, 157, 199, 255, 140,  55,  99, 200, 163,  61,   4, 249,  80, 190,
++              7, 199, 255,  14, 210, 135, 182, 156, 251,  33, 111, 233, 186,  47,  76, 225,  22,  50,  99, 171, 242, 122, 164,  32, 112,  16, 133, 205,  61, 145, 232, 185,  70, 168,  53, 208,  76,   9,  42,  96, 215, 192, 104, 207, 184,  54,  71, 142, 211,   0, 136, 103,  16, 166,  32, 179,   8, 126, 216,  38,  97, 135,  50, 121,
++            217,  57, 128,  33, 113, 232,  22,  63, 194, 141,  88,  25, 152, 207, 105, 175, 246, 150, 218,  35, 192,  54, 227,  88, 143, 243, 188,   4, 162, 111,  31,  47, 124, 245, 193, 112, 229, 176, 246, 130,  16, 240,  76,   3, 233,  94,  26, 189,  37, 115,  56, 186,  45, 212,  68, 151,  84, 247,  72, 145, 173, 226, 157, 104,
++             71, 171,  88, 162, 191,  42,  94, 124,   9, 176, 239,  71, 127, 229,  36,  90, 197,  65, 132,  81, 109, 154,   3, 207,  47,  77, 102,  38, 248,  79, 172, 213, 100,  11,  36,  93,  19, 149,  52,  83, 156,  62, 116, 134, 149, 173, 124, 247,  85, 154,  74, 244,  87, 234, 109, 197, 230,  21, 187, 116,  28, 202,  15, 235,
++            149,  20, 206, 239,  75, 151, 246, 208,  79, 219,  51, 161, 195,   1,  58, 139, 113,  28,   7, 250, 202,  72, 236, 128, 177, 224, 156, 121, 218, 138,  21, 238, 152, 134, 221, 163,  65, 199, 218, 106, 185, 167, 213,  25,  44, 221,  63,  17, 230, 179, 219,  28, 144, 124,  13,  41, 134, 160,  52,  90, 244,  63,  83, 183,
++            250,  46,  99, 141,  53,   0, 170, 106, 135,  36, 115,  20,  98, 248, 167, 183, 235, 209, 160, 177,  41, 140,  17,  99,  25, 193,  56,  17, 200,  65,  89, 196,  56,  77, 180, 250, 118, 136,  29, 237,  39,   9, 253, 196,  81, 111, 161, 201, 101, 129,   8, 165,  97, 190, 174,  59, 208, 100,   1, 220, 194, 128,  35, 113,
++              7, 126, 221,  28, 117, 227, 199,  18,  58, 243, 185, 147, 216,  79, 121,  17,  48,  84, 100, 226,  59, 118, 169, 255,  66, 147,  92, 241, 168, 106, 182,   3, 119, 209,  26,  46,  86,   0, 172,  72, 144, 126,  56,  97, 177, 242,   4,  51, 146,  40,  67, 205,  50, 249,  76, 224, 119, 253, 178, 150,  45, 166, 141, 212,
++            172, 197,  67, 164, 183,  90,  69, 146, 222, 163,  89, 204,  61,  34, 156, 219,  68, 148, 126,  11, 188,  90, 218, 199,  32, 115, 229,   7,  48, 129, 251,  39, 161, 234, 108, 147, 239, 204,  97, 222, 192,  86, 229, 155,  32, 136, 215,  77, 252, 192, 116, 235, 136,  24,   5, 148,  85,  27,  67, 108,  14, 230,  94,  57,
++            106,  81, 233,  13, 132, 250,  32, 189, 102,   6,  44, 129,  11, 236, 105, 192, 251,  37, 205, 243,  29, 144,  49,  80, 162, 134, 206,  75, 155,  29, 215, 143,  95,  70,  10, 185,  59, 157, 122,  50,  22, 113, 206,  15,  69, 190, 123,  92,  20, 170, 216,  83, 157, 111, 201, 167,  39, 193, 137, 240,  79, 203,  22, 242,
++             34, 145, 190,  42, 108, 211,  49, 126, 231,  76, 180, 254, 142, 173,  86, 135,   5, 115, 171,  75, 159, 109, 233,   2, 185,  42, 104, 175, 237,  85, 191,  53, 227, 172, 202, 131,  34, 229,  14, 179, 249, 163,  43, 141, 106, 236,  39, 180, 152, 104,  11,  35,  61, 226,  95, 129, 237, 215,  54, 161, 124, 186,  69, 155,
++              4, 254,  93,  61, 150, 175,  83, 156,  25, 120, 217, 108,  70, 198,  28,  55, 181,  94, 231,  61, 195,  21, 210, 125, 246,  60, 223,  23, 138,  62, 113,  15, 125,  23,  83, 255, 101,  71, 210,  82, 133,  64, 240, 172, 218,   7,  59, 207, 230,  54, 132, 242, 185, 172,  46,  69,  18, 102, 181,   7,  37, 226, 114, 177,
++            136, 122, 201, 220,  23, 234,   3, 205, 247, 168,  53,  16, 158,  42, 212, 226, 152,  20, 130,  45, 137,  98, 176,  70,  89, 148,  13, 193,  97, 211, 179, 247, 153, 217,  45, 165, 116, 195, 146,  31, 104,   2, 194,  93,  78, 159, 114, 138,  25,  73, 195,  91, 144,  27, 247, 210, 155, 117,  87, 251, 144,  98,  48, 214,
++             75,  53,  12, 166, 118,  74, 137,  97,  64,  36, 201,  91, 232, 125,  98,  73, 243, 200,  84, 219, 253,   9, 152, 238,  30, 169, 111, 253,  45, 162,   1,  78, 104,  64, 191, 142,   5,  53, 244, 156, 232, 213, 123,  52,  30, 254, 199,  86, 245, 166, 110, 223,   1, 122,  82, 189,   9, 228,  31, 170,  63, 206,  25, 238,
++             89, 228, 184, 102, 245,  38, 179, 192, 113, 149, 131, 184, 245,   3, 144, 167,  12, 109,  34, 161, 184,  56, 114,  40, 203, 132, 215,  74, 123,  33, 230, 133, 205,  27, 242,  93, 224,  21, 171,  89,  42, 184,  20, 153, 224, 130, 174,  45,   8, 212,  36, 158,  52, 205, 105, 141,  57, 133, 195, 217,  79, 129, 192, 164,
++             39, 152,  30,  63, 147, 213,  52, 239,   9, 228,  79,  22,  62, 176, 115,  49, 190,  64, 213, 121,  26,  78, 226, 189,  95,   4,  53, 182, 151, 198,  92,  50, 173, 120,  39, 181,  73, 125, 206,  62, 115, 140,  71, 178, 108,  14,  65,  98, 149, 185, 127,  66, 253, 177,  38, 165, 244,  72,  44, 109,   0, 149,  17, 111,
++            242, 211, 133, 199,  84,  20, 128,  92,  30, 210, 164, 106, 207,  35, 222,  82, 132, 249, 147,  93, 236, 172, 140,  65, 159, 222,  84, 236,  18,  65, 245, 144, 219,   7, 157, 233, 137, 105, 188,  13, 221, 247,  97, 204, 241,  37, 193, 234, 118,  80, 228,  16,  98,  75, 218,  20,  94, 233, 179, 158, 225, 247,  59, 176,
++             71,  95,   6, 163, 114, 253, 172, 156,  71, 139,  44, 252,  89, 153, 194, 239,  24, 178,  43,   1, 204, 105,  13, 242, 121,  23, 142, 103, 172, 117,  12, 186,  70, 111,  84, 200,  48,  30, 252,  81, 160,  35,   7,  54, 145,  77, 163, 217,  51,  26, 142, 198, 236, 129, 151, 191, 116,  11, 126,  29,  88, 101, 200, 121,
++             26, 188, 233,  47, 223,  12, 103, 195, 219,  56, 187, 123,  14, 137,  55,   8,  96, 162,  72, 194,  54, 131,  36, 209,  48, 195, 247,  35, 209, 228,  41, 100, 165, 251,  58,  15, 169, 214, 144,  56, 130, 196, 169,  87, 214, 113, 135,   2, 250, 176, 107,  43, 163,   6,  33,  63, 204, 147,  55, 212, 183,  47,  12, 142,
++            249,  55, 127,  80, 183,  67,  41, 232, 117,   0, 237, 173,  73, 227, 107, 210, 124, 230, 112, 219, 156, 250,  84, 168, 110,  74, 163,  58, 127,  77, 139, 206,  25, 225, 151, 123, 237,  90,   0, 181, 106, 236, 121, 227,  17, 183,  31,  94, 154, 205,  59,  88, 183, 113, 223, 240,  85, 169, 251,  76, 137, 236, 166, 215,
++            155, 103, 174,  31, 150, 207, 137,  26,  83, 149,  97,  21, 198,  39, 167,  66, 185,  33, 141,  89,  27,  67, 181, 223, 150,  14, 186,  92,   7, 155, 192,  53,  88, 131,  37, 193, 101,  67, 155, 219,  44,  25,  67, 152,  47, 246,  63, 195,  75, 125,  11, 213, 248,  77,  49, 138, 105,  40,  22, 196, 107,  67,  36,  83,
++            205,   2, 220, 245, 118,  93, 242, 164, 181,  62, 208, 111, 157, 243,  87, 146, 255,  51,  11, 238, 188, 126,   5,  97,  31, 231, 131, 214, 255, 107, 233, 177,   3, 211,  74, 179,  21, 205, 118, 243,  78, 189,  99, 200, 131, 168, 105, 232,  40, 224, 170, 135,  18, 153, 199, 178,   4, 226, 120, 153,   8, 228, 132, 115,
++             45,  72, 140,  19,  58, 192,   6,  49, 126, 251,  30, 218,  49, 128,   4,  25, 201,  79, 172, 207, 102, 147, 234,  52, 199, 114,  43, 174,  20,  68,  31, 120, 243, 146, 112, 248,  51, 139,  33, 170,  12, 142, 255,   5,  82, 209,  18, 143, 114,  28, 243,  99,  66, 121,  27,  90, 209,  62, 187, 244,  93, 176,  20, 186,
++             97, 168, 197,  85, 159, 108, 217,  76, 196,  92, 169, 138,  78, 192, 231, 175,  96, 134, 114,  40,  59,  22, 213,  80, 139,  65, 239,  85, 143, 200,  46, 168,  95,  62,  13, 223, 158,  85, 231,  60, 109, 211, 159,  37, 119, 238,  56, 161, 187,  85, 149,  46, 190, 220, 166, 254, 128, 144,  78,  44, 162,  57, 221, 255,
++             29, 235, 128, 225,  39, 175, 132, 238,  16,  42, 225,   9,  60, 103, 118, 215,  62, 158, 223, 241, 163, 120, 174, 251, 156, 192,   0, 122, 163, 220,  79, 135, 229, 202,  42, 172, 124,  18, 196, 131, 180,  91,  53, 222,  71, 175,  97,   8, 220,  70, 202,   0, 237, 107,  36,  54,  13, 100, 216,  31, 201, 123, 143,  65,
++            154, 114,  52,  10, 251,  69,  29, 154, 103, 120, 147, 182, 248, 151,  31,  43, 245,  19,   2,  74, 193,  90,  10,  38, 104,  27, 210,  54,  99, 246,   9, 190,  26, 152, 107,  77, 216,  99, 250,  45, 226,  27, 127, 186,  21, 198, 134,  44, 253, 128, 174,  58, 138, 159,  74, 230, 176, 152, 239, 112,   2,  85, 210,  14,
++            194,  78, 183, 203,  99, 143, 210, 186, 231,  66, 206,  88,  21, 202, 164,  76, 189, 108, 148, 129,  48, 204, 226, 133,  75, 169, 228, 186,  36, 153, 116,  57,  89, 180, 237,   2, 191,  66, 148,   8,  77, 163, 236, 146,  88, 243, 153, 210, 111,  31,  95, 214,  20,  87, 194, 117, 205,  23,  64, 184, 138, 243, 172, 105,
++             44, 247, 148,  21, 122,  55,  84,   1,  49, 167,  33, 238, 129,  54, 230, 139,  91, 211, 180,  30, 248, 100,  63, 184, 242, 112,  89, 135,  21,  72, 233, 216, 127,  37, 140,  56, 163,  34, 177, 116, 201, 102,  63,   2, 108,  34,  60,  80,  13, 164, 235, 119, 185, 245,   8, 134,  46,  93, 165, 226,  51,  73,  34, 229,
++            131,   5,  91, 165, 220, 179, 241, 115, 197, 137,  79, 111,   5,  99, 176,  11, 124,  50, 234,  85, 153, 167,  24, 144,  45,   8,  60, 252, 174, 203, 103, 165,  16, 253, 209, 115, 242,  89, 133, 212, 245,  40, 189, 214, 169, 124, 227, 178, 192,  51, 145,  73,  40, 151,  62, 221, 249,  77, 129,  19, 197, 119,  94, 160,
++             58, 212,  70, 234,  41,  28, 158,  95,  23, 254, 213, 160, 191, 220,  69, 251, 197,  23,  65, 222, 115,  12, 215, 122, 202, 161, 219, 119, 142,   3,  43, 194,  64,  81,  99,  23, 198, 226,  19,  53, 153,  15, 137, 252,  48, 201,  18, 138, 248,  90, 202,  24, 218, 110,  96, 170,  33, 189, 106, 154, 252,  12, 208, 181,
++            242, 116, 138, 196, 107,  61, 134, 226,  73, 176,  42,  60, 144,  29, 117,  41, 157, 105, 173, 135,  38, 190,  81, 235,  96,  33, 192,  78,  51,  88, 245, 148, 131, 187, 160,  47, 146,  70, 109,  81, 171,  94, 118,  71,  84, 156, 100,  69, 117,   3, 225, 131, 180, 162,  18, 202, 143,   4, 214,  42, 175,  63, 145,  26,
++            102,  38,  18, 175,  80, 248, 191,  10, 150, 123,  14,  96, 236, 171,  86, 208, 141, 240,   5, 204,  72, 251,  51, 175,  67, 154,  15, 230, 208, 179, 110,  30, 218,  11, 230, 176, 123,   8, 185, 239, 223,  29, 181, 229,   9, 238,  31, 214,  43, 158, 104,  61, 255,  50,  82, 227, 116,  57, 234,  86, 100, 125, 223,  81,
++            201, 162, 227, 146,   5, 119, 209,  50, 105, 221, 244, 194, 131,  51, 228,  19,  73, 187,  56,  96, 161, 142, 110,   1, 132, 241, 104, 127,  24, 162, 234,  74, 118,  58,  91,  33, 249, 214, 158,  39, 125, 203,  55, 162, 110, 191, 143, 173, 241, 187,  79,  33, 198,   7, 127, 240,  69, 179, 133, 203,  30, 238,   0, 186,
++             67, 254,  53,  94, 217,  35, 167,  88, 183,  65,  27, 156,  80,   0, 182, 127, 101, 220,  32, 123, 230,  19, 209, 223,  85, 184,  41, 147,  66,  96,   6, 198, 154, 241, 205, 136,  76,  51,  98, 140,  66,   0, 147, 212,  41, 129,  60,  89,  11, 123, 232, 168, 141, 101, 155, 188,  39,  14, 161,  74, 150, 169,  46, 131,
++            153,  12, 124, 183,  68, 154, 237,  17, 140, 203, 116,  38, 212, 109, 252, 165,  45, 150, 244,  83, 181,  46, 153,  31, 197,  57, 170, 245, 212, 187,  52, 139,  41, 103, 169,   4, 113, 200,  18, 189, 254, 106,  80, 244,  96,  23, 223, 202,  50, 150,  21, 208,  66, 223,  26,  87, 110, 217, 244,  20,  54, 110, 212,  90,
++            179, 108, 207,  27, 231, 103, 130,  43, 250,  77, 173, 232, 143,  67, 199,  90,  13, 208, 169,   8, 196,  63, 101, 121, 253,   9, 111,  80,  32, 120, 220, 255,  17, 183,  62, 224, 149, 235, 164,  88, 219, 169,  16, 195,  68, 178, 159, 112,  72, 251,  92, 114,  46, 177, 248, 200, 145, 172,  95, 122, 224, 188, 246,  31,
++            232,  79,  44, 137, 197,  82,  59, 192, 160,   8,  55,  98,  16, 159,  29,  58, 138, 117,  68, 107, 134, 234, 174,  73, 140, 159, 224,  19, 136, 173,  87, 159,  75, 125,  27, 193,  84,  37,  59, 130,  28,  49, 136, 118, 229,   6, 246, 137,  32, 182, 217, 133,  14,  78, 123,  54,   3,  65,  42, 198,  80, 138,  16,  61,
++            144, 216, 168, 247,   1, 176,  20, 210, 109, 228, 134, 188, 247, 120, 216, 238, 189, 224,  24, 249,  37, 216,  89,  22, 211,  47,  92, 201, 238,  60,  10, 109, 208, 239,  95, 133, 250,  12, 179, 114, 203, 238, 182,  35, 150,  84,  44, 207, 104, 165,   1, 194, 230, 160,  35, 213, 234, 135, 254, 178,   6, 101, 164, 118,
++            190,  10,  96,  56, 113, 149, 241, 122,  91,  34, 219,  84,  47, 174, 103,  75,  40, 178,  82, 148,  55, 161,   5, 239, 189, 127,  65, 181, 151,  44, 227, 189,  34, 146,  49, 167,  70, 213, 102, 227,  74, 155,  62, 101, 215, 127, 171,  17, 235,  64,  52,  86, 245, 141, 100, 168,  84, 108, 157,  32,  69, 240, 204,  38,
++            252,  73, 128, 161,  39, 221,  69,  26, 181,  63, 148,   3, 206,  21, 151, 130,   5, 159,  99, 202, 123, 185, 112, 145,  34, 104, 247,   0, 115,  98, 134,  68, 171, 222,   2, 204, 117, 151,  44, 140,  23,  93,   3, 250, 199,  55,  75,  95, 190, 125, 154, 111,  26,  68, 186,  20, 193,  12, 206, 129, 227, 150,  51,  88,
++            222,  28, 180, 238, 204,  87, 136, 158, 255, 201, 168, 111,  70, 233,  92, 196, 253,  50, 227,  12, 242,  29,  61, 206, 172,  81, 218, 165,  30, 196, 249,  19, 121,  83, 106,  24, 245, 187,   7, 241, 170, 221, 186, 113,  15, 157, 242, 218, 145,  37, 225, 178, 208,  45, 222, 120,  60, 231,  48,  91, 113, 185,  18, 133,
++            153, 200,  63, 104,  13, 190,  50, 102,  11,  43, 125, 244, 138, 182,  33,  62, 211, 113, 139,  69, 167,  95,  77, 228,  46,  13, 139,  57, 232,  76, 155, 210,  55, 234, 182, 160,  57,  89,  68, 198, 122,  50,  80, 142,  41, 177,  29, 117,   7, 254,  72,  13, 131,  92, 152, 251, 139,  75, 166,  26, 217,  63, 174, 106,
++             44,   3, 121, 145,  34, 233, 170, 218,  77, 231,  95,  25,  54, 222, 161, 125,  19,  86, 175,  41, 217, 195, 133, 254, 117, 156, 202,  91, 125,  15, 184,  93, 140,  37, 200, 127,  29, 228, 135,  98,  36, 163, 208, 231, 129, 102, 202,  59,  87, 164, 100, 200, 240, 171,   2,  35, 104, 181, 245, 145, 195,   9,  81, 235,
++            168,  93, 249, 216,  81, 129,  18, 115, 143, 188, 157, 198,  82,   9, 105, 241, 149, 187, 247,  26, 107, 151,   4,  23, 181, 101, 243,  38, 216, 170,  47, 110,   6, 253,  76, 101, 146, 210, 176,  18, 255, 109,  64,  24, 189,  73, 237, 139, 209, 184,  50,  28, 114,  79,  57, 197, 211,  15, 117,  40,  98, 242, 124, 208,
++             72, 193,  54, 163, 183,  66, 246, 209,  57,   6,  36, 215, 119, 174, 194,  73,  47,   2, 203, 130,  81,  50, 222, 164,  58,  72,  25, 191, 146,  66, 238, 223, 151, 172,  63,  11, 240,  42,  78, 155, 218,  10, 148, 246,  92,   0, 169,  44,  17, 128, 220, 157, 140, 187, 236, 127, 155,  87,  66, 227, 160,  56,  33, 142,
++        },
++        {
++             18, 163,   7, 104,  57,  20, 225,  71,   1, 245, 169, 113,  54, 253, 192, 217,  49,   0, 141, 160, 192,  23, 143, 246, 220, 113,  60,  84, 243, 116,  58, 130, 175,  46, 119,  12, 171, 102,  58, 251,  77, 181,  98, 238, 129, 109,  30, 246,  60, 104, 222,  43, 196,   1, 149,  73,  55, 129, 221,  48, 187,   6, 108,  83,
++            251, 189,  76, 125, 182, 205,  94,  47, 128,  99,  79,  24, 182, 160,  82, 146, 245,  71, 204,  56, 255,   7,  71,  88, 130,  25, 204, 155,  37, 180, 232,   4, 254,  95, 228,  81, 245,  33, 191,   3, 139,  26, 220, 189,  62, 225,  78, 182, 119,  11, 174, 142,  81, 231,  22, 206, 106, 254,  30,  98, 244, 170,  33, 138,
++             63,  98, 218, 240,  32, 141, 255, 176, 214, 158, 227,  65, 123, 207, 100,  20, 117, 186, 223, 133, 104, 178, 203, 165,  51, 183, 239, 103,  16, 198, 144, 107, 163,  62, 201, 137, 157, 214,  87, 230, 153,  53, 119,   7, 155,  18, 163,  40, 234,  74,  25, 248, 115,  49, 170, 138, 190,  13, 150,  65, 201,  88, 156, 221,
++            173,  24,  45, 158,  67,   6,  84, 116,  36,  19, 144, 242,  40,   7, 235,  61,  33, 169,  93,  43,  28, 120, 217, 151,  13, 228,  69, 125, 166,  53,  79,  21, 220,  38, 184,   7,  51, 111, 130,  42, 177, 244,  72, 201,  88, 255, 100, 213, 127, 154, 203,  63, 101, 212, 240,  68,  39, 165, 217, 114,  17, 231,  49, 119,
++              1, 197, 134, 113, 229, 171, 150, 199,  61, 185, 108, 196,  89, 172, 134, 152, 227,  78,  10, 158, 237,  81,  61,  34, 110, 140,  42,  90, 224, 249, 136, 208,  88, 154, 123,  72, 237, 167,  21, 203, 107,  93, 169, 134,  45, 142, 193,  56,   2,  91, 186,  35, 160, 130,   9,  95, 121, 236,  82, 141, 181, 131,  73, 208,
++            149, 247,  82, 209,  96,  53,  17, 221, 244,  77,  12, 128, 218,  51, 188, 106, 200, 125, 250, 208, 141, 185, 232,  93, 251, 196, 174,   1, 192,  31,  65, 187, 114, 246,  23, 100, 210, 189,  80,  62, 222,  15,  32, 236, 210, 114,  27, 230, 177, 137, 244, 220,  19, 192,  84, 177, 202,  53,   3, 197,  43,  27, 242, 105,
++             38,  59, 179,  10, 188, 239, 122, 102, 137,  45, 166, 233,  26,  70, 248,   4,  45, 177,  59, 111,  16,  49, 171,   9, 123,  75, 215, 152, 100, 120, 161,  47,   5, 177, 223, 148,  44, 135,  10, 252, 150, 124, 188,  64,  10,  81, 168,  70, 108,  47,  79, 120,  58, 149, 252,  30, 224, 155, 109, 250,  97, 164, 188,  87,
++            230, 126,  28, 143,  73,  41, 162,  29, 179, 212,  92, 147, 115, 161,  85, 213,  96, 145,  25,  74, 193, 100, 135, 209, 163,  21,  55, 243,  81,  17, 212, 231,  74, 132,  58,  31, 240,  92, 180, 115,  38, 213, 159, 102, 178, 226, 151, 242,  21, 211, 165,   5, 233, 110,  44, 136,  67,  21, 173,  75,  57, 222,  14, 157,
++            214, 110, 167, 250, 217, 132, 198,  86,  67, 252,   6,  57, 206,  36, 140,  21, 231, 165, 218, 244, 155, 225,  40,  65, 238, 107,  35, 131, 177, 147, 247, 106,  92, 203, 167, 111, 195,  66, 162, 233,  54,  83, 137, 249,  50, 119,  36, 131, 198,  98, 141, 181,  72, 197, 169, 102, 212, 126, 231, 147, 206, 116, 137,  69,
++              4, 193,  48,  92,  14, 108, 226,  19, 154, 191, 104, 175, 241, 193, 122, 184,  66, 113,  35,  89, 127,   2, 199,  85, 145, 185, 230, 201,  63,  43, 194,  30, 142,  14, 255,  82, 216,   0, 141,  27,  98, 194,  22,   3, 204,  92, 189,  59,  12, 250,  37, 215,  92,  25, 240,  13, 186,  88,  38,   7, 182,  31,  51, 240,
++            101,  77, 207, 155,  64, 183,  54, 236, 117,  40, 134,  22,  75,  97,  53, 254,  11, 135, 201,  50, 173, 109, 253,  27, 159,  94,   5, 114, 223,  12, 125, 163,  55, 181,  40, 153,  22, 125, 227, 203, 170, 244,  75, 224, 147,  25, 218, 162,  85, 118, 151,  52, 129, 223, 156,  80,  50, 243, 107, 132, 248,  93, 200, 173,
++             21, 139,  37, 121, 244, 169,   0, 144, 205,  82, 217, 156, 225,   2, 146, 208,  80, 179, 238,  21,  71, 188,  57, 120, 218,  47,  76, 140, 168,  89,  73, 239, 217, 114, 230,  99, 186,  73, 108,  41,  60, 152, 110, 126, 173,  70, 105, 237, 179,  69, 232, 191,   9,  63, 116, 140, 167, 194, 215,  61, 163,  81, 122, 151,
++            254, 216, 186, 228,  27,  79, 128,  98,  30, 242,  64, 120,  47, 236, 164, 106,  39, 154,  96, 212, 145, 229, 134,  14, 170, 242, 192,  20, 252, 206, 103, 188,   3,  65, 130, 208,  52, 250, 175,  86, 132,  12, 184,  37,  53, 254, 136,  44,   0, 202,  29, 105, 173, 253, 200,  31,   2,  73, 152,  23, 224,  11, 232,  42,
++             57, 112,   9,  90, 149, 200, 219,  58, 158, 171,  16, 197, 180,  85, 128,  26, 223,  57, 117,   6, 164,  84,  41, 207,  70, 100, 128,  56, 154,  33,  48, 136, 151,  84,  29, 162,  10, 147, 218,  18, 239, 206, 230,  90, 197, 158,  19, 209, 125,  91, 161, 138,  81,  41,  98, 211, 234, 123,  43, 101, 185, 142,  68, 179,
++            165, 132,  71,  50, 105, 178,  39, 248, 188, 109,  91, 140,  35, 203,  66, 171, 249, 192, 131, 241,  32, 104, 248, 148, 182,  30, 234, 213, 110, 179, 222,  22, 249, 172, 235, 198,  93,  35, 119, 192, 157, 101,  68,   5, 117, 234,  78, 150,  58, 224, 246,  15, 214, 148, 183,  58,  85, 177, 246, 203, 115,  35, 210,  95,
++            222, 194, 246, 161, 236,  15, 118,  76,   6,  48, 223, 252,   8, 114, 215,  94,  11,  77,  46, 181, 220,  65, 196,   8, 115,  85, 143,   0,  65,  81, 120, 194,  97,  43, 116,  68, 137, 244,  58,  78,  30,  48, 142, 217, 178,  31,  99, 190, 110, 175,  34,  65, 120, 239,  22, 113, 161, 136,  15,  55,  77, 239, 126,   1,
++             84,  27,  38, 142, 207,  64, 136, 230, 149, 209, 130,  71, 153,  54, 240,  21, 144, 160, 204,  90,  20, 124, 156,  55, 223, 166,  44, 200, 171, 232,  12, 160,  59, 210,   6, 178, 223, 105, 168, 209, 181, 127, 250, 166,  60, 134, 214,   8, 236,  49, 131, 196,  76, 168,  48, 231,   8, 216,  94, 146, 171, 191,  19, 152,
++            201, 102, 122, 183,  25,  95, 168, 196,  86,  21, 178, 101, 166, 194, 134, 182, 102, 225,  61, 112, 141, 174, 237,  96,  22, 191, 250, 126,  93, 146, 245,  74, 130, 226, 149,  81,  17,  46, 145,   1, 228, 109,  86,  17,  43, 245,  70, 167,  23,  87, 156, 221,   3,  96, 202, 130,  71, 193, 254,  28, 227, 106,  53, 250,
++            167,  62, 227,  79, 215,   9, 253,  36, 112,  60, 242,  40,  27, 228,  75,  44, 121,  34, 245,   4, 213,  78,  39, 206, 136,  74, 105,  33,  16,  52, 204,  35, 107,  24, 186, 251, 124, 194,  90, 240,  25,  70, 200, 149, 186,  94, 115, 145, 203, 253, 103, 184, 141, 248,  30, 153, 108,  38,  63, 125, 158,  41,  74, 138,
++            235,  16,  47, 172, 111, 131,  54, 159, 187, 226, 122, 204,  83, 110,   1, 202, 235, 171, 152, 190,  51, 252,  13, 120, 231,  60, 159, 226, 214, 183, 135, 169, 238,  87,  51, 163,  34, 220,  61, 134, 159,  39, 221, 120,   6, 208, 228,  33, 127,  57,  14,  39, 116,  62, 176, 224,  83, 184, 209,   9,  87, 219, 178, 117,
++            210,  92, 156, 245, 197,  71, 220,  99,   3, 141,  18, 172, 147, 248, 162,  59,  88,  25,  73, 130, 106, 160,  91, 184, 149,   5, 176,  83, 115,  66,  99,   4, 191, 207, 141, 111,  72, 173, 205, 115, 189, 100, 171, 242,  65, 158,  50,  83, 193, 172,  73, 236, 216,  88,  17,  51, 237, 163, 140, 112, 242, 197,  13,  32,
++            190, 129,   5, 142,  41,  26, 148, 241,  78, 211,  68,  95,  52, 214, 126, 189, 140, 219,  98,  15, 199, 222,  69,  30, 202,  49, 238, 129,  23, 255, 158,  45, 121,  63,  11, 242,  99,  28,   7, 254,  80,  18,  54, 133,  29, 107, 181,  19, 233, 110, 207, 133, 161, 189, 145, 122,   0,  98,  23, 172,  56, 147,  99,  68,
++            255,  54, 106, 231,  88, 185, 118, 178,  47, 129, 246, 194,  12,  37,  99,  20, 255,  49, 179, 234, 145,  42, 170, 243, 113,  97, 211,  39, 147, 196, 218,  78, 233, 154, 215, 181, 128, 229, 153,  44, 142, 211, 235, 194,  77, 250, 215, 138,  95, 151,   4,  48,  26, 102, 247, 203,  74, 219, 251,  45,  78, 233, 133, 161,
++             81, 221, 175,  22, 207,  58, 234,  14, 166,  32, 153, 114, 232, 183, 157,  69, 111, 164,  33, 118,  63,   1, 128,  80, 140,  19, 167, 187,  58,  91,  16, 176,  33,  95,  22,  48,  82, 199,  57,  96, 166, 123,   2,  90, 146, 164,   9,  68,  38, 169, 251,  82, 199,  67,  41, 159, 135,  33, 191, 126, 203,   5, 182,  42,
++             14, 196, 122,  73, 153, 134,  94, 201, 106,  84, 218,  59, 136,  79, 239, 216,   7, 204,  85, 241, 211,  95, 229, 196,  55, 248,  73, 105,   2, 240, 112, 130, 144, 250, 195, 167, 137, 113, 246, 185,  70, 225,  37, 175, 117,  47, 200, 124, 238,  56, 219, 118, 177, 227,  10, 109, 182,  57,  91, 152, 107,  29, 212, 116,
++             93,  34, 165, 249,   0, 225,  37,  65, 254, 190,  24, 170,   4,  44, 121, 144, 191,  55, 134, 155, 187,  27, 148, 179,  13, 215, 151, 226, 135, 201,  70, 228,  53, 104,  67,   0, 225,  35,  11, 214,  20, 108, 202,  62, 233,  22, 222, 103, 185, 141,  18,  93, 149, 128, 242,  85, 213, 232,  16, 165, 222,  67, 241, 141,
++            231,  61, 215, 102,  50, 173, 117, 157,   8, 142, 226,  97, 209, 179,  89,  29, 102, 246,  76,  16,  46, 106,  69, 117,  39,  89, 122,  29, 160,  44, 168,  26, 212, 187, 121, 240,  75, 148, 177,  88, 158, 134, 248,  98, 188,  74, 156,  86,  31, 208,  73, 195,  35,  56, 167,  24, 145,  71, 119, 245,  50,  85, 174, 157,
++            190, 131,  25, 145,  85, 187, 213, 239, 127,  49,  72, 112, 150, 250,  62, 229, 167,  11, 123, 173, 218, 250, 164, 205, 233, 171, 192,  63,  83, 245, 184,   7, 153,  88,  39, 159, 207,  99, 126,  42, 238,  52,  28, 152,  13, 137, 255, 173,   3, 115, 161, 244,   7, 221,  98, 206,  44, 175,   2, 196, 138, 104,  10,  46,
++            112,  71, 202, 235, 109,  15,  75,  30,  91, 181, 234,  37, 195,  19, 132, 201,  41, 150, 226, 195,  58,  86, 133,   4,  53, 103, 253,   9, 205, 116, 101,  75, 127, 222,  17, 180,  56,  26, 221,  67, 196, 171,  80, 121, 216,  55,  40, 126,  65, 230,  45, 106, 135, 187,  64, 113, 236, 132,  96,  37, 182, 208,  23, 251,
++             88, 177,   7, 159,  41, 195, 136,  59, 204, 164,  12, 124,  56, 160,  77, 108, 181,  66,  94, 113,  35,  19, 238, 145,  76,  24, 128, 148,  36, 216, 139, 233,  50, 196, 254, 109, 136, 236, 187, 112, 143,   3, 207, 231, 177, 107, 202, 241, 189, 144, 213, 175,  79, 249, 156,  17, 199,  78, 254, 150,  62, 227, 127, 152,
++             35, 217,  54, 247, 121, 228, 169, 251, 146, 105, 213, 244,  87, 222,   1, 211, 237,  22, 139, 207, 161, 183,  98, 198, 220, 158, 229, 180,  94,  58,  14, 175,  32, 145,  63,  92,   5, 162,  82,  18, 252, 103,  64,  38,  90,   8, 162,  77,  97,  15,  57,  90,  25,  40, 122, 181,  53, 163,  28, 214, 117,  80,  52, 198,
++            237,  99, 139,  83,  63,  21, 100,   2,  43,  78,  25, 187, 140, 175,  34, 121,  90,  52, 247,   5, 230,  68, 123,  42, 174,  64, 111,  45, 240, 190, 159, 247,  85, 118, 169, 203,  42, 214, 122,  35, 225, 166, 131, 191, 248, 147,  22, 221,  34, 123, 155, 233, 193, 219, 146,   8,  91, 229, 109,  13, 170, 242,   4, 163,
++            115,  27, 172, 208, 151, 219, 130, 178, 224, 119, 156,  66,  99,  46, 254, 146, 164, 191, 127,  80, 151, 106, 252,  28,  90,  11, 209,  79,  20, 124,  70, 106, 210,   8, 230,  73, 150, 241,  60, 180,  94,  50, 155,  26, 118,  58, 133, 182, 237, 170, 204,   1, 131, 102,  67, 239, 205, 138,  72,  45, 190,  94, 143,  68,
++            229, 127,  12, 189,  32,  91,  71, 192,  54, 238, 200,   8, 230, 115, 198,  11,  69, 218,  38, 176,  50,  12, 211, 188, 142, 244, 132, 169, 223, 147, 200,  28,  47, 181, 129,  19, 193, 103, 139, 211,  14, 200,  73, 235, 213,  84, 199, 105,  67,  44, 112,  74, 253,  47, 172, 117,  36, 185, 155, 224, 132, 206,  20, 182,
++            196,  76, 255,  49, 158, 116, 245,  18, 138,  86,  33, 129, 162,  58,  82, 227, 103,  27, 114, 199, 224, 131, 164,  56, 114, 196,  35,  97,  54,   1,  90, 239, 138, 221,  98, 250,  53,  29, 172,  78, 126, 227, 108,   5, 174,  46, 152,  10, 247,  87, 143, 184,  28, 160, 213,  82,  19, 250,  59,  86,  31, 247, 106,  41,
++             91, 137,  60, 104, 223, 202,  39, 166, 216, 110, 175, 243, 210,  19, 188, 132, 178, 156, 242,  64,  96,  24,  84, 228,  73,   7, 159, 205, 252, 176, 115, 165,  61, 154,  38,  82, 160, 115,   2, 244, 148,  41, 183, 138,  96, 241,  31, 216, 164,  17, 208, 224,  59,  93,   6, 196, 128, 103, 175,   0, 123, 159,  55, 220,
++              5, 165, 239, 177,   8, 143,  62, 100,   5, 153,  46,  70,  93, 148,  40, 249,  53,  88,   6, 139, 170, 248, 152,  39, 179, 234, 107,  66, 134,  42, 229,  77, 191,  15, 123, 217, 183, 234, 198,  66,  90,  27, 251,  62, 163,  75, 117, 129, 189,  98,  39, 121, 136, 243, 151, 228,  50, 145, 216, 200, 231,  70, 178, 150,
++             34, 119, 198,  22,  86, 124, 231, 182,  78, 253, 195,  23, 107, 222, 169,  14, 118, 203, 215,  43, 186, 105,  14, 213, 126, 146,  21,  85, 186,  27, 211,  10, 109, 247, 201,  64,  93, 135,  47, 221, 168, 192, 120, 210,  16, 197, 226,  51,  64, 148, 233, 176,  13, 108, 186,  67,  30, 167,  92,  42, 114,  16,  84, 209,
++            234,  97,  47, 148,  73, 248,  25, 206, 130,  57, 226, 142, 184, 126,  66, 235,  77, 144,  23, 228,  74, 120, 194,  63,  95,  46, 218, 243, 119, 157, 141,  95,  49, 172,  26, 146,  12,  34, 108, 155,  11, 103,  53, 146,  35, 108, 177,   6, 253,  83,  25, 199,  77,  43, 207, 117, 235,  76,  10, 243, 140, 187, 249, 129,
++            173,  65, 227, 214, 188, 161, 112,  41, 170,  12, 118,  85,  36,   2, 206, 101, 158, 182,  93, 129,  51, 236,  32, 159, 254, 200, 170,   4,  55, 197,  69, 219, 238, 131,  80, 228, 209, 178, 255, 125,  72, 238, 219,  82, 246, 155,  90, 135, 206, 170, 104,  56, 248, 162,  89,  18, 178, 130, 194, 155,  61, 100,  49,  24,
++             78, 112,  10, 132,  32,  55,  89, 220, 148,  97, 239, 212, 166, 244,  48, 192,  31,  59, 250, 167,   4, 207, 136,  81,  11, 110, 140,  77, 102, 231,  35, 164, 115, 187,  40, 102, 160,  59,  84, 205,  23, 173, 134,   0, 184,  68, 231,  42,  20, 118, 217, 151, 128,   8, 222, 143, 255,  52, 107, 220,  31, 167, 205, 146,
++            194, 253, 156, 179, 101, 242,   1, 197,  66,  20, 190,  52,  75, 150, 133, 229, 116,  12, 199, 108, 150,  89, 180, 222,  54, 188,  29, 238, 127, 180,  18,  87,   5, 153,  68, 246, 119,   4, 188, 142,  39,  95, 199,  47, 122,  27, 201, 100, 161, 243,  70,  33, 192, 173,  60, 100,  37, 212,  21,  84, 237, 119,   2, 224,
++             57,  20,  42,  80, 201, 143, 123, 230, 178, 134, 157,  28, 112,  94,  19,  69, 174, 140, 219,  35,  64, 243,  20, 165, 124,  69, 155, 213,  43, 147, 206, 253,  56, 199,  23, 213, 135,  49, 243, 217,  67, 157, 232, 109, 165, 215, 143,  56, 186,   3, 140,  48, 238,  84, 121, 202, 158,  71, 135, 174, 191,  69,  92, 133,
++            105, 212, 125, 236,  62,  16, 165,  75,  44, 105, 247, 225, 196, 180, 255, 211,  86,  45, 237,  78, 189, 116,  43, 100, 249, 203,  92,  14, 172,  62,  99, 122, 138, 234, 175,  89, 168,  32,  99, 114, 181,  17,  58, 247,  87,  12, 237, 127,  78, 226,  95, 210, 110,  28, 233,   3, 184, 243, 114,   9, 147,  43, 246, 161,
++             31, 189,  91, 170, 219, 110, 252,  29, 208,  86,   4,  61, 128,  40,  10, 161, 104, 125, 156,  24, 209, 134, 231, 145,   0,  36, 224, 114, 244,  80, 188, 223,  33,  77, 108,  15, 195, 226, 147,   9,  82, 221, 138,  33, 194,  74, 176,  34, 107, 197, 166,  13, 180, 154,  74, 129,  46,  91, 229,  56, 201, 216,  14, 180,
++            141,  70,   8, 149,  36,  52,  95, 186, 147, 120, 216, 168,  79, 204, 144,  57, 226,   2, 184,  97, 171,  10,  60, 197,  80, 169, 133,  51, 142,   6,  24, 162,  48, 149, 219, 126,  60,  75, 237, 203, 163, 121, 188,  97, 151, 118,  50, 254, 155,  23,  62, 246, 135,  54, 218, 193,  16, 143, 166,  33, 102, 124,  82, 234,
++             46, 223, 249, 195, 118, 206, 138,  13, 240,  55, 154,  24, 101, 236, 115,  32, 193, 243,  69,  50, 253,  87, 160, 219, 109, 185,  66, 235, 194, 209, 104, 247,  66, 185,   1, 251, 158,  38, 131,  53,  26, 252,  45,  15, 228, 204,   7, 217, 139,  89, 119, 202,  36, 102, 251, 160, 109, 207,  68, 253, 177, 156,  63, 113,
++            165, 129, 102,  25,  76, 162, 228,  64, 173,  37, 193, 249, 137,  68, 175, 217,  83, 131, 148, 110, 216, 123,  30,  47, 245,  18,  97,  28, 157, 120,  87, 174, 133, 204,  96,  28, 113, 191,  92, 177, 108,  69, 210, 170,  60, 104, 164,  70, 192,  43, 229,  75, 150,  19,  88,  61,  30, 223,  81, 132,  17, 220,  26, 204,
++              4,  86,  55, 174, 234,   5, 127,  83, 218, 111,  92,   9, 183,  44,  17,  96, 163,  22,  40, 197,  16, 182, 140,  71, 151, 128, 212, 176,  40,  72, 232,  13,  37, 237,  79, 169, 210, 244,   7, 224, 153,  80, 142, 125, 245,  84, 132,  20, 179, 241,   2, 128, 185, 211, 171, 237, 123, 180,   0, 193,  52,  94, 247, 182,
++            152, 239, 210, 143,  42, 191, 104,  21, 200, 133,  72, 230, 208, 123, 153, 251,  60, 210, 234, 166,  79, 228, 103, 237, 190,  11,  86, 255, 139,  54, 219, 148, 109,  56, 122, 144,  46,  67, 137,  18, 186, 240,  31,   2, 182,  36, 235,  55, 111,  96, 168, 221,  48, 114,   8, 139,  45,  98, 151, 236, 118, 142,  41,  75,
++            122,  18, 185,  65,  91, 255, 154,  48, 238, 163,  31, 146,  54,  86, 226, 191,   5, 119, 101, 135,  62,   3, 203,  42, 162,  61, 227, 112,   3, 203, 187,  23, 161, 197, 221,  20, 233,  85, 163, 101,  42, 198, 113, 213,  95, 156, 221, 146, 207,  32, 154,  63,  83, 247, 195,  71, 227, 202,  23,  64, 169, 212, 104, 198,
++            227,  37, 110, 132, 219,  30, 116, 178,  61,   0, 247, 116, 171,  13, 105, 139,  72, 180,  49, 244,  32, 175, 116,  91,  26, 124, 198,  76, 168, 101, 127,  89, 250,  73,   6, 176, 107, 189, 208, 126,  61, 233, 164,  52,  71, 190,  16, 122,  74, 251,  13, 137, 103,  27, 149,  37, 164, 110, 249,  88,  11, 232,  29,  59,
++            162,  96, 246,   8, 159, 199,  74, 141, 210,  97, 189,  79, 220, 200,  40, 240,  29, 151, 205,  90, 157, 222, 143, 249, 213, 174,  46, 144,  33, 243,  64,  40, 181, 139,  95, 152,  36,  55, 252,  27, 150,  89,  11, 136, 254, 106,  46, 201,  89, 173, 216, 193, 231, 180, 126, 215,  82,  56, 134, 183, 155,  77, 176, 136,
++            192, 212,  79, 172,  53, 232,  14,  87, 225, 129,  44, 155,  24,  65, 126, 166,  81, 227,  10, 124, 195,  69,  51,   8,  80, 104, 240,  15, 225, 154, 208,  12, 230,  50, 205, 238, 120, 217,   1, 172,  74, 222, 120, 176,  24, 228, 167,   6, 133,  58,  38, 118,  52,  15,  93, 245,   4, 190,  32, 208,  48, 124, 253,   2,
++             45,  66, 143,  26, 125, 103, 186,  37, 169,  18, 234, 107, 180, 254,  94, 212, 189, 111,  45, 252,  22, 106, 185, 130, 154, 193,  57, 133, 179,  83, 117, 166, 103, 131,  29,  67, 159,  80, 135, 111, 241, 204,  39, 194,  83, 141,  66, 239, 185, 100, 243, 159,  77, 171, 205,  65, 156, 117, 241, 100,  16, 219, 111,  90,
++            225, 118, 184, 236, 205,  63, 251, 152, 119,  57, 204,  72, 135,   6,  51, 144,  20,  61, 174, 140,  85, 167, 242,  19, 230,  34,  72, 215,  97,  23,  52, 220,  77, 185, 248,  16,  92, 199, 183,  49,  17,  97, 154,  56, 216, 116,  31, 206, 149,  21, 211,   1, 144, 235, 106, 139,  18, 223, 168, 143,  67, 198, 149,  22,
++            245, 154,   9,  41,  91, 138,   3, 214,  80, 241, 145,  32, 197, 223, 117, 238, 161, 100, 235, 209,  36, 217,  62,  96, 204, 169, 114,   0, 187, 253, 124, 198,   5, 147, 113, 172, 226,  39, 237, 144,  66, 187, 130,   3, 245, 101, 160,  49, 125,  81, 112,  61, 218,  41,  29, 197,  51,  75,  91,  38, 235, 180,  57, 170,
++            202,  84, 107, 218, 163, 179, 111,  48, 190,  96,  13, 172,  87, 157,  38,  79,  10, 200,  72, 127,   2, 113, 146,  44, 123,  86, 246, 152, 139,  66,  36, 157, 236,  46, 195,  59, 128,  11, 101, 168,  29, 249, 209,  76, 171,  15, 235,  72, 176, 251, 193, 165, 131,  87, 183, 255, 125, 176, 206,   6, 129,  81, 104,  34,
++             71, 129, 239,  59,  30,  76, 243,  24, 158, 132, 226, 111, 246,  62, 187, 215, 137,  31, 179,  51, 157, 191, 232, 181,  10, 224,  50,  31, 208, 233, 173,  92,  72,  26,  99, 215,  78, 153, 206, 120, 224,  87, 111,  36, 143, 190,  89, 220,   9,  37,  96,  24, 242, 115,  69, 159,  99,  26, 232, 111, 249, 190,  15, 139,
++             48, 166,  17, 193, 150, 229, 128, 202,  68,  39, 210,  52,   3, 127, 101, 168, 251, 116, 224,  94, 249,  79,  28,  69, 162, 133, 198, 105,  82,   8, 110, 136, 205, 245, 142, 165,  33, 255,  54,  72,   7, 158, 181,  59, 229, 127,  44, 199, 139, 154, 225,  51, 202,  15, 230,   4, 218, 145,  43, 153,  53, 161, 212, 223,
++            254, 185,  99, 209, 118,  51,  94,   7, 183, 252, 164,  76, 195, 144,  23,  47,  88,  60, 150,  19, 199, 105, 137, 240,  93,  17, 183,  63, 167, 220,  54, 184,  14, 121, 179,   1, 229, 109, 192, 174, 137,  46, 216,  20, 103, 157,  27, 117,  64, 108, 184,  76, 148, 174, 138,  59,  84, 186,  68, 200,  25,  92, 121,   0,
++            112,  28,  68, 140,  11, 174, 217, 146, 107,  87, 121,  29, 176, 221, 239, 202,  13, 184, 131,  41, 168,   9, 215,  55, 205, 119, 252, 148,  24, 125, 248,  38, 225,  63,  83,  50, 132,  88,  21, 234,  95, 242, 122, 194, 252,  70, 214, 241, 168, 232,   6, 124, 214, 103,  45, 198, 114, 247, 133, 102, 172, 227,  75, 149,
++            175,  89, 232,  42, 248,  81,  34, 236,  60,  17, 151, 233,  93,  67, 109, 156,  76, 232, 210, 241,  67, 124, 177, 153,  34,  76, 229,  44,  97, 192, 152,  89, 160, 105, 241, 209, 186, 150,  40, 201,  14,  64, 147,  83,   0, 176,  93,  15,  49,  86,  32, 253,  65,  26, 241, 164,  34,   9, 211,  18, 240,  60,  38, 195,
++             52, 130, 214, 153, 195, 113, 162, 135, 188, 201,  43, 212, 137,   9,  36, 125, 174,  98,  30, 112,  85, 227,  45, 101, 189,   3, 170, 138, 211,  12,  74, 214,  28, 195, 145,  25,  70, 222, 124, 162, 113, 211,  34, 165,  47, 205, 136, 149, 190, 207, 133, 160,  94, 183, 121, 225,  90, 178, 157,  79, 123, 144, 207, 235,
++        },
++        {
++            205,  47, 139,  62,  81, 118, 209, 172,   1, 238,  29, 103, 230,   4, 190, 244, 152, 203, 230,  50, 100, 254, 139,  57,  98, 198, 157, 252, 143,  52, 203,  98, 247, 215, 128,  26, 168, 239, 212,  90, 188,  47, 153, 196, 229,  74, 107, 175,  83, 197, 233, 185,  67, 244,  13,  87, 117,  44, 209,  90,  32, 231,  65, 104,
++             13, 222, 250, 166, 187, 227,  51,  74, 142, 129, 180, 154,  49,  88, 130,  61, 218,  25,  12, 189,  74, 113, 167,  26, 181,  44,  71,  22,  90, 183, 126,  41,  73, 179,  48, 231, 192,   1, 146, 109, 166,  68, 116,  96, 144,  34, 190,   9, 134,  57, 123, 104, 213, 142, 199, 161, 240,  16,  60, 111, 157, 188, 120,  81,
++            153,  93,  24, 106,  36,  11,  97, 252, 202,  42, 221,  67, 248, 144,  33, 113,  75, 170, 137, 240, 149,   4, 210, 235, 119, 133, 173, 108, 226,   3, 238, 153,  24, 144, 118,  63,  97,  39, 126, 202,  15, 237, 176,   3, 254, 213, 157,  47, 242, 205, 165,   2,  46,  94,  24,  76, 182, 145, 221, 172, 238,  21, 214, 175,
++            242,  54, 197, 214, 133, 150, 192, 161,  16, 111,  82, 169,  10, 211, 184, 162, 252,  92,  56, 122,  40, 194,  62,  86, 222,   8, 244, 206,  61, 165,  81, 220, 197,  10, 255, 207,  78, 155, 244,  55,  83, 222,  41, 130,  58,  85, 120, 224,  96,  22,  76, 253, 153, 235, 114, 226,  34,  99, 129,   0,  53,  98,  39, 135,
++              4, 126,  78, 177,  66, 239,  86, 122,  56, 235,  24, 192, 119,  98, 235,  46,   0, 107, 213, 177, 224,  95, 160,  32, 145,  52,  79, 151,  37, 136, 116,  49, 106,  89, 161, 183,  18, 224, 174,  31, 138, 101, 159, 185, 203,  26, 168,  68, 147, 113, 181,  35, 129, 188,  52, 136,  69, 206, 190,  83, 250, 144, 201,  71,
++            189, 230, 159,  43, 115,   5,  31, 224, 182, 100, 207, 138,  53,  72,  21, 150, 202, 187,  28,  80,  15, 134, 249, 110, 184, 201, 103,  13, 190, 250,  27, 185, 232,  59,  35, 136, 102, 116,  71, 189, 215,  22, 247,  74, 109, 236,   6, 196,  41, 229, 209,  88,  65, 218,   6, 160, 248,  18,  44, 119, 161,  63, 224, 112,
++             35, 100,  22, 253, 219, 171, 201,  72, 132, 156,  38, 241, 164, 220, 130,  85, 229, 140,  67, 158, 232,  47, 205,  71,  20, 168, 234, 127, 216,  95,  68, 210, 168, 125, 241, 217,  52,   5, 250,  93, 148, 121,   8,  49, 142,  92, 181, 127, 248,  13, 138, 172,  17, 100, 203, 178, 108, 148, 232, 213,  26, 182,  15, 170,
++            148,  82, 206, 136,  56,  92, 143,  46, 250,   2,  66,  90,  17, 197, 180,  34, 117,  51, 246, 125, 102, 174,   6, 121, 241,  92,  65,  44, 175,  18, 155, 140,   6,  77,  21, 151, 195, 167, 131,  43,  60, 197, 164, 226, 209,  30, 153,  61,  82, 106,  55, 155, 245, 122,  81,  32,  59,  90, 169,  73, 105, 131,  90, 244,
++             61, 121,  11, 181, 108, 157,  14, 212, 114, 176, 227, 145, 107, 255,  61, 100, 170,   8, 218, 191,  35,  61, 150, 217, 138,  33, 159, 226, 112,  84, 237,  40,  97, 178, 204,  66,  87, 231,  27, 207, 235, 179,  87,  65, 118, 244,  46, 220, 167, 202,  33, 190, 226,  45, 144, 221, 240, 127,   7, 200,  38, 229,  50, 211,
++            164, 192, 234,  70,  36, 244, 195,  80,  97,  28, 191, 124,  44,   6, 151, 234, 204,  82,  20, 142,  90, 254, 196,  81,  54, 189,  11, 144, 198,  55, 122, 189, 224, 111, 249, 121,  36, 105, 153,  79, 112,  17,  37, 135, 175,  10, 191,  95, 134,   1, 236, 114,  73,  21, 165, 195,  16, 184,  53, 254, 152, 189, 139,   4,
++            249,  45, 152,  88, 221,  21, 124, 232, 164,  55, 209,  77, 172, 215, 127,  27,  70, 158, 109, 176, 211,  25, 163, 114, 228, 104, 247,  75, 209,   1, 253, 160,  23,  47, 145,  12, 191, 222, 174,   0, 141, 251,  99, 202, 231,  76, 107,  23, 255,  67, 148,  92, 178, 132,  62,  97, 112, 139, 217,  87, 117,  19,  78, 108,
++             96,  25, 208, 129, 168, 187,  65,  42, 139, 248,  13, 154, 236,  89,  53, 186, 135, 221, 243,  49,  73, 132,   2,  42, 179,  25, 128,  93, 168,  32, 135,  72,  89, 215,  61, 166, 132,  52, 241,  69, 186, 213, 156,  24,  51, 163, 144, 210, 120, 183,  41, 213,   9, 250, 206, 235,  39,  75, 160,  27,  61, 236, 178, 222,
++             68, 143, 113,   2,  51, 101, 149,   7, 183, 118, 103,  68,  20, 201, 112, 248,  96,  40,  11, 120, 233, 100, 205, 240,  67, 156, 214,  47, 184,  63, 108, 231, 175, 197, 101, 245,  77,  22,  94, 120,  43,  59, 127,  85, 115, 242,  38, 171,  56,  85, 225, 160, 106,  51,  84, 152,   2, 179, 244, 101, 167, 197, 126,  34,
++            202, 174, 240, 227,  77, 254, 201, 217,  87,  33, 225, 193, 137,  37, 164,   4, 174,  64, 197, 154, 187,  56, 147,  89, 122, 197,   7, 140, 242, 220, 150,  14, 123,  34,   3, 184, 209, 144, 219, 194, 163, 228,   9, 179, 222,  68,   4, 200, 233,  16, 126,  29, 199, 169,  23, 224, 190, 121,  45, 210, 143,  11,  51, 156,
++             85,  21,  60, 192, 136,  30, 112, 162,  72, 239, 169,  50, 121, 240,  78, 145, 207, 230,  84,  32, 167,  20, 221, 174,  36, 252,  82, 114,  20,  96,  43, 206, 240, 156,  85, 113,  41, 158,  12, 106,  31,  77, 245, 149, 190, 136,  91, 104, 153,  72, 140, 246,  63, 119, 142, 100,  68, 134,  17, 228,  72,  94, 251, 216,
++            135, 107,  41, 158,  91, 177,  48,  18, 131, 148,   0,  93, 178, 220,  58, 105,  26, 125, 141, 112, 250,  77, 134,  10, 105,  58, 223, 161,  70, 196, 170,  80,  56, 137, 223,  68, 128, 233,  63, 254, 137, 205,  98,  18,  46, 214,  30, 251, 178, 195,  44,  95, 187, 232,  37, 208, 253,  55, 201, 110,  35, 185, 116,   4,
++            243, 184, 220, 123,   9, 209, 245, 223,  60, 203, 109, 211,  28, 154,  14, 253, 188,  49, 215,  14,  96, 208,  47, 237, 189, 146,  28, 178, 234, 130,   5, 116, 185,  22, 247, 167, 199,  27, 180,  86, 171,  40, 123,  64, 109, 164, 125,  54,  11, 114, 215, 157,  12,  77, 176,   7,  91, 156, 171,  82, 236, 151,  62, 165,
++             47,  73,  18, 236,  65, 142,  79, 101, 187,  37, 251,  81,  67, 193, 130,  91, 167,  71, 239, 181,  62, 194, 116, 162,  69, 127, 206,  50, 102,  36, 254, 147, 209,  46, 104,  10,  92,  48, 111, 212,   2, 154, 193, 232, 176, 241,  79, 145, 228,  86,  22, 238,  56, 131, 113, 217, 145,  30, 193,   9, 130, 218,  27, 201,
++            126, 147,  98, 199, 166, 116,  25, 171, 124,  12, 159, 140, 233, 115,  42, 223, 149,   3, 102, 158,  34, 145, 229,  21,  93, 246,   0,  85, 156, 218,  60,  90, 229,  72, 177, 142, 219, 243, 132,  70, 239,  55, 220,  89,  23,   5, 196, 208,  39, 171, 136, 103, 205, 162, 243,  48,  72, 224, 119, 242,  45, 176, 103,  87,
++            214, 178, 251,  37,  54, 228, 194,  45, 237,  88, 182,  49,   7, 170, 205,  31,  82, 199,  44, 124, 221,   8,  80, 174,  42, 216, 115, 197, 138, 181,  12, 110, 158,  33, 195, 121,  60, 155, 188,  17, 144, 114,  32, 131,  71, 158, 101,  61, 121, 246,  69, 191,  31,  84, 182,  17, 105, 165,  59,  97,  71, 143,  14, 234,
++             32,   8, 113,  84, 156,   4,  94, 149, 215,  62, 132, 221,  97, 247,  60, 107, 231, 133, 246, 172,  88, 110, 255, 129, 184, 150,  18, 235,  67,  28, 245, 200, 132,  19, 249,  79,   5,  35, 204, 103,  82, 166, 183, 203, 252, 140, 225,  26, 183,   9, 147,  46, 230,   3, 122, 198, 250, 139,  22, 185, 204, 255, 158,  58,
++            170,  70, 139, 187, 219, 130, 249,  71,  15, 198, 106,  19, 191,  75, 143, 159,  24, 183,  59,  19, 209,  50, 200,  29,  58, 100,  78,  46, 167, 123,  82,  51, 173,  97, 211, 165, 227,  91, 174, 233,  45, 246,   8,  97,  52,  37, 113,  83, 162, 217,  91, 110, 210, 153,  62,  92,  36, 212, 232,   0, 121,  38, 110, 194,
++             95, 229, 207,  21,  62, 104, 180,  33, 119, 166, 243, 152,  30, 123, 179,   5, 215, 116,  76, 142, 238, 157,  71, 138, 226, 242, 161, 212, 191, 104, 217, 149, 232,  65,  42, 109, 146,  53, 119,  21, 211,  64, 150, 123, 213, 172, 190, 239,  50, 126, 255, 172,  76, 140, 238, 175, 128,  75, 154,  88, 171, 226,  76, 133,
++            245,  42, 162, 123, 238,  47, 200, 138, 232,  79,  40,  58, 212, 235,  47,  92, 253,  39, 100, 191,   2,  95, 169,  14, 193, 118,   7, 131,  23, 239,  37,   3, 117, 186,  13, 131, 194, 255,  74, 159, 135, 191,  28,  78, 227,  18, 145,   4,  67, 198,  23,  38,  12, 223,  50,  26, 194, 112,  43,  57, 141,  26, 209,  14,
++            151, 108,   2,  80, 172,  26,  87, 159,   5, 209,  94, 172, 111, 136, 197,  67, 166, 204, 153, 230, 125,  42, 113, 210,  89,  36, 180,  62,  93, 143,  74, 202, 162,  88, 242, 216,  28, 179,   0, 222, 106,  89, 236, 164,  60, 108,  91, 206, 137, 104, 155, 188, 117, 201, 101, 164,   6, 241, 178, 199, 248, 102, 186,  53,
++            218,  66, 196, 251, 143, 212, 226, 113,  52, 185, 145, 246,  22,  81,  14, 226, 122,  11,  57,  31, 174, 221, 250,  55, 148,  74, 247, 155, 223, 184,  54, 252,  21, 136,  49,  77, 101,  62, 126,  43, 202,  14, 181,  40, 130, 250, 177,  35, 233,  81, 242,  61, 133,  87, 250,  64, 137, 218,  95,  18,  69, 127, 165,  84,
++            138, 179, 117,  36,  56, 100,  17,  69, 254, 127,  12,  65, 222, 156, 186, 105, 148,  85, 244, 134,  68,  82, 184,  24, 233, 106, 204,  45,  12, 111, 124, 175,  96, 225, 154, 170, 205, 232, 149,  83, 246, 140, 115, 210,   7, 154,  73, 218,  19, 169,  46, 224, 180,  15, 210, 151,  80,  33, 119, 160, 224,   7, 239,  30,
++            228,  13,  91, 232, 156, 190, 133, 168, 196,  32, 102, 203, 118,  39,  54, 237,  27, 178, 193, 216, 108,   9, 141, 163, 122,   4, 171, 134,  84, 234, 208,  29,  64, 193,  15,  38, 117,   9, 187, 164,  31,  70,  54, 239,  98, 198,  51, 124, 110, 147,   1,  96, 160,  29,  44, 108, 235, 187,  52, 208, 146,  42, 115, 197,
++             49, 167, 129, 203,   7,  79,  43, 238,  89, 152, 233, 178,  86, 164, 209, 127,  73,  45,  94,  19, 157, 206,  44, 195,  91, 225,  67, 192,  19, 160,  42, 147, 107, 128, 240,  85, 141, 248,  51,  96, 227, 195, 174, 147,  81,  29, 231, 181,  65, 195, 214, 126, 246,  76, 197, 175, 129,   9, 254,  73,  90, 180,  61, 100,
++             76,  22, 241,  63, 107, 180, 217, 116,   3,  60,  46, 134,  24, 248,   0, 140, 199, 252, 166, 119, 238,  62, 101, 246,  29,  51, 149, 254, 101, 216,  77, 247,   2, 203, 176,  56, 218, 107,  24, 211, 123,   3, 108,  19, 221, 136, 160,  11, 253,  87,  36,  55, 112, 142, 230,  58,  22, 168, 102, 134,  27, 202, 247, 155,
++            141, 187, 219,  34, 149, 249,  23, 141, 207, 163, 220,  74, 191,  95,  61, 223, 103,  10,  56, 143,  36, 224, 129,  77, 213, 181, 114,  34, 129,  57, 185, 167,  91, 226,  72,  19, 161, 182,  67, 136,  79, 156, 252,  64, 190, 117,  40, 102, 208, 134, 173, 236, 189,  12,  98, 216,  86, 226, 194, 152, 234,   2, 123, 215,
++             39, 111,  89, 163, 124,  53,  94,  68, 186, 106,  18, 240, 148, 112, 172,  34, 154,  77, 230, 175,  86, 186,   1, 168, 137,  14, 203,  72, 238,   7, 136, 115,  48,  34, 142, 120,  92, 198,  43, 238, 172,  36, 205,  48,  91, 168, 235,  58,  77,  26, 154,  20,  70, 164,  39, 148, 118,  65,  33,  48, 110, 169,  84,  17,
++            176, 252,  70,  19, 210, 234, 173,  35, 228, 126,  83,  38, 208,  13, 235, 185, 123, 213,  20, 111, 203,  26, 152, 107,  57, 242, 157,  94, 170, 196,  24, 235, 214, 158, 189, 231, 253,   6, 151, 221,  20, 101, 182, 128, 242,   5, 215, 149, 184, 115, 225,  90, 212, 125, 251, 204,   4, 162, 243, 210,  71, 189,  57, 232,
++            129,  52, 144, 192,   1,  81, 198, 155,  10, 246, 176,  54, 161, 131,  70,  49,  88, 193, 134, 241,  46,  71, 250, 216,  87,  27, 124,  46, 224,  82, 151,  64,  98,  10,  80,  54,  30, 129, 111,  85,  58, 144, 225,  73,  30, 140,  85,  16, 203,  49, 244, 105,   6, 176,  80,  51, 185, 139,  95, 126,  12, 146, 100, 205,
++              6,  93, 221, 171, 103, 135, 116,  47,  99, 140, 201, 118,  93, 253,  26, 218, 165,   4,  63, 150,  95, 126, 192,  40, 176, 231, 188,  11, 211, 108,  37, 249, 172, 132, 206, 104, 168,  69, 214, 192, 246, 119,  15, 161, 199, 110, 178, 250, 127,  32, 143,  61, 200, 135,  28, 110, 235,  75,  20, 180, 251, 224,  33, 158,
++            237, 120,  44, 243,  32,  61, 255, 216,  76,  28,  64, 221,   3, 196, 146, 102, 117, 248,  33, 210, 171, 233,   7, 115, 145,  66, 101, 132,  59, 144, 183, 120, 198,  19, 243, 148, 224, 180,  47, 158,   1, 207,  97,  53, 229,  63,  43,  99,  69, 170, 193, 159,  44, 240, 223, 156, 196,  38, 213, 165,  46, 116,  79, 194,
++             66,  26, 153,  75, 202, 162,  20, 187, 169, 238, 152, 182,  36,  79, 174, 230,  42,  76, 183, 106,  15,  56, 162,  78,  21, 207, 159, 252,  29, 228,   0,  89,  52,  74,  40, 116,   8,  93,  26, 134,  76,  40, 175, 243, 131, 190, 154, 220,   1, 232,  86,  19, 120,  69,  97,   9,  57, 131, 106,  88,  63, 141,  15, 173,
++            136, 212, 185, 109, 225, 143,  89, 122,   6, 104,  50, 228, 109, 137,  57,  16, 199, 158, 139, 223,  83, 201, 134, 218, 239,  50,  84, 173, 200,  72, 165, 239, 213, 157, 184, 233,  61, 201, 249, 103, 187, 220, 146,  83,  10,  24, 120,  78, 204, 136, 103, 255, 213, 179, 143,  84, 171, 247, 227,   0, 199, 240, 218,  98,
++            252,  84,  16, 129,   8,  54, 231,  41, 209, 132,  83,  18, 165, 243, 210,  96, 128, 237,  50,  23, 122, 255,  35,  98, 180, 121,   5,  39, 114,  97, 128,  21, 139, 100,  28, 127,  80, 143, 163, 229, 124,  64,  29, 108, 212, 166, 236,  39, 177,  28,  56, 165,  12,  36, 192, 220, 117,  29, 146, 184, 122, 160,  55,  37,
++            201, 164,  47, 242,  97, 195, 177,  67, 241, 146, 192, 205,  66, 120,   9, 184,  29,  68, 173,  93, 189, 153,  70,  12, 195, 139, 225, 152, 246, 187,  45, 222,  63, 195, 254, 167, 217,  13,  38,  55,  16, 170, 253, 196,  50, 141,  91, 247, 114, 149, 228, 129,  79, 111, 235,  48,  16, 203,  68,  42,  81,  22, 188, 112,
++            148,  63, 176, 217,  72, 152,  23, 112, 163,  31,  94, 252,  44, 156,  87, 219, 148, 247, 115,   0, 227,  43, 170, 110, 244,  57,  92,  25,  66, 207,  10, 150, 111,  86,   4,  48, 108, 191,  90, 117, 204, 154,  94, 128,  72, 183,   7,  60, 199,  73,  46, 186, 208, 152,  62, 135, 160,  96, 176, 250, 103, 234, 133,   4,
++            229,  29, 106, 140,  37, 121, 248,  80, 218,  58,   1, 127, 174,  27, 233, 106,  38,  79, 200, 212,  59, 140, 234,  28,  77, 161, 215, 177, 133,  83, 169, 231,  33, 180, 208,  72, 148, 245, 178, 234,  79, 222,   3,  37, 233, 215, 102, 160,  16, 219,  98,   8, 248,  25, 102, 243,  76, 217, 126,  10, 150, 204,  71,  92,
++            245, 125, 207,   6, 227, 167, 202,  11, 182, 103, 226, 188,  76, 142, 202,  61, 167, 135,  13, 159, 104,  86, 124, 186, 202,  45, 118,  14, 236, 105,  52, 121, 242, 158, 133, 227,  19, 124,  63,  31, 139,  48, 110, 175, 149,  21, 123, 191, 138, 241, 173, 119,  88, 199, 169,   2, 185,  32, 230,  59, 168, 215,  48, 180,
++             14,  76, 186,  89,  59, 100,  48, 144, 131,  39, 155, 114, 237,  51,   7, 119, 194, 231,  49, 182, 249,  18, 219, 150,   3, 101, 253, 146,  35, 195, 216,  74,  16,  95,  58,  39, 173,  99, 214,  10, 164, 189, 244, 207,  87,  66, 251,  42,  80,  27, 156,  67,  39, 144,  53, 211, 113,  45, 142,  88,  25, 118,  35, 158,
++            220,  52, 146, 252, 194,  20, 233,  86, 211, 249,  69,  17, 208,  99, 175, 254,  25,  95, 128,  31,  74, 172,  40,  64, 130, 209,  73, 184,  60, 160,   1, 141, 184, 200, 117, 251,  82, 196, 151, 239,  93,  70, 131,  29,  55, 221, 168, 109, 210,  54, 132, 237, 182, 222, 123,  83, 155, 240, 198, 106, 186, 255, 136,  99,
++            171, 111,  28, 161, 129, 115, 177,  64,  26, 195, 170,  88,  35, 130, 222,  83, 151,  66, 218, 147, 198, 116, 241,  92, 228, 167,  17,  88, 223, 125,  98, 248,  47,  23, 219, 162,   3, 135,  43,  57, 203, 120,  13, 157,  99, 141,   0, 182,  92, 229, 193,   6, 104,  30, 253,  20,  65, 173,  15,  75, 223,   1,  64, 197,
++            124, 232,  42,  70, 206,   2, 153, 240, 107,  52, 121, 145, 246,  62, 160,  15,  43, 185, 107, 234,  55,  14, 156, 189,  30, 141,  48, 113, 239,  27, 206, 171,  83, 149,  64, 104,  32, 230, 177, 108,  23, 255, 181, 227, 194, 238,  35, 128, 151,  16, 114, 205,  76, 166, 137, 192,  99, 213, 129,  52, 163, 147, 237,  82,
++            212,   8, 181, 242,  82, 225,  37, 137, 163,  11, 219, 181,   5, 190, 205, 112, 242, 169,   2,  86, 135, 207,  79, 111,  58, 247, 199, 174, 152,  42,  66, 109, 233, 129, 191, 240, 206,  73, 123, 223,  83, 145,  41,  77, 115,  51, 202,  73, 248,  63,  41, 159,  94,  56, 234,   4, 151,  37, 247, 115, 207,  94,  44,  19,
++             60, 150, 105, 135,  51,  98, 183,  75, 200,  95, 230,  78, 105,  49, 138,  73, 215, 125, 195,  23, 253,  45, 173,   5, 213,  99, 128,   8,  78, 189, 137,  19, 213,  37,  11,  90, 141,  49, 166,   8, 189, 216,  64, 171,   9,  90, 161,  24, 220, 174, 140, 241, 212, 178,  44, 118, 226,  89, 182,   9,  31, 176, 131, 189,
++            251,  90, 198, 169,  25, 214, 122,  15, 254,  44, 130,  30, 155, 238,  21,  93,  36,  58, 158,  99, 221, 145, 122, 236, 160,  69,  25, 231, 219,  93, 255, 162,  56, 178, 118, 157, 183,  18, 249,  95, 154,  31, 104, 138, 210, 245, 120, 186, 101,  86, 125,  28,  13,  70, 130, 199,  78,  57, 139, 230,  71, 243, 110, 160,
++             74,  36, 223,  12, 148, 245, 193,  59, 150, 212,  67, 169, 198, 118, 221, 180, 144, 245,  28,  75, 178,  66,  20, 192,  87,  40, 179, 143,  53, 120,  13, 201, 101, 227,  78, 244,  62, 110, 211, 133,  55, 242, 124, 231,  20, 149,  60, 214,   7,  48, 229, 184, 107, 248, 154, 216,  25, 168, 193, 105, 153,  53, 217,  27,
++            205, 117,  55, 127,  68, 109,  87,  29, 175, 113,   1, 244,  86,  59,   8, 163, 204, 106, 229, 119, 203,  37, 104, 216, 134, 251, 205, 103, 159,  34, 183,  71, 147,   3,  43, 217,  26, 193,  39,  78, 197,   2, 176,  46, 198,  80,  34, 134, 252, 157, 200,  79, 143,  35,  97,  10, 112, 251,  45,  16, 200,  85,   5, 142,
++             94, 173, 240, 183, 228,  40, 166, 138, 235, 100, 187, 137,  40, 228, 128,  80,  46,  18, 187, 141,  53, 247, 154,  10,  55, 115,  76,   0, 243, 212,  85, 236, 125, 174, 134,  99, 149, 234, 119, 165, 226,  89,  68, 159,  97, 182, 109, 171,  71,  22, 117,  59, 208, 171, 237, 185,  66, 159,  93, 133, 224, 125, 185, 233,
++             22, 137,   0,  84, 156,  15, 201, 219,  49,  79,  23, 208, 152, 103, 192, 249,  65, 131,  89,   5, 170,  83, 232, 186, 167,  31, 151, 194,  63, 132, 109,  23,  51, 249, 207,  84, 169,  69,  11, 141,  23, 209, 115, 250,  13, 223,  52, 237, 192, 146,  41, 225,   1,  86,  53, 124, 142, 231, 204,  32, 170,  60,  41, 163,
++             70, 196,  45, 210, 102, 248,  71, 120,  11, 162, 251,  56, 177,  31,  15, 168, 213, 153, 240, 223,  30, 112, 128,  69,  96, 222, 238,  20, 173,  44, 225, 162, 192,  65,  33,  17, 188,  51, 254, 103, 181,  40, 130, 146,  30, 204, 124,   4,  89, 103, 241, 162, 132, 195,  23, 219,  38,  82,   3, 242,  74, 113, 254, 102,
++            215, 245, 113,  62, 135,  24, 179,  96, 195, 131, 224,  92, 123,  74, 237, 114,  96,  35, 177,  59, 208, 147,  16,  41, 201, 138,  80, 121,  98, 148, 200,   6,  92, 116, 155, 227, 122, 214,  91, 154, 236,  59, 193,  84, 232,  66, 140, 159, 220,  18, 180,  67,  95, 255, 109, 166, 190,  59, 120, 179, 145, 193,   9, 155,
++            126,  29, 169, 188, 226, 151,  54, 236,  32, 147,  67,   6, 200, 218, 147,  54,   0, 199, 121,  73, 102, 191, 251, 227, 176,   5,  52, 188, 246,  33,  75, 138, 214, 181, 241, 104, 137,   1, 198,  30,  75, 217,   5, 164, 105, 177,  38,  78, 200,  54, 125, 211,  33, 150,  75,  16, 228, 153, 101, 211,  20,  90, 222,  54,
++             81, 146,  93,   8,  38, 125,  85, 212, 110,  45, 186, 163, 107,  43, 133, 188,  84, 255, 137,  11, 165,  50,  88, 157,  64, 105, 215, 163,  15, 228, 107, 253,  57,  11,  41,  77,  60, 177,  45, 127, 172, 111, 241,  47,  17, 211, 253, 118,  28, 245, 142,   8, 172,  49, 200, 136,  91, 249,  30,  50, 237, 135,  38, 182,
++             15, 208, 238,  74, 199, 255, 157,   3, 173, 243,  83, 229,  27, 246, 170,  21, 225, 158,  42, 211, 237,  24, 133, 118,  35, 237, 130,  86,  65, 177,  47, 126, 166,  87, 148, 203, 163, 245, 229, 144,  21,  88, 150, 185, 132,  94,  57, 169, 106, 186,  85, 229, 114, 239, 216,  65,  10, 175, 130, 164,  70, 201, 109, 231,
++            100, 161,  48, 117, 172, 105,  22,  69, 204, 139,  16, 128,  63,  91, 207,  72, 105,  59, 183, 114,  78, 173, 219,  12, 204, 146,  25, 196, 117, 151, 206,  27, 190, 236, 220,  31,  18, 114,  96,  64, 208, 250, 121,  69, 225, 194,  25, 234, 152,  70,  41, 194,  98,  25, 123, 183,  43, 113, 222,  84,   5, 151, 173,  60,
++            132, 187,  31, 141, 217,  56, 191, 230, 119,  50,  99, 214, 155, 181,   7, 125, 150, 234,  30,  94, 143, 196,  68, 245,  93, 179,  50, 249,   1, 219,  95,  72,  14, 118,  99, 132, 188,  81, 216,   6, 190,  53,  34,   9, 157,  81, 139,   0, 214, 128,  19, 162,  58, 146,  81, 159, 243, 207,  58, 191, 241, 122,  27, 251,
++              2, 225,  68, 245,   9,  96, 133,  80,  33, 165, 188, 253,  36, 111, 239,  48, 197,  14, 214, 247,   2,  54, 108,  39, 165,  75, 227, 102, 161,  38, 133, 244, 145, 174,  66,  50, 252, 152,  40, 161, 102, 170, 204, 236, 112,  41, 202,  99,  49, 177, 226, 206, 252,   3, 190,  33,  97, 139,  24, 107,  41,  94, 210,  78,
++            155, 110,  88, 202, 163,  43, 182, 247, 219, 149,  13,  75,  57, 140, 222,  80, 175, 135,  66, 161, 126, 225, 153, 188, 124,   8, 137,  63, 186,  81, 230,  58, 194,  34, 227, 205,  12, 181, 119, 228, 130,  77, 138,  90, 179, 244, 164,  65, 249, 116,  92,  75, 133, 108, 217, 230,  69,   7, 150, 180, 223, 166,  53, 193,
++             34, 179, 125,  17, 235, 147,  25, 109,  62,  91, 198, 122, 206, 166,  22,  99,  39, 116,  87, 179,  34, 206,  17,  82, 239, 216,  32, 115, 211,  17, 167, 111,   6, 157,  85, 105, 138,  73,  57,  29, 248,  13, 218,  24,  55, 127,  17, 220, 147,  32,  14, 155,  38, 175,  53, 127, 168, 196, 254,  74, 131,  10, 142, 243,
++        },
++    };
++};
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+index 853204b..93dd957 100644
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -87,6 +87,7 @@ namespace RT64 {
+         std::vector<std::unique_ptr<RenderBuffer>> &retired = retiredRing[ringIndex % RingDepth];
+         retired.clear();
+         graveyardRing[ringIndex % RingDepth].clear();
++        timerResolve();
+ 
+         if (bottomLevelPool.size() < bottomLevelASVector.size()) {
+             bottomLevelPool.resize(bottomLevelASVector.size());
+@@ -119,6 +120,7 @@ namespace RT64 {
+ 
+     void RaytracingResources::submitBottomLevelASCreation(RenderWorker *worker) {
+         const auto start = std::chrono::steady_clock::now();
++        timerBegin(worker, Span::Build);
+         thread_local std::vector<RenderBufferBarrier> barriers;
+         barriers.clear();
+ 
+@@ -213,6 +215,7 @@ namespace RT64 {
+             worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(topLevelBuffer.get(), RenderBufferAccess::READ));
+         }
+ 
++        timerEnd(worker, Span::Build);
+         buildTime += std::chrono::steady_clock::now() - start;
+         buildFrames++;
+ 
+@@ -232,12 +235,76 @@ namespace RT64 {
+             return;
+         }
+ 
+-        const double ms = std::chrono::duration<double, std::milli>(buildTime).count() / std::max(buildFrames, 1u);
+-        std::fprintf(stderr, "[rt] tlas %u blas %u build %.3f ms (cpu, recording, %u frames)\n",
+-            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, ms, buildFrames);
++        // The line the frame budget tool of phase 58 reads (lighting-design.md, section 6): every
++        // span in GPU milliseconds averaged over the frames it ran in, the ones not built yet at
++        // zero, then the CPU recording time of the builds.
++        const double recordingMs = std::chrono::duration<double, std::milli>(buildTime).count() / std::max(buildFrames, 1u);
++        auto spanMs = [&](Span span) {
++            const uint32_t i = uint32_t(span);
++            return (spanFrames[i] > 0) ? (spanMilliseconds[i] / spanFrames[i]) : 0.0;
++        };
++        std::fprintf(stderr, "[rt] frame tlas %u blas %u build %.3f shadows %.3f ao 0.000 lights 0.000 gi 0.000 reflect 0.000 scatter 0.000 filter 0.000 ms (gpu), recording %.3f ms, %u frames\n",
++            (topLevelAS != nullptr && lastInstanceCount > 0) ? 1u : 0u, lastBlasCount, spanMs(Span::Build), spanMs(Span::Shadows), recordingMs, buildFrames);
++
++        // The scene's lights as the passes see them (patch 0005), beside the budget line.
++        std::fprintf(stderr, "[rt] light sun (%.2f %.2f %.2f) toward (%.2f %.2f %.2f) ambient (%.2f %.2f %.2f) point lights %u\n",
++            float(rtParams.sunColor.x), float(rtParams.sunColor.y), float(rtParams.sunColor.z),
++            float(rtParams.sunDirection.x), float(rtParams.sunDirection.y), float(rtParams.sunDirection.z),
++            float(rtParams.ambientBaseColor.x), float(rtParams.ambientBaseColor.y), float(rtParams.ambientBaseColor.z),
++            rtParams.lightsCount);
++
+         lastTrace = now;
+         buildTime = std::chrono::steady_clock::duration{};
+         buildFrames = 0;
++        for (uint32_t i = 0; i < uint32_t(Span::Count); i++) {
++            spanMilliseconds[i] = 0.0;
++            spanFrames[i] = 0;
++        }
++    }
++
++    // ---- the GPU timer -------------------------------------------------------------------------
++
++    void RaytracingResources::timerBegin(RenderWorker *worker, Span span) {
++        const uint32_t slot = ringIndex % RingDepth;
++        if (timerPools[slot] == nullptr) {
++            timerPools[slot] = worker->device->createQueryPool(2 * uint32_t(Span::Count));
++        }
++
++        worker->commandList->writeTimestamp(timerPools[slot].get(), 2 * uint32_t(span));
++    }
++
++    void RaytracingResources::timerEnd(RenderWorker *worker, Span span) {
++        const uint32_t slot = ringIndex % RingDepth;
++        if (timerPools[slot] == nullptr) {
++            return;
++        }
++
++        worker->commandList->writeTimestamp(timerPools[slot].get(), 2 * uint32_t(span) + 1);
++        timerWritten[slot] |= (1u << uint32_t(span));
++    }
++
++    void RaytracingResources::timerResolve() {
++        // Called once the ring has advanced: this slot's frame is the one from RingDepth frames
++        // ago, finished by now, and its stamps can be read before the slot is stamped again.
++        const uint32_t slot = ringIndex % RingDepth;
++        if ((timerPools[slot] != nullptr) && (timerWritten[slot] != 0)) {
++            timerPools[slot]->queryResults();
++            const uint64_t *nanoseconds = timerPools[slot]->getResults();
++            for (uint32_t i = 0; i < uint32_t(Span::Count); i++) {
++                if ((timerWritten[slot] & (1u << i)) == 0) {
++                    continue;
++                }
++
++                const uint64_t begin = nanoseconds[2 * i];
++                const uint64_t end = nanoseconds[2 * i + 1];
++                if (end > begin) {
++                    spanMilliseconds[i] += double(end - begin) / 1000000.0;
++                    spanFrames[i]++;
++                }
++            }
++        }
++
++        timerWritten[slot] = 0;
+     }
+ 
+     // ---- binding table and lights -------------------------------------------------------------
+@@ -271,6 +338,15 @@ namespace RT64 {
+         const uint32_t count = (rtScene.pointLights != nullptr) ? rtScene.lightCount : 0;
+         rtParams.lightsCount = count;
+ 
++        // The scene's lights for the shadow pass (patch 0005). The renderer sets the ambient
++        // field from its preset before it calls here, so this is the value the shaders see. The
++        // sun's angular radius is a design constant: half a degree across, the sun's own
++        // (lighting-design.md, section 3); the moon's softer disc comes with the hour work.
++        const float SunAngularRadius = 0.0044f;
++        rtParams.ambientBaseColor = hlslpp::float4(rtScene.ambientColor, 0.0f);
++        rtParams.sunDirection = hlslpp::float4(rtScene.sunDirection, SunAngularRadius);
++        rtParams.sunColor = hlslpp::float4(rtScene.sunColor, 0.0f);
++
+         const uint64_t size = sizeof(interop::PointLight) * std::max(count, 1u);
+         const uint32_t slot = ringIndex % RingDepth;
+         if (lightsBuffer != nullptr) {
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+index 79a739e..a953af7 100644
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -95,6 +95,14 @@ namespace RT64 {
+         const interop::PointLight *pointLights = nullptr;
+         uint32_t lightCount = 0;
+         float deltaTime = 0.0f;
++
++        // The scene's lights (patch 0005), found among the pair's projections by the framebuffer
++        // renderer: the direction toward the sun, its color (zero when the scene has none), and
++        // the game's ambient, which the shadow pass leaves standing where the sun is blocked so
++        // the shadow sits on the game's own lighting rather than on black.
++        hlslpp::float3 sunDirection = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        hlslpp::float3 sunColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        hlslpp::float3 ambientColor = hlslpp::float3(0.0f, 0.0f, 0.0f);
+     };
+ 
+     struct RaytracingResources {
+@@ -234,6 +242,20 @@ namespace RT64 {
+         // The interleaved raster targets, one pair per interleaved scene.
+         void updateInterleavedRenderTargets(RenderWorker *worker, uint32_t width, uint32_t height, uint32_t count, const RenderMultisampling &multisampling, bool usesHDR);
+ 
++        // THE GPU TIMER (patch 0005): a timestamp pair per span per frame, in a query pool per ring
++        // slot, read back when the slot comes round again (the frame is done by then, the same
++        // cadence as the graveyard). The once a second trace prints each span in milliseconds; the
++        // frame budget tool of phase 58 reads that line. A span's stamps sit around its commands
++        // wherever they are recorded: the builds here, the dispatches in the framebuffer renderer.
++        enum class Span : uint32_t {
++            Build = 0,
++            Shadows,
++            Count
++        };
++
++        void timerBegin(RenderWorker *worker, Span span);
++        void timerEnd(RenderWorker *worker, Span span);
++
+     private:
+         // One bottom level structure's buffers, kept from frame to frame and grown when a mesh
+         // needs more than it has.
+@@ -294,6 +316,13 @@ namespace RT64 {
+         uint32_t lastInstanceCount = 0;
+         uint32_t framesTraced = 0;
+ 
++        // The GPU timer's pools, one per ring slot, and what was stamped in each frame.
++        std::unique_ptr<RenderQueryPool> timerPools[RingDepth];
++        uint32_t timerWritten[RingDepth] = {};
++        double spanMilliseconds[uint32_t(Span::Count)] = {};
++        uint32_t spanFrames[uint32_t(Span::Count)] = {};
++        void timerResolve();
++
+         std::unique_ptr<RenderBuffer> &ringSlot(std::unique_ptr<RenderBuffer> *ring, uint64_t *sizes, uint64_t size, RenderBufferFlags flags);
+         void traceBuild();
+     };
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index d1c5273..f877f12 100644
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -843,7 +843,18 @@ namespace RT64 {
+             std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(PostProcessPSBlobDXIL, PostProcessPSBlobSPIRV, PostProcessPSBlobMSL, "PSMain", shaderFormat));
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.pipelineLayout = postProcess.pipelineLayout.get();
+-            pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
++
++            // OoT: Recompiled, patch 0005: the output is a factor over the rasterized frame
++            // (ComposePS), so it multiplies the target rather than covering it.
++            RenderBlendDesc multiply;
++            multiply.blendEnabled = true;
++            multiply.srcBlend = RenderBlend::ZERO;
++            multiply.dstBlend = RenderBlend::SRC_COLOR;
++            multiply.blendOp = RenderBlendOperation::ADD;
++            multiply.srcBlendAlpha = RenderBlend::ZERO;
++            multiply.dstBlendAlpha = RenderBlend::ONE;
++            multiply.blendOpAlpha = RenderBlendOperation::ADD;
++            pipelineDesc.renderTargetBlend[0] = multiply;
+             pipelineDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(usesHDR);
+             pipelineDesc.renderTargetCount = 1;
+             pipelineDesc.vertexShader = fullScreenVertexShader.get();
+diff --git a/src/shaders/ComposePS.hlsl b/src/shaders/ComposePS.hlsl
+index 7463926..03e832c 100644
+--- a/src/shaders/ComposePS.hlsl
++++ b/src/shaders/ComposePS.hlsl
+@@ -15,23 +15,20 @@ Texture2D<float4> gReflection : register(t5);
+ Texture2D<float4> gRefraction : register(t6);
+ Texture2D<float4> gTransparent : register(t7);
+ 
++// OoT: Recompiled, patch 0005: the composite is a factor over the rasterized frame, not a color
++// of its own. The rasterizer has already drawn every traced call with the game's own blender,
++// fog and dither, and a hit's color from the hit shader is not that (a room drawn for depth
++// only, its color held back by the blender, would show through). The direct light pass writes
++// the fraction of the game's shading that stands where the sun is blocked, one per channel, and
++// the post process multiplies the frame by it (rt64_shader_library.cpp). A pixel no ray reached
++// keeps its color.
+ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
+     float4 diffuse = gDiffuse.SampleLevel(gSampler, uv, 0);
+     if (diffuse.a > EPSILON) {
+         float3 directLight = gDirectLight.SampleLevel(gSampler, uv, 0).rgb;
+-        float3 indirectLight = gIndirectLight.SampleLevel(gSampler, uv, 0).rgb;
+-        float3 reflection = gReflection.SampleLevel(gSampler, uv, 0).rgb;
+-        float3 refraction = gRefraction.SampleLevel(gSampler, uv, 0).rgb;
+-        float3 transparent = gTransparent.SampleLevel(gSampler, uv, 0).rgb;
+-
+-        // We intentionally mix the HDR buffer that will be upscaled in sRGB space to preserve the color of effects like fog and such.
+-        float3 result = lerp(LinearToSrgb(diffuse.rgb), LinearToSrgb(diffuse.rgb * (directLight + indirectLight)), diffuse.a);
+-        result += reflection;
+-        result += refraction;
+-        result += transparent;
+-        return float4(result, 1.0f);
++        return float4(saturate(directLight), 1.0f);
+     }
+     else {
+-        return LinearToSrgb(float4(diffuse.rgb, 1.0f));
++        return float4(1.0f, 1.0f, 1.0f, 1.0f);
+     }
+ }
+\ No newline at end of file
+diff --git a/src/shaders/PostProcessPS.hlsl b/src/shaders/PostProcessPS.hlsl
+index dd4396f..2788902 100644
+--- a/src/shaders/PostProcessPS.hlsl
++++ b/src/shaders/PostProcessPS.hlsl
+@@ -8,7 +8,10 @@
+ 
+ #include "shared/rt64_raytracing_params.h"
+ 
+-#define ENABLE_EXPOSURE_ADJUSTMENT
++// The exposure adjustment is off (OoT: Recompiled, patch 0005): the composite keeps the game's
++// own colors, and the adjustment scaled every pixel by the preset's exposure over a
++// luminance average no pass computes at these levels.
++// #define ENABLE_EXPOSURE_ADJUSTMENT
+ 
+ ConstantBuffer<RaytracingParams> RtParams : register(b0);
+ Texture2D<float4> gInput : register(t1);
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+index 0dbadcc..6676c39 100644
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -25,6 +25,7 @@
+ #include "Color.hlsli"
+ #include "FbRendererCommon.hlsli"
+ #include "FbRendererRT.hlsli"
++#include "BlueNoise.hlsli"
+ 
+ // The instance masks the renderer assigns (rt64_common.h): the same three bits, by the same names.
+ static const uint DepthRayQueryMask = 0x1;
+@@ -123,6 +124,11 @@ void PrimaryRayGen() {
+ 
+     gViewDirection[launchIndex] = float4(direction, 0.0f);
+     if (payload.instanceId >= 0) {
++        // A hit is lit by the passes: the diffuse alpha is what the composite reads to apply the
++        // direct light to the raster color (ComposePS.hlsl); a miss keeps alpha zero and the
++        // raster color comes back unchanged.
++        gDiffuse[launchIndex] = float4(SrgbToLinear(raster), 1.0f);
++
+         const float3 hitPosition = origin + direction * payload.hitDistance;
+         gShadingPosition[launchIndex] = float4(hitPosition, 1.0f);
+         gShadingNormal[launchIndex] = float4(payload.hitNormal, 0.0f);
+@@ -137,10 +143,74 @@ void PrimaryRayGen() {
+     }
+ }
+ 
+-// The four passes that arrive with phases 54 to 56. Their records exist in the binding table
+-// from the start, so dispatching them is already the shape it will keep.
++// An orthonormal pair around a direction, for the disc the soft shadow samples.
++void tangentFrame(float3 n, out float3 t, out float3 b) {
++    const float3 up = (abs(n.y) < 0.999f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
++    t = normalize(cross(up, n));
++    b = cross(n, t);
++}
++
++// THE SHADOW PASS (phase 54). One shadow ray per hit pixel toward a point on the sun's disc, and
++// the result written as a MULTIPLIER on the raster color, not as a light: the game lit the
++// surface with its ambient plus the sun times the cosine, and this is what remains of that with
++// the sun blocked, so the base stays the game's own vertex lighting (lighting-design.md, section
++// 3). A pixel the sun does not face keeps its color whatever the ray finds.
++static const float ShadowBiasBase = 0.5f;          // world units off the surface, Link is about 60
++static const float ShadowBiasPerUnit = 0.002f;     // more with distance, where the hit position is coarser
++
+ [shader("raygeneration")]
+-void DirectRayGen() { }
++void DirectRayGen() {
++    const uint2 launchIndex = DispatchRaysIndex().xy;
++    if (gInstanceId[launchIndex] < 0) {
++        return;
++    }
++
++    // The scene's directional light comes in the parameter block (rt64_framebuffer_renderer.cpp
++    // finds it among the game's own lights each frame); a scene without one has a zero color.
++    float3 factor = 1.0f;
++    const float3 sunColor = RtParams.sunColor.rgb;
++    if (any(sunColor > 0.0f)) {
++        const float3 position = gShadingPosition[launchIndex].xyz;
++        const float3 normal = gShadingNormal[launchIndex].xyz;
++        const float3 toSun = RtParams.sunDirection.xyz;
++        const float ndl = saturate(dot(normal, toSun));
++        if (ndl > 0.0f) {
++            // One point on the disc per pixel per frame, placed by the blue noise so neighbors
++            // and frames differ; the penumbra is the disc's angular radius. Phase 57 accumulates
++            // the frames.
++            const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount);
++            const float angularRadius = RtParams.sunDirection.w;
++            const float angle = 6.28318531f * noise.x;
++            const float radius = sqrt(noise.y) * angularRadius;
++            float3 tangent;
++            float3 bitangent;
++            tangentFrame(toSun, tangent, bitangent);
++            const float3 direction = normalize(toSun + tangent * (radius * cos(angle)) + bitangent * (radius * sin(angle)));
++
++            RayDesc ray;
++            ray.Origin = position + normal * (ShadowBiasBase + ShadowBiasPerUnit * length(position - eyePosition()));
++            ray.Direction = direction;
++            ray.TMin = 0.0f;
++            ray.TMax = 1.0e6f;
++
++            ShadowPayload payload;
++            payload.visibility = 1.0f;
++            TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, DepthRayQueryMask, 1, 0, 1, ray, payload);
++
++            const float3 ambient = RtParams.ambientBaseColor.rgb;
++            const float3 lit = ambient + sunColor * ndl;
++            const float3 shaded = ambient + sunColor * (ndl * payload.visibility);
++            factor.x = (lit.x > 1.0e-4f) ? (shaded.x / lit.x) : 1.0f;
++            factor.y = (lit.y > 1.0e-4f) ? (shaded.y / lit.y) : 1.0f;
++            factor.z = (lit.z > 1.0e-4f) ? (shaded.z / lit.z) : 1.0f;
++        }
++    }
++
++    gDirectLightAccum[launchIndex] = float4(factor, 1.0f);
++}
++
++// The three passes that arrive with phases 55 and 56. Their records exist in the binding table
++// from the start, so dispatching them is already the shape it will keep.
+ 
+ [shader("raygeneration")]
+ void IndirectRayGen() { }
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+index 12d77e7..d4aaad7 100644
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -67,6 +67,18 @@ namespace interop {
+         uint interleavedRastersCount;
+         VisualizationMode visualizationMode;
+ 
++        // The scene's directional light for the passes (OoT: Recompiled, patch 0005): the
++        // direction toward it with its angular radius in w, and its color, zero when the
++        // scene has none. Found from the game's own lights each frame (rt64_framebuffer_renderer).
++        // The three words of padding are the shader's: it aligns a float4 to sixteen bytes and
++        // the CPU side's float4 does not, so without them the CPU packs the sun eight bytes
++        // early and the passes read its color as zero.
++        uint sunPadding0;
++        uint sunPadding1;
++        uint sunPadding2;
++        float4 sunDirection;
++        float4 sunColor;
++
+ #   ifdef HLSL_CPU
+         RaytracingParams() {
+             view = FLOAT4X4_IDENTITY;

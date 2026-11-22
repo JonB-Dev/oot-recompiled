@@ -1,0 +1,483 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 13:09:15 -0400
+Subject: [PATCH] A window is a light
+
+Patch 0030 of the renderer series (OoT: Recompiled).
+
+The Temple of Time's windows are glass painted on its walls, not openings, so no traced sun can
+come through them and the hall below was lit as though they were stone. The user, 2026-10-08:
+"the windows in the Temple of Time ... to be actual light sources that cast shadows per window
+across the room, and that would allow those to actually accurately behave like a window".
+
+The texture cache now also measures each texture's brightness and contrast as it is queued, and
+keeps whether it is a bright lattice: a mean brightness of at least 0.6 and a spread of at least
+0.25. The Temple of Time's lattice glass reads 0.71 and 0.33; its stone, as bright, spreads only
+about 0.1. Where the program says a place's windows give light (a new RaytracingEnvironment
+field, set from the game's scene), each upright, flat draw of a bright lattice at least 60 units
+each way becomes a window light: daylight falling into the room through that rectangle, inward
+and down at about 53 degrees below level. Inward is the side the eye is on.
+
+The local lights pass lights a surface where the light, followed back up its direction, comes
+through the glass, with shadow rays back out the same way, so a pillar between a window and the
+floor shadows the floor in the window's own shape, one shadow per window. The edge of the light
+softens with the distance it fell. The air's glow leaves windows out. Windows share the eight
+places after the game's lights with the beams of patch 0029, and are never merged with each
+other or with a beam.
+
+Rung 37 leaves the windows dark as well as the beams.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -453,9 +453,162 @@ namespace RT64 {
+         return true;
+     }
+ 
++    // A LATTICE WINDOW IS A LIGHT (patch 0030). The Temple of Time's windows are glass painted on
++    // its walls, not openings, so no traced sun can come through them, and the hall below them was
++    // lit as though they were stone (the user, 2026-10-08: "the windows in the Temple of Time ...
++    // to be actual light sources that cast shadows per window across the room"). Where the game
++    // says a place's windows give light (RaytracingEnvironment::windowLights), each upright, flat
++    // draw of a bright lattice texture (textureIsBrightLattice) becomes daylight falling into the
++    // room through that rectangle: inward and down at a fixed slope, lighting only what the window
++    // can see along it, with shadow rays back out through the glass, so every pillar casts its own
++    // shadow from every window. Inward is the side the eye is on, because the windows are seen
++    // from inside.
++    static const float WindowMinSize = 60.0f;          // world units across, each way
++    static const float WindowMaxTilt = 0.25f;          // how far from upright its plane may lean (the normal's up share)
++    static const float WindowFlatness = 0.02f;         // the variance off its plane against the smaller one in it
++    static const float WindowLightDrop = 0.8f;         // the downward share of the light's direction: about 53 degrees below level
++    static const float WindowReach = 3000.0f;          // world units the light travels from the glass
++    static const float WindowStrength = 0.9f;
++    static const uint32_t WindowLightBit = 16u;        // the group bit the shaders read as a window (Raytracing.hlsl)
++
++    // The distinct world positions of a draw's vertices, as beamFromDraw reads them.
++    static uint32_t drawWorldPoints(const DrawData &drawData, const GameCall &call, hlslpp::float3 *points, uint32_t maxPoints) {
++        const uint32_t triangleCount = call.callDesc.triangleCount;
++        const uint32_t start = call.meshDesc.faceIndicesStart;
++        if ((start + triangleCount * 3) > drawData.faceIndices.size()) {
++            return 0;
++        }
++
++        uint32_t indices[MaxBeamTriangles * 3];
++        uint32_t count = 0;
++        for (uint32_t i = 0; (i < (triangleCount * 3)) && (count < maxPoints) && (count < (MaxBeamTriangles * 3)); i++) {
++            const uint32_t v = drawData.faceIndices[start + i];
++            if (std::find(indices, indices + count, v) == (indices + count)) {
++                indices[count++] = v;
++            }
++        }
++
++        for (uint32_t i = 0; i < count; i++) {
++            const uint32_t v = indices[i];
++            if ((v >= drawData.worldIndices.size()) || (((v + 1) * 3) > drawData.posFloats.size())) {
++                return 0;
++            }
++
++            const uint16_t transformIndex = drawData.worldIndices[v];
++            if (transformIndex >= drawData.worldTransforms.size()) {
++                return 0;
++            }
++
++            const hlslpp::float4 local(drawData.posFloats[v * 3 + 0], drawData.posFloats[v * 3 + 1], drawData.posFloats[v * 3 + 2], 1.0f);
++            const hlslpp::float4x4 worldMatrix = drawData.worldTransforms[transformIndex];
++            const hlslpp::float4 world = hlslpp::mul(local, worldMatrix);
++            points[i] = world.xyz;
++        }
++
++        return count;
++    }
++
++    static bool windowFromDraw(const DrawData &drawData, const GameCall &call, const hlslpp::float3 &eye, interop::PointLight &window) {
++        if ((call.callDesc.triangleCount < 1) || (call.callDesc.triangleCount > 16)) {
++            return false;
++        }
++
++        hlslpp::float3 points[48];
++        const uint32_t count = drawWorldPoints(drawData, call, points, 48);
++        if (count < 3) {
++            return false;
++        }
++
++        hlslpp::float3 mean(0.0f, 0.0f, 0.0f);
++        for (uint32_t i = 0; i < count; i++) {
++            mean += points[i];
++        }
++        mean /= float(count);
++
++        float covariance[3][3] = {};
++        for (uint32_t i = 0; i < count; i++) {
++            const hlslpp::float3 d = points[i] - mean;
++            const float dx = float(d.x);
++            const float dy = float(d.y);
++            const float dz = float(d.z);
++            covariance[0][0] += dx * dx; covariance[0][1] += dx * dy; covariance[0][2] += dx * dz;
++            covariance[1][1] += dy * dy; covariance[1][2] += dy * dz; covariance[2][2] += dz * dz;
++        }
++        covariance[1][0] = covariance[0][1];
++        covariance[2][0] = covariance[0][2];
++        covariance[2][1] = covariance[1][2];
++
++        float values[3];
++        float vectors[3][3];
++        symmetricEigen3(covariance, values, vectors);
++        if ((values[1] <= 0.0f) || (values[2] > (WindowFlatness * values[1]))) {
++            return false;
++        }
++
++        // The plane's normal, made level and turned to the side the eye is on.
++        hlslpp::float3 normal(vectors[0][2], vectors[1][2], vectors[2][2]);
++        if (std::abs(float(normal.y)) > WindowMaxTilt) {
++            return false;
++        }
++
++        normal = hlslpp::float3(float(normal.x), 0.0f, float(normal.z));
++        if (float(hlslpp::length(normal)) < 1e-4f) {
++            return false;
++        }
++
++        normal = hlslpp::normalize(normal);
++        if (float(hlslpp::dot(eye - mean, normal)) < 0.0f) {
++            normal = -normal;
++        }
++
++        const hlslpp::float3 up(0.0f, 1.0f, 0.0f);
++        const hlslpp::float3 across = hlslpp::normalize(hlslpp::cross(up, normal));
++        float acrossMin = 1e30f, acrossMax = -1e30f, upMin = 1e30f, upMax = -1e30f;
++        for (uint32_t i = 0; i < count; i++) {
++            const hlslpp::float3 d = points[i] - mean;
++            const float a = float(hlslpp::dot(d, across));
++            const float u = float(d.y);
++            acrossMin = std::min(acrossMin, a);
++            acrossMax = std::max(acrossMax, a);
++            upMin = std::min(upMin, u);
++            upMax = std::max(upMax, u);
++        }
++
++        if (((acrossMax - acrossMin) < WindowMinSize) || ((upMax - upMin) < WindowMinSize)) {
++            return false;
++        }
++
++        const hlslpp::float3 center = mean + across * (0.5f * (acrossMin + acrossMax)) + up * (0.5f * (upMin + upMax));
++        const float level = std::sqrt(1.0f - WindowLightDrop * WindowLightDrop);
++        const hlslpp::float3 falls = hlslpp::normalize(normal * level - up * WindowLightDrop);
++
++        window = {};
++        window.position = interop::float3(center);
++        window.direction = interop::float3(falls);
++        // Daylight through white glass, a touch warm.
++        window.diffuseColor = interop::float3(hlslpp::float3(1.0f, 0.96f, 0.88f) * WindowStrength);
++        // The fields a window uses, named for a point light's: the glass's inward normal in the
++        // specular color, its half width and half height in the point radius and the spot's
++        // maximum, how far its light travels in the exponent.
++        window.specularColor = interop::float3(normal);
++        window.pointRadius = 0.5f * (acrossMax - acrossMin);
++        window.spotMaxCosine = 0.5f * (upMax - upMin);
++        window.spotFalloffCosine = 0.0f;
++        window.attenuationExponent = WindowReach;
++        window.attenuationRadius = WindowReach;
++        window.shadowOffset = 0.0f;
++        window.flickerIntensity = 0.0f;
++        window.groupBits = WindowLightBit | 4u;
++        return true;
++    }
++
+     // One light per shaft: a shaft drawn in layers (an inner and an outer cylinder) is one beam.
+     static void addBeam(std::vector<interop::PointLight> &beams, const interop::PointLight &beam) {
+         for (interop::PointLight &existing : beams) {
++            if ((existing.groupBits & WindowLightBit) != 0u) {   // a window is never part of a shaft (patch 0030)
++                continue;
++            }
++
+             const float reach = std::max(std::max(existing.pointRadius, existing.spotMaxCosine), std::max(beam.pointRadius, beam.spotMaxCosine));
+             const hlslpp::float3 existingPosition = existing.position;
+             const hlslpp::float3 beamPosition = beam.position;
+@@ -478,6 +631,22 @@ namespace RT64 {
+             beams.push_back(beam);
+         }
+     }
++
++    // One light per window (patch 0030), however many times the same glass is drawn; neighboring
++    // windows stay apart, each with its own shadows.
++    static void addWindow(std::vector<interop::PointLight> &lights, const interop::PointLight &window) {
++        const hlslpp::float3 position = window.position;
++        for (const interop::PointLight &existing : lights) {
++            const hlslpp::float3 existingPosition = existing.position;
++            if (((existing.groupBits & WindowLightBit) != 0u) && (float(hlslpp::length(existingPosition - position)) < 1.0f)) {
++                return;
++            }
++        }
++
++        if (lights.size() < MaxBeamLights) {
++            lights.push_back(window);
++        }
++    }
+ #   endif
+ 
+     // RasterScene
+@@ -2403,6 +2572,24 @@ namespace RT64 {
+                             }
+                         }
+ 
++                        // A LATTICE WINDOW BECOMES A LIGHT (patch 0030, above windowFromDraw),
++                        // where the game says this place's windows give light. Only a draw the
++                        // traced scene takes as a surface, so the glass is solid to the rays the
++                        // way the wall around it is.
++                        if (rtExternalEnvironment.windowLights && !wasTranslucent && (otherMode.zCmp() || otherMode.zUpd()) && (cutoutRule != 37) &&
++                            (call.callDesc.tileCount > 0) && (beamLights.size() < MaxBeamLights)) {
++                            const DrawCallTile &windowTile = drawData.callTiles[call.callDesc.tileIndex];
++                            if (windowTile.valid && !windowTile.tileCopyUsed && textureIsBrightLattice(windowTile.tmemHashOrID)) {
++                                const hlslpp::float4x4 view = drawData.modViewTransforms[proj.transformsIndex];
++                                const hlslpp::float4 eyePoint = hlslpp::mul(hlslpp::float4(0.0f, 0.0f, 0.0f, 1.0f), hlslpp::inverse(view));
++                                const hlslpp::float3 eye = eyePoint.xyz;
++                                interop::PointLight window;
++                                if (windowFromDraw(drawData, call, eye, window)) {
++                                    addWindow(beamLights, window);
++                                }
++                            }
++                        }
++
+                         const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart *IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, false);
+                         rtResources->addBottomLevelASMesh(asMesh);
+ 
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -126,6 +126,9 @@ namespace RT64 {
+         // Whether that answer could be read at all. False leaves the sniff in charge, so nothing
+         // is worse than it was before this was published.
+         bool sunShadowsKnown = false;
++        // Whether this place's lattice windows give light (patch 0030): the game says so for a
++        // scene whose windows are glass painted on the wall, where no sun can come through.
++        bool windowLights = false;
+         bool valid = false;
+     };
+ 
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -6,6 +6,8 @@
+ // Patch 0025: the resizer the Texture detail row reads a PNG replacement through.
+ #define STB_IMAGE_RESIZE_IMPLEMENTATION
+ 
++#include <cmath>   // patch 0030
++
+ #include "ddspp/ddspp.h"
+ #include "stb/stb_image.h"
+ #include "stb/stb_image_resize2.h"
+@@ -1407,6 +1409,84 @@ namespace RT64 {
+         return ((partial * 10U) <= total) ? TextureAlphaKind::Cutout : TextureAlphaKind::Fade;
+     }
+ 
++    // THE BRIGHT LATTICES, BY HASH (patch 0030): the textures that are glass crossed by dark lines.
++    // Kept apart from the alpha kinds so neither answer changes the other.
++    static std::mutex textureLatticeMutex;
++    static std::unordered_map<uint64_t, bool> textureLattices;
++
++    bool textureIsBrightLattice(uint64_t hash) {
++        std::scoped_lock lock(textureLatticeMutex);
++        const auto it = textureLattices.find(hash);
++        return (it != textureLattices.end()) && it->second;
++    }
++
++    // Bright on average and high in contrast throughout: the mean brightness at least 0.6 and its
++    // spread at least 0.25. The measure comes from the Temple of Time, whose lattice glass reads
++    // 0.71 and 0.33 while its wall and pillar stone, as bright, spreads only about 0.1. A checkered
++    // floor passes too; the renderer takes only upright surfaces as windows. Reads texture memory
++    // the way classifyTextureAlpha does; a paletted texture or a format it does not read is never
++    // a lattice.
++    static bool classifyTextureLattice(const uint8_t *TMEM, int width, int height, uint32_t tlut, const LoadTile &loadTile) {
++        if ((width <= 0) || (height <= 0) || (width > 1024) || (height > 1024) || (tlut > 0)) {
++            return false;
++        }
++
++        const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
++        const uint32_t tmemMask = RGBA32 ? 2047U : 4095U;
++        const uint32_t rowBytes = uint32_t(loadTile.line) << 3;
++        const uint32_t base = uint32_t(loadTile.tmem) << 3;
++        auto byteAt = [&](uint32_t row, uint32_t offset, uint32_t half) -> uint8_t {
++            uint32_t address = (base + row * rowBytes + offset) & tmemMask;
++            if (row & 1) {
++                address ^= 4;
++            }
++
++            return TMEM[(address & tmemMask) | half];
++        };
++
++        double sum = 0.0;
++        double sumSquares = 0.0;
++        for (uint32_t y = 0; y < uint32_t(height); y++) {
++            for (uint32_t x = 0; x < uint32_t(width); x++) {
++                float luminance = 0.0f;
++                if ((loadTile.siz == G_IM_SIZ_16b) && (loadTile.fmt == G_IM_FMT_RGBA)) {
++                    const uint32_t high = byteAt(y, x * 2, 0);
++                    const uint32_t low = byteAt(y, x * 2 + 1, 0);
++                    const float r = float(high >> 3) / 31.0f;
++                    const float g = float(((high & 7U) << 2) | (low >> 6)) / 31.0f;
++                    const float b = float((low >> 1) & 31U) / 31.0f;
++                    luminance = 0.299f * r + 0.587f * g + 0.114f * b;
++                }
++                else if (RGBA32) {
++                    const float r = float(byteAt(y, x * 2, 0)) / 255.0f;
++                    const float g = float(byteAt(y, x * 2 + 1, 0)) / 255.0f;
++                    const float b = float(byteAt(y, x * 2, 2048U)) / 255.0f;
++                    luminance = 0.299f * r + 0.587f * g + 0.114f * b;
++                }
++                else if ((loadTile.siz == G_IM_SIZ_16b) && (loadTile.fmt == G_IM_FMT_IA)) {
++                    luminance = float(byteAt(y, x * 2, 0)) / 255.0f;
++                }
++                else if ((loadTile.siz == G_IM_SIZ_8b) && (loadTile.fmt == G_IM_FMT_IA)) {
++                    luminance = float(byteAt(y, x, 0) >> 4) / 15.0f;
++                }
++                else if ((loadTile.siz == G_IM_SIZ_8b) && (loadTile.fmt == G_IM_FMT_I)) {
++                    luminance = float(byteAt(y, x, 0)) / 255.0f;
++                }
++                else {
++                    return false;
++                }
++
++                sum += luminance;
++                sumSquares += double(luminance) * double(luminance);
++            }
++        }
++
++        const double count = double(width) * double(height);
++        const double mean = sum / count;
++        const double spread = std::sqrt(std::max(sumSquares / count - mean * mean, 0.0));
++        return (mean >= 0.6) && (spread >= 0.25);
++    }
++
+     void TextureCache::queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM) {
+         assert(!decodeTMEM || ((width > 0) && (height > 0)));
+ 
+@@ -1417,6 +1497,13 @@ namespace RT64 {
+             textureAlphaKinds[hash] = alphaKind;
+         }
+ 
++        // Patch 0030: whether it is a bright lattice, the same way.
++        if (decodeTMEM && (bytes != nullptr) && (bytesCount >= 4096)) {
++            const bool lattice = classifyTextureLattice(bytes, width, height, tlut, loadTile);
++            std::scoped_lock lock(textureLatticeMutex);
++            textureLattices[hash] = lattice;
++        }
++
+         TextureUpload newUpload;
+         newUpload.hash = hash;
+         newUpload.creationFrame = creationFrame;
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -56,6 +56,11 @@ namespace RT64 {
+     // Unknown until the texture's memory has been seen. Any thread.
+     TextureAlphaKind textureAlphaKind(uint64_t hash);
+ 
++    // Whether a texture is bright glass crossed by dark lines (patch 0030): bright on average and
++    // high in contrast throughout, the way a lattice window is and a wall's stone is not. False
++    // until the texture's memory has been seen, and for a format the measure does not read.
++    bool textureIsBrightLattice(uint64_t hash);
++
+     struct TextureUpload {
+         uint64_t hash;
+         uint64_t creationFrame;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -602,6 +602,76 @@ void beamLight(PointLight light, float3 position, float3 normal, float biasBase,
+     sumUnblocked += light.diffuseColor * weight;
+ }
+ 
++// A WINDOW (patch 0030): daylight falling into a room through a rectangle of glass the game
++// paints on its wall, found on the CPU (rt64_framebuffer_renderer.cpp, windowFromDraw). Its
++// fields, named for a point light's: position the middle of the glass, direction the way the
++// light falls (inward and down), the glass's inward normal in the specular color, its half width
++// and half height in the point radius and the spot's maximum, its reach in the exponent. A
++// surface is lit where the light, followed back up its direction, comes through the glass; its
++// shadow rays go back out the same way, so a pillar between a window and the floor shadows the
++// floor in the window's own shape.
++static const uint WindowLightBit = 16u;
++static const float WindowClearance = 12.0f;   // world units before the glass the shadow rays stop, so the wall the glass is painted on cannot block it
++static const float WindowEdge = 0.02f;        // the edge of a window's light softens by this share of the distance it fell
++static const float WindowSpread = 0.015f;     // how far its shadow rays lean, so its shadows soften with distance
++
++void windowLight(PointLight light, float3 position, float3 normal, float biasBase, uint2 launchIndex, uint lightIndex, uint lightSamples,
++                 inout float3 sum, inout float3 sumUnblocked) {
++    const float3 falls = light.direction;
++    const float3 inward = light.specularColor;
++    const float inside = dot(position - light.position, inward);
++    if (inside <= 0.0f) {
++        return;
++    }
++
++    // Back up the light to the plane of the glass.
++    const float approach = dot(falls, inward);
++    if (approach <= 0.0f) {
++        return;
++    }
++
++    const float travel = inside / approach;
++    if (travel >= light.attenuationExponent) {
++        return;
++    }
++
++    const float3 onGlass = position - falls * travel;
++    const float3 across = normalize(cross(float3(0.0f, 1.0f, 0.0f), inward));
++    const float3 offset = onGlass - light.position;
++    const float edge = WindowEdge * travel + 2.0f;
++    const float acrossShare = 1.0f - smoothstep(light.pointRadius - edge, light.pointRadius + edge, abs(dot(offset, across)));
++    const float upShare = 1.0f - smoothstep(light.spotMaxCosine - edge, light.spotMaxCosine + edge, abs(offset.y));
++    const float3 toLight = -falls;
++    const float ndl = saturate(dot(normal, toLight));
++    const float fade = 1.0f - smoothstep(light.attenuationExponent * 0.7f, light.attenuationExponent, travel);
++    const float weight = acrossShare * upShare * ndl * fade;
++    if (weight <= 0.0f) {
++        return;
++    }
++
++    float3 tangent;
++    float3 bitangent;
++    tangentFrame(toLight, tangent, bitangent);
++    const float3 shadowOrigin = position + normal * (biasBase * (1.0f + 2.0f / max(ndl, 0.25f)));
++    const float tMax = max(travel - WindowClearance, 0.0f);
++    float hitDistance;
++    float blocked = 0.0f;
++    for (uint ls = 0; ls < lightSamples; ls++) {
++        const float3 noise = getBlueNoise(gBlueNoise, launchIndex, FrParams.frameCount + 17u + ls * 31u + lightIndex * 7u);
++        const float angle = 6.28318531f * noise.x;
++        const float spread = sqrt(noise.y) * WindowSpread;
++        const float3 rayDirection = normalize(toLight + tangent * (spread * cos(angle)) + bitangent * (spread * sin(angle)));
++        const float sample = (tMax > LocalBlockerSkip)
++            ? traceVisibilityRange(shadowOrigin, rayDirection, LocalBlockerSkip, tMax, hitDistance)
++            : 1.0f;
++        blocked += 1.0f - sample;
++    }
++
++    const float visibility = 1.0f - (blocked / float(lightSamples));
++    sum += light.diffuseColor * (weight * visibility);
++    sumUnblocked += light.diffuseColor * weight;
++}
++
+ [shader("raygeneration")]
+ void LightsRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+@@ -649,6 +719,11 @@ void LightsRayGen() {
+             continue;
+         }
+ 
++        if ((light.groupBits & WindowLightBit) != 0u) {   // daylight through glass (patch 0030)
++            windowLight(light, position, normal, biasBase, launchIndex, i, lightSamples, sum, sumUnblocked);
++            continue;
++        }
++
+         const float3 toLight = light.position - position;
+         const float distance2 = dot(toLight, toLight);
+         // The reach control (patch 0008) scales the game's own radius.
+@@ -1353,7 +1428,7 @@ void ScatterRayGen() {
+         if ((lightGlow > 0.0f) && (RtParams.tuneExperiment.x != 4.0f)) {   // the Experiment row: 4 is the glow off
+             for (uint i = 0; i < lights; i++) {
+                 const PointLight light = SceneLights[i];
+-                if ((light.groupBits & BeamLightBit) != 0u) {   // a beam's glow is the shaft the game draws (patch 0029)
++                if ((light.groupBits & (BeamLightBit | WindowLightBit)) != 0u) {   // a beam's glow is the shaft the game draws (patch 0029); a window's is the glass (0030)
+                     continue;
+                 }
+ 

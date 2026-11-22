@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 20:35:00 +0100
+Subject: [PATCH] The water probe is exempt from the water rule
+
+Patch 0020 of the renderer series (OoT: Recompiled).
+
+Patch 0019 gave the shadows the user wanted and left the reflections still missing. The fault is
+in that patch and is exact: the pass-through it adds for water lives in SurfaceAnyHit, and the
+water probe uses that same hit group. So a rule written to stop the GATHERING rays halting at
+water also stopped the one ray that has to see it. Water went invisible to everything.
+
+The probe now marks its own payload with a negative coverage before tracing, and the any hit
+honors the mark. The probe never reads that field back, nothing writes it during traversal, and
+no real coverage is ever negative, so it cannot be mistaken for one.
+
+The shadows from 0019 are deliberately unchanged. The user settled that question while this was
+being written: "honestly i dont even feel like water needs to have surface shadow. iot looks odd
+because the lack of reflection".
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -287,7 +287,15 @@ void PrimaryRayGen() {
+         water.hitNormal = 0.0f;
+         water.shadedColor = 0.0f;
+         water.hitVelocity = 0.0f;
+-        water.coverage = 1.0f;
++        // THE PROBE MARKS ITSELF (patch 0020). The water pass-through added for the foliage work
++        // lives in SurfaceAnyHit, and this probe uses that same hit group, so the rule meant to
++        // stop the GATHERING rays halting at water also stopped this one seeing it, which is the
++        // single ray that has to. Water went invisible to everything and the reflections with it.
++        //
++        // A negative coverage is the mark. The probe never reads the field back (it takes the
++        // normal and the distance), nothing writes it during traversal, and no real coverage is
++        // ever below zero, so it cannot be confused with one.
++        water.coverage = -1.0f;
+         // REFLECTION CANDIDATE B (patch 0018, rungs 28 and 29): the PROBE looks wider, rather than
+         // any instance's mask changing. Water carries the depth mask now that the foliage rule
+         // classifies it as solid, so a probe that also traces depth finds it again, and no tree's
+@@ -1554,7 +1562,8 @@ void SurfaceAnyHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionA
+     // classified. A horizontal face of a depthless translucent draw is passed through exactly as
+     // it was before the foliage work, so the primary reaches the bed, the shadow lands on the bed,
+     // and the probe finds the water in front of it. A vertical one is foliage and is unaffected.
+-    if (hitIsWaterLike(InstanceID(), PrimitiveIndex()) && (RtParams.tuneExperiment.x == 30.0f)) {
++    if ((payload.coverage >= 0.0f) && hitIsWaterLike(InstanceID(), PrimitiveIndex()) &&
++        (RtParams.tuneExperiment.x == 30.0f)) {
+         IgnoreHit();
+         return;
+     }

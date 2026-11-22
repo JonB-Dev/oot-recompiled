@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Fri, 9 Oct 2026 12:45:00 -0400
+Subject: [PATCH] The video recorder's picture, drawn again at a size of its own
+
+Patch 0053 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-09, of the program's new MP4 recorder: "choose the output resolution", and "use
+4K for the output of the recording while still allowing me to play it at my resolution".
+
+Two hooks beside the draw hook (rt64_render_hooks): a size hook, asked once per presented frame
+with the window's size, and a picture hook. When the size hook answers with a size, the present
+draws the VI pass a second time into a B8G8R8A8_UNORM target of that size (pictureTexture, kept
+while the size holds and given back after 600 presents without a picture), with no panel inset and
+nothing drawn over it, moves it to COPY_SOURCE and hands it to the picture hook, then sets the swap
+chain's framebuffer back for the draw hook. The picture is the window's: the same crop, gamma and
+fit, from the game's own render target, so it may be larger than the window.
+
+VIRenderer::RenderParams gains targetWidth and targetHeight (0 is the swap chain, as before), and
+getViewportAndScissor a second form that takes a named target size in place of the swap chain's;
+the first form forwards to it. Declared as a second form, and the hooks' code placed beside the
+other hooks rather than at the end of the file, so that no hunk touches a file's last line: those
+lines have no line ending, and git's line ending conversion of the series would break such a hunk.
+
+diff --git a/src/rhi/rt64_render_hooks.h b/src/rhi/rt64_render_hooks.h
+--- a/src/rhi/rt64_render_hooks.h
++++ b/src/rhi/rt64_render_hooks.h
+@@ -16,4 +16,17 @@ namespace RT64 {
+     RenderHookDeinit *GetRenderHookDeinit();
+ 
+     void SetRenderHooks(RenderHookInit *init, RenderHookDraw *draw, RenderHookDeinit *deinit);
++
++    // THE GAME'S PICTURE AT A SIZE OF THE PROGRAM'S CHOOSING (patch 0053, OoT: Recompiled, for its
++    // video recorder). Once per presented frame that has a picture, the present asks the size hook
++    // whether a picture is wanted, telling it the window's size. When it answers yes, with a size,
++    // the present draws the VI pass a second time into a B8G8R8A8_UNORM target of that size (the
++    // same crop, gamma and fit as the window gets, with no panel inset and nothing drawn over it)
++    // and hands that target to the picture hook in COPY_SOURCE, where it must be left. The size
++    // may be larger than the window: the picture is drawn from the game's own render target.
++    using RenderHookPictureSize = bool(uint32_t windowWidth, uint32_t windowHeight, uint32_t *width, uint32_t *height);
++    using RenderHookPicture = void(RenderCommandList *list, RenderTexture *picture, uint32_t width, uint32_t height);
++    RenderHookPictureSize *GetRenderHookPictureSize();
++    RenderHookPicture *GetRenderHookPicture();
++    void SetRenderHookPicture(RenderHookPictureSize *size, RenderHookPicture *picture);
+ };
+diff --git a/src/rhi/rt64_render_hooks.cpp b/src/rhi/rt64_render_hooks.cpp
+--- a/src/rhi/rt64_render_hooks.cpp
++++ b/src/rhi/rt64_render_hooks.cpp
+@@ -9,6 +9,23 @@ namespace RT64 {
+     static RenderHookDraw *draw = nullptr;
+     static RenderHookDeinit *deinit = nullptr;
+ 
++    // Patch 0053.
++    static RenderHookPictureSize *pictureSize = nullptr;
++    static RenderHookPicture *picture = nullptr;
++
++    RenderHookPictureSize *GetRenderHookPictureSize() {
++        return pictureSize;
++    }
++
++    RenderHookPicture *GetRenderHookPicture() {
++        return picture;
++    }
++
++    void SetRenderHookPicture(RenderHookPictureSize *pictureSize_, RenderHookPicture *picture_) {
++        pictureSize = pictureSize_;
++        picture = picture_;
++    }
++
+     RenderHookInit *GetRenderHookInit() {
+         return init;
+     }
+diff --git a/src/render/rt64_vi_renderer.h b/src/render/rt64_vi_renderer.h
+--- a/src/render/rt64_vi_renderer.h
++++ b/src/render/rt64_vi_renderer.h
+@@ -31,8 +31,13 @@ namespace RT64 {
+             bool removeBlackBorders = false;
+             uint32_t insetLeft = 0;    // patch 0008: pixels of the window held by the interface at the left
+             uint32_t insetRight = 0;   // and at the right; the picture is scaled into what is left
++            uint32_t targetWidth = 0;  // patch 0053: the size of the target drawn into, when it is not
++            uint32_t targetHeight = 0; // the swap chain (the video recorder's picture); 0 is the swap chain
+         };
+ 
++        // Patch 0053: the same, fitted to a named target of its own size rather than the swap chain.
++        static void getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor, uint32_t insetLeft, uint32_t insetRight, uint32_t targetWidth, uint32_t targetHeight);
++
+         VIRenderer();
+         ~VIRenderer();
+         void render(const RenderParams &p);
+diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
+--- a/src/render/rt64_vi_renderer.cpp
++++ b/src/render/rt64_vi_renderer.cpp
+@@ -69,7 +69,7 @@ namespace RT64 {
+ 
+         RenderViewport viewport;
+         RenderRect scissor;
+-        getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, p.removeBlackBorders, viewport, scissor, p.insetLeft, p.insetRight);
++        getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, p.removeBlackBorders, viewport, scissor, p.insetLeft, p.insetRight, p.targetWidth, p.targetHeight);
+         p.commandList->setViewports(viewport);
+         p.commandList->setScissors(scissor);
+ 
+@@ -87,6 +87,10 @@ namespace RT64 {
+     }
+ 
+     void VIRenderer::getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor, uint32_t insetLeft, uint32_t insetRight) {
++        getViewportAndScissor(swapChain, vi, resolutionScale, downsamplingScale, removeBlackBorders, viewport, scissor, insetLeft, insetRight, 0, 0);
++    }
++
++    void VIRenderer::getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor, uint32_t insetLeft, uint32_t insetRight, uint32_t targetWidth, uint32_t targetHeight) {
+         // We define three different coordinate spaces to work with to translate the VI parameters into the Window.
+         //
+         // VideoSD: This corresponds to the SD TV Scanline space, which is what the VI natively works on.
+@@ -102,7 +106,12 @@ namespace RT64 {
+         // specified by the VI.
+         const hlslpp::float2 sdSize = removeBlackBorders ? hlslpp::float2(vi.fbSize()) : hlslpp::float2(320.0f, 240.0f);
+         const hlslpp::float2 hdSize = computeHDSize(sdSize, resolutionScale, downsamplingScale);
+-        const hlslpp::float2 windowSize = { float(swapChain->getWidth()), float(swapChain->getHeight()) };
++        // THE TARGET IS THE SWAP CHAIN UNLESS ONE IS NAMED (OoT: Recompiled, patch 0053). The video
++        // recorder draws the same picture a second time into a target of its own size, which may be
++        // larger than the window: everything below is relative to this one size, so naming it is
++        // the whole change.
++        const bool namedTarget = (targetWidth > 0) && (targetHeight > 0);
++        const hlslpp::float2 windowSize = namedTarget ? hlslpp::float2(float(targetWidth), float(targetHeight)) : hlslpp::float2(float(swapChain->getWidth()), float(swapChain->getHeight()));
+ 
+         // Query the VI for the current rendering area.
+         hlslpp::float4 viViewRect = vi.viewRectangle() * sdSize.xyxy;
+diff --git a/src/hle/rt64_present_queue.h b/src/hle/rt64_present_queue.h
+--- a/src/hle/rt64_present_queue.h
++++ b/src/hle/rt64_present_queue.h
+@@ -52,6 +52,11 @@ namespace RT64 {
+         std::unique_ptr<RenderCommandSemaphore> acquiredSemaphore;
+         std::vector<std::unique_ptr<RenderCommandSemaphore>> drawSemaphores;
+         std::unique_ptr<VIRenderer> viRenderer;
++        std::unique_ptr<RenderTexture> pictureTexture;          // patch 0053: the video recorder's
++        std::unique_ptr<RenderFramebuffer> pictureFramebuffer;  // picture, at the recording's size
++        uint32_t pictureTextureWidth = 0;
++        uint32_t pictureTextureHeight = 0;
++        uint32_t pictureIdlePresents = 0;
+         std::unique_ptr<Inspector> inspector;
+         ProfilingTimer presentProfiler = ProfilingTimer(120);
+         Timestamp presentTimestamp;
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -350,6 +350,56 @@ namespace RT64 {
+                 if (renderParams.texture != nullptr) {
+                     commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
+                     viRenderer->render(renderParams);
++
++                    // THE VIDEO RECORDER'S PICTURE (OoT: Recompiled, patch 0053). The same VI pass
++                    // drawn a second time, into a target of the recording's size rather than the
++                    // window's, with no panel inset: the picture the window shows, at any size,
++                    // and nothing of the program's own interface in it.
++                    RenderHookPictureSize *pictureSizeHook = GetRenderHookPictureSize();
++                    RenderHookPicture *pictureHook = GetRenderHookPicture();
++                    uint32_t pictureWidth = 0;
++                    uint32_t pictureHeight = 0;
++                    if ((pictureSizeHook != nullptr) && (pictureHook != nullptr) &&
++                        pictureSizeHook(ext.swapChain->getWidth(), ext.swapChain->getHeight(), &pictureWidth, &pictureHeight) &&
++                        (pictureWidth > 0) && (pictureHeight > 0))
++                    {
++                        if ((pictureTexture == nullptr) || (pictureTextureWidth != pictureWidth) || (pictureTextureHeight != pictureHeight)) {
++                            pictureFramebuffer.reset();
++                            pictureTexture.reset();
++                            RenderClearValue clearValue = RenderClearValue::Color(RenderColor(), RenderFormat::B8G8R8A8_UNORM);
++                            pictureTexture = ext.device->createTexture(RenderTextureDesc::ColorTarget(pictureWidth, pictureHeight, RenderFormat::B8G8R8A8_UNORM, RenderMultisampling(), &clearValue));
++                            const RenderTexture *pictureTarget = pictureTexture.get();
++                            pictureFramebuffer = ext.device->createFramebuffer(RenderFramebufferDesc(&pictureTarget, 1));
++                            pictureTextureWidth = pictureWidth;
++                            pictureTextureHeight = pictureHeight;
++                        }
++
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(pictureTexture.get(), RenderTextureLayout::COLOR_WRITE));
++                        commandList->setFramebuffer(pictureFramebuffer.get());
++                        commandList->clearColor();
++
++                        VIRenderer::RenderParams pictureParams = renderParams;
++                        pictureParams.insetLeft = 0;
++                        pictureParams.insetRight = 0;
++                        pictureParams.targetWidth = pictureWidth;
++                        pictureParams.targetHeight = pictureHeight;
++                        viRenderer->render(pictureParams);
++
++                        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(pictureTexture.get(), RenderTextureLayout::COPY_SOURCE));
++                        pictureHook(commandList, pictureTexture.get(), pictureWidth, pictureHeight);
++
++                        // Back to the window for whatever is drawn over the picture next.
++                        commandList->setFramebuffer(swapChainFramebuffer);
++                        pictureIdlePresents = 0;
++                    }
++                    else if ((pictureTexture != nullptr) && (++pictureIdlePresents > 600)) {
++                        // Ten seconds at sixty without a picture wanted: the recording is over,
++                        // and a target that may be the size of a 4K frame is given back.
++                        pictureFramebuffer.reset();
++                        pictureTexture.reset();
++                        pictureTextureWidth = 0;
++                        pictureTextureHeight = 0;
++                    }
+                 }
+ 
+                 RenderHookDraw *drawHook = GetRenderHookDraw();

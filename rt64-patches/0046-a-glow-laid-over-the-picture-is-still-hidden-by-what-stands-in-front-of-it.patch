@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 17:28:32 -0400
+Subject: [PATCH] A glow laid over the picture is still hidden by what stands
+ in front of it
+
+Patch 0046 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, of Navi's core since patch 0028: "Link doesn't cover her. Or, you know, if
+she's behind something, it's not actually masking her. I need it to not be affected. I need her
+circle to not be affected by shadows. But, you know, obviously 3D objects like Link and you know,
+characters and stuff need to be able to mask her".
+
+The game draws Navi's core blended with no depth test at all, so on the console it shows through
+everything, and 0028, which moved it after the composite so the lighting could not touch it, kept
+that. A draw 0028 and 0040 take as an overlay is now rasterized with a depth test against the world
+drawn before it (Z_CMP set on the copy of its description the raster uses; it still writes no
+depth): still untouched by the lighting, but hidden wherever Link, a character or a wall stands in
+front of it.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2327,6 +2327,7 @@ namespace RT64 {
+ #           if RT_ENABLED
+                 tracedCall.type = InstanceDrawCall::Type::Unknown;   // set again only by a traced call (patch 0005)
+                 bool hideShaft = false;   // patch 0034: a drawn shaft the windows' light stands in for
++                bool overlayDepthTest = false;   // patch 0046: an overlay hidden behind what is in front of it
+ #           endif
+ 
+                 uint32_t cycleType = call.callDesc.otherMode.cycleType();
+@@ -2640,6 +2641,16 @@ namespace RT64 {
+                         if (otherMode.zUpd()) {
+                             worldDepthWritten = true;
+                         }
++                        // HIDDEN BEHIND WHAT STANDS IN FRONT OF IT (patch 0046, the user, 2026-10-08:
++                        // "Link doesn't cover her. Or ... if she's behind something, it's not
++                        // actually masking her ... I need her circle to not be affected by shadows.
++                        // But ... 3D objects like Link and ... characters and stuff need to be able
++                        // to mask her"). The game draws Navi's core with no depth test at all, so on
++                        // the console it shows through everything, and 0028 kept that. The overlay
++                        // is now drawn with a depth test against the world drawn before it (compare,
++                        // never write): still untouched by the lighting, but hidden where Link, a
++                        // character or a wall stands in front of it.
++                        overlayDepthTest = depthlessOverlay;
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+                         const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);
+                         if ((wasTranslucent && !solidDraw) || depthlessOverlay) {
+@@ -2774,18 +2785,26 @@ namespace RT64 {
+                     }
+ #               endif
+                     {
+-                        triangles.shaderDesc = call.shaderDesc;
++                        // The draw as it is rasterized: the game's own, but for an overlay that is
++                        // now depth tested (patch 0046).
++                        ShaderDescription drawDesc = call.shaderDesc;
++#                   if RT_ENABLED
++                        if (overlayDepthTest) {
++                            drawDesc.otherMode.L |= Z_CMP;
++                        }
++#                   endif
++                        triangles.shaderDesc = drawDesc;
+ 
+-                        RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
++                        RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(drawDesc);
+                         if (gpuShader != nullptr) {
+                             triangles.pipeline = gpuShader->pipeline.get();
+                         }
+                         else {
+-                            const bool copyMode = (call.shaderDesc.otherMode.cycleType() == G_CYC_COPY);
++                            const bool copyMode = (drawDesc.otherMode.cycleType() == G_CYC_COPY);
+                             triangles.pipeline = rasterShaderUber->getPipeline(
+-                                !copyMode && call.shaderDesc.otherMode.zCmp() && (call.shaderDesc.otherMode.zMode() != ZMODE_DEC),
+-                                !copyMode && call.shaderDesc.otherMode.zUpd(),
+-                                (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
++                                !copyMode && drawDesc.otherMode.zCmp() && (drawDesc.otherMode.zMode() != ZMODE_DEC),
++                                !copyMode && drawDesc.otherMode.zUpd(),
++                                (drawDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (drawDesc.otherMode.cvgDst() == CVG_DST_SAVE));
+                         }
+                         
+                         triangles.faceCount = call.callDesc.triangleCount;

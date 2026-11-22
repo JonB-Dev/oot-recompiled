@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 11:46:48 -0400
+Subject: [PATCH] A glow drawn over everything is not lit
+
+Patch 0028 of the renderer series (OoT: Recompiled).
+
+Navi's core, the bluish white body between her wings, is two quads of a glow texture that the
+game draws with G_RM_CLD_SURF2 when the fairy is Navi: no depth test, no depth write, blended
+over the framebuffer. Every other fairy uses the depth tested form, which is in the translucent
+z mode and is already kept out of the traced scene. Navi's form is in the solid z mode, so the
+sorting never saw it as translucent: it went into the traced scene and into the raster before
+the composite, and was multiplied by the shadow of whatever surface stood behind it. In the
+sun's shade her body dimmed and read as see-through, which the user reported on 2026-10-08 as
+"her light disappears around the actual light body".
+
+A draw that neither tests nor writes depth and reads the framebuffer to blend is an overlay laid
+on the picture, not a surface in it. It now takes the translucent mask, so it is drawn after the
+composite in its own color and alpha and traced by nothing. The game's choice of no depth test
+is kept, so she still shows through a wall as she does on the console. An inventory of every room
+in the game found no depthless draw, so the rule reaches only actors and effects drawn that way.
+
+Rung 36 puts the old sorting back for a side by side, and takes the cut-out quads of patch 0027
+like the default, so it differs from Off only in this.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1981,13 +1981,29 @@ namespace RT64 {
+                         // 0027): Off, the unrelated shader experiments 1 to 7, 25 (the rule that
+                         // won, which IS the default) and 30 to 34. The ladder's own historical
+                         // rules (8 to 24, 26 to 29) and 35 keep exactly what they did.
+-                        const bool defaultFamily = (cutoutRule < 8) || (cutoutRule == 25) || ((cutoutRule >= 30) && (cutoutRule <= 34));
++                        const bool defaultFamily = (cutoutRule < 8) || (cutoutRule == 25) || ((cutoutRule >= 30) && (cutoutRule <= 34)) ||
++                                                   (cutoutRule == 36);
+                         if (defaultFamily && cutoutQuad) {
+                             solidDraw = true;
+                         }
++                        // A BLENDED DRAW WITH NO DEPTH AT ALL IS AN OVERLAY (patch 0028). It
++                        // neither tests nor writes depth and reads the framebuffer to blend, so
++                        // it is a glow laid over the picture, not a surface in it. It is not in
++                        // the translucent z mode, though, so the rule above never saw it: it
++                        // went into the traced scene and the raster before the composite, where
++                        // it was multiplied by the shadow of whatever stood BEHIND it. Navi is
++                        // the one this game draws that way (her core, two quads of a glow
++                        // texture under G_RM_CLD_SURF2; every other fairy uses the depth tested
++                        // form), so in the sun's shade her body dimmed and read as see-through
++                        // (the user, 2026-10-08: "her light disappears around the actual light
++                        // body"). As an overlay it takes the translucent mask: after the
++                        // composite, in its own color and alpha, traced by nothing. No room
++                        // draw in the game is depthless. Rung 36 puts the old sorting back.
++                        const bool depthlessOverlay = !otherMode.zCmp() && !otherMode.zUpd() && ((otherMode.L & IM_RD) != 0) &&
++                                                      otherMode.forceBlend() && (cutoutRule != 36);
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+                         const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);
+-                        if (wasTranslucent && !solidDraw) {
++                        if ((wasTranslucent && !solidDraw) || depthlessOverlay) {
+                             raytracing.queryMask = TranslucentRayQueryMask;
+                         }
+                         else if (wasTranslucent && castsNothing) {

@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 18:00:19 -0400
+Subject: [PATCH] The wind comes in gusts, each from its own way
+
+Patch 0047 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08: "it doesn't seem like the varied direction is like changing ... it needs to
+like have ramp-ups that you know the gust happens in one direction and then it kind of slows down
+and particles just kind of float around. And then another gust happens but it goes in a completely
+different direction and then it slows down. It needs to act very natural", modeled on a reference
+of theirs; then "fully 3D, as in you know, 360 around, but as far as up and down ... limit the
+cone", and "it can also gust down and then up or up and then down".
+
+0036 and 0041 moved the dust by a closed form of the time; 0041's varied wind turned on waves of 75
+and 200 seconds, so in play its direction never visibly changed. The wind is now stepped on the CPU
+with a real clock (stepWind, called each trace): a base breeze that swells and eases and, for the
+varied wind, meanders in heading; and gusts one at a time, each with its own heading (anywhere for
+the varied wind, within 40 degrees of the base for a set one), its own tilt between 12 degrees
+below level and 18 above, wavering by up to 8 degrees inside that while it blows, and its own
+strength (two to five times the base, weaker for Light gusts), that ramp up, hold with a flutter
+and fade, with a calm of a few seconds between (longer for Light). The air follows that wind with
+drag, so it keeps moving after a gust and slows instead of stopping. The shader takes how far the
+air has carried the dust (tuneWindField.xyz) in place of windOffset, which is gone.
+
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -5,6 +5,8 @@
+ #include "rt64_framebuffer_renderer.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cmath>
+ #include <cstring>
+ 
+ #include "../include/rt64_extended_gbi.h"
+@@ -1291,6 +1293,148 @@ namespace RT64 {
+     }
+ 
+ #if RT_ENABLED
++    // THE WIND, GUST BY GUST (patch 0047, the user, 2026-10-08: "it doesn't seem like the varied
++    // direction is like changing ... it needs to like have ramp-ups that you know the gust happens in
++    // one direction and then it kind of slows down and particles just kind of float around. And
++    // then another gust happens but it goes in a completely different direction and then it slows
++    // down. It needs to act very natural"; and a reference of theirs whose wind they want this to
++    // behave like). 0036 and 0041 moved the dust by a closed form of the time, and 0041's varied
++    // wind turned on waves of 75 and 200 seconds, so in play its direction never visibly changed.
++    //
++    // This is the reference's model, on the CPU with a real clock: a gentle base breeze whose
++    // strength swells and eases and, for the varied wind, whose heading meanders; and gusts, one at
++    // a time, each from its own direction (any for the varied wind, within 40 degrees of the base
++    // for a set one) and of its own strength, that ramp up, hold with a flutter, fade away, and
++    // leave a calm of a few seconds before the next. The AIR follows that wind with drag, so it
++    // keeps moving after a gust and slows down rather than stopping dead, and what the shader
++    // receives is how far the air has carried the dust so far (tuneWindField.xyz) and how fast it
++    // is moving now (w). The rows: the wind's speed is the base breeze in world units a second, a
++    // gust peaks at two to five times it, Light gusts are weaker and rarer than Strong, and None
++    // leaves the base breeze alone.
++    struct WindModel {
++        enum class Gust { Calm, Ramp, Hold, Fade };
++        Gust state = Gust::Calm;
++        float timer = 2.0f;
++        float stateTime = 0.0f;
++        float rampTime = 1.0f;
++        float holdTime = 1.0f;
++        float fadeTime = 2.0f;
++        float peak = 0.0f;
++        float gustHeading = 0.0f;
++        float gustTilt = 0.0f;
++        float gustWaverPhase = 0.0f;
++        float baseHeading = 0.0f;
++        float clock = 0.0f;
++        hlslpp::float3 air = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        hlslpp::float3 carried = hlslpp::float3(0.0f, 0.0f, 0.0f);
++        uint32_t seed = 0x9E3779B9u;
++        bool started = false;
++        std::chrono::steady_clock::time_point last;
++
++        float random(float low, float high) {
++            seed = seed * 1664525u + 1013904223u;
++            return low + (high - low) * (float(seed >> 8) / 16777216.0f);
++        }
++    };
++
++    static const float WindAirDrag = 1.9f;          // a second's share by which the air closes on the wind (the reference's drag)
++    static const float WindMaxStep = 0.05f;         // seconds at most one step integrates, so a stall never fires a huge jump
++    // A GUST'S TILT IS HELD NEAR LEVEL (the user, 2026-10-08: "gusts wouldn't come directly up from
++    // the ground, so they need to be fully 3D, as in you know, 360 around, but as far as up and down
++    // ... limit the cone"; and "it can also gust down and then up or up and then down"). Its heading
++    // is anywhere round the compass, its tilt between these two, and while it blows the tilt wavers
++    // by up to WindGustWaver either way, still inside them.
++    static const float WindGustDown = 12.0f * 0.0174533f;   // radians below level at most
++    static const float WindGustUp = 18.0f * 0.0174533f;     // radians above level at most
++    static const float WindGustWaver = 8.0f * 0.0174533f;
++
++    static hlslpp::float4 stepWind(const hlslpp::float4 &tuneWind) {
++        static WindModel wind;
++        const auto now = std::chrono::steady_clock::now();
++        float dt = 0.0f;
++        if (wind.started) {
++            dt = std::min(std::chrono::duration<float>(now - wind.last).count(), WindMaxStep);
++        }
++        else {
++            wind.started = true;
++            wind.baseHeading = wind.random(0.0f, 6.2831853f);
++        }
++
++        wind.last = now;
++        wind.clock += dt;
++
++        const float speed = std::max(float(tuneWind.z), 0.0f);
++        const float gusts = std::clamp(float(tuneWind.w), 0.0f, 1.0f);
++        const bool varied = (float(tuneWind.x) == 0.0f) && (float(tuneWind.y) == 0.0f);
++        const float setHeading = std::atan2(float(tuneWind.y), float(tuneWind.x));
++        if (varied) {
++            wind.baseHeading += std::sin(wind.clock * 0.07f) * dt * 0.25f;
++        }
++
++        const float heading = varied ? wind.baseHeading : setHeading;
++        const float baseStrength = speed * (1.0f + 0.35f * std::sin(wind.clock * 0.23f));
++        hlslpp::float3 target = hlslpp::float3(std::cos(heading), 0.0f, std::sin(heading)) * baseStrength;
++
++        if ((gusts > 0.0f) && (speed > 0.0f)) {
++            switch (wind.state) {
++            case WindModel::Gust::Calm:
++                wind.timer -= dt;
++                if (wind.timer <= 0.0f) {
++                    wind.gustHeading = varied ? wind.random(0.0f, 6.2831853f) : (setHeading + wind.random(-0.7f, 0.7f));
++                    wind.gustTilt = wind.random(-WindGustDown, WindGustUp);
++                    wind.gustWaverPhase = wind.random(0.0f, 6.2831853f);
++                    wind.peak = speed * wind.random(2.0f, 5.0f) * (0.4f + 0.6f * gusts);
++                    wind.rampTime = wind.random(0.4f, 1.2f);
++                    wind.holdTime = wind.random(0.3f, 1.6f);
++                    wind.fadeTime = wind.random(1.8f, 4.2f);
++                    wind.state = WindModel::Gust::Ramp;
++                    wind.stateTime = 0.0f;
++                }
++                break;
++            default:
++                wind.stateTime += dt;
++                break;
++            }
++
++            float force = 0.0f;
++            if (wind.state == WindModel::Gust::Ramp) {
++                const float t = std::min(1.0f, wind.stateTime / wind.rampTime);
++                force = wind.peak * t * t;
++                if (wind.stateTime >= wind.rampTime) {
++                    wind.state = WindModel::Gust::Hold;
++                    wind.stateTime = 0.0f;
++                }
++            }
++            else if (wind.state == WindModel::Gust::Hold) {
++                force = wind.peak * (0.92f + 0.08f * std::sin(wind.clock * 9.0f));
++                if (wind.stateTime >= wind.holdTime) {
++                    wind.state = WindModel::Gust::Fade;
++                    wind.stateTime = 0.0f;
++                }
++            }
++            else if (wind.state == WindModel::Gust::Fade) {
++                const float t = std::min(1.0f, wind.stateTime / wind.fadeTime);
++                force = wind.peak * (1.0f - (1.0f - (1.0f - t) * (1.0f - t)));
++                if (wind.stateTime >= wind.fadeTime) {
++                    wind.state = WindModel::Gust::Calm;
++                    // Light gusts come further apart than strong ones.
++                    wind.timer = wind.random(1.6f, 5.5f) * (2.0f - gusts);
++                }
++            }
++
++            const float tilt = std::clamp(wind.gustTilt + WindGustWaver * std::sin(wind.clock * 1.1f + wind.gustWaverPhase), -WindGustDown, WindGustUp);
++            const hlslpp::float3 gustDirection(std::cos(tilt) * std::cos(wind.gustHeading), std::sin(tilt), std::cos(tilt) * std::sin(wind.gustHeading));
++            target += gustDirection * force;
++        }
++        else {
++            wind.state = WindModel::Gust::Calm;
++        }
++
++        wind.air += (target - wind.air) * std::min(1.0f, WindAirDrag * dt);
++        wind.carried += wind.air * dt;
++        return hlslpp::float4(float(wind.carried.x), float(wind.carried.y), float(wind.carried.z), float(hlslpp::length(wind.air)));
++    }
++
+     void FramebufferRenderer::updateRaytracingScene(RenderWorker *worker, const RaytracingScene &rtScene) {
+         auto &rtParams = rtResources->rtParams;
+         const bool lumaActive = rtScene.presetScene.luminanceRange > 0.0f;
+@@ -1321,6 +1465,8 @@ namespace RT64 {
+         rtParams.tonemapExposure = preset.tonemapExposure;
+         rtParams.tonemapWhite = preset.tonemapWhite;
+         rtParams.tonemapBlack = preset.tonemapBlack;
++        // The wind, gust by gust, and how far it has carried the dust (patch 0047).
++        rtParams.tuneWindField = stepWind(rtParams.tuneWind);
+ 
+         const auto &proj = rtScene.curProjMatrix;
+         rtParams.fovRadians = fovFromProj(proj);
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1579,26 +1579,8 @@ float3 dustLightAt(float3 p, uint2 launchIndex) {
+ // answer to whether there is a sky. Indoors the motes only wander about their places, at the drift
+ // row's pace. Outdoors the whole field travels with the wind, its speed rising and easing in gusts
+ // that never turn it round, each mote wandering a little as it goes, and the motes show against
+-// the open sky as well.
+-float3 windOffset(float seconds) {
+-    const float speed = RtParams.tuneWind.z;
+-    const float gusts = RtParams.tuneWind.w;
+-    // A VARIED WIND (patch 0041, the user, 2026-10-08: "naturally have wind from various
+-    // directions on its own. It'll just ... randomly choose a direction and randomly choose the
+-    // strength of the gust"), asked for by a direction of nothing. Its motion over the ground is
+-    // two slow waves in each axis at unrelated paces, so it wanders round the compass, rises to
+-    // gusts and falls to lulls and never repeats in any time a person would notice; the distance
+-    // it has carried the dust is those waves' sum taken over the time, so the dust never jumps.
+-    if ((RtParams.tuneWind.x == 0.0f) && (RtParams.tuneWind.y == 0.0f)) {
+-        const float gustScale = 1.0f + gusts;
+-        const float x = -(0.7f / 0.031f) * cos(seconds * 0.031f + 1.3f) - (0.5f * gustScale / 0.083f) * cos(seconds * 0.083f + 4.1f);
+-        const float z = (0.7f / 0.027f) * sin(seconds * 0.027f + 0.4f) - (0.5f * gustScale / 0.071f) * cos(seconds * 0.071f + 2.2f);
+-        return float3(x, 0.0f, z) * speed;
+-    }
+-
+-    const float travelled = speed * (seconds + gusts * 1.5f * sin(seconds * 0.5f));
+-    return float3(RtParams.tuneWind.x, 0.0f, RtParams.tuneWind.y) * travelled;
+-}
++// the open sky as well. (Since patch 0047 the wind is stepped on the CPU, gust by gust, and the
++// march takes how far it has carried the air from tuneWindField; see stepWind.)
+ 
+ // THE AMBIENCE'S DISTANCE (patch 0037, the user, 2026-10-08: "a distance setting on how far out
+ // the stuff renders and it needs to ... have a gradual fade out rather than a harsh cutoff ...
+@@ -1690,7 +1672,8 @@ float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex
+     }
+     const float seconds = float(FrParams.frameCount) * (1.0f / 60.0f);
+     // Where the field has travelled to, and how fast a mote wanders in it.
+-    const float3 carried = outdoors ? windOffset(seconds) : float3(0.0f, 0.0f, 0.0f);
++    // How far the wind has carried the air so far, gust by gust, from the CPU (patch 0047).
++    const float3 carried = outdoors ? RtParams.tuneWindField.xyz : float3(0.0f, 0.0f, 0.0f);
+     const float wander = outdoors ? (1.0f + RtParams.tuneWind.w) : RtParams.tuneReflection.w;
+ 
+     // The ray in the turned lattice, in cells, and the walk from cell to cell (patch 0043).
+diff --git a/src/shared/rt64_raytracing_params.h b/src/shared/rt64_raytracing_params.h
+--- a/src/shared/rt64_raytracing_params.h
++++ b/src/shared/rt64_raytracing_params.h
+@@ -112,6 +112,7 @@ namespace interop {
+         // (patch 0038: tuneDust.x and z are now motes to a cell, 0 to 8, no longer a share of cells)
+         float4 tuneWindowAim;    // patch 0044, read on the CPU: x degrees steeper, y degrees turned, z the window aimed (0 every one), w 1 to start from the drawn shaft's direction
+         float4 tuneWindowMove;   // patch 0044, read on the CPU: x, y, z world units the aimed window's light is moved
++        float4 tuneWindField;    // patch 0047, set on the CPU every trace: xyz how far the wind has carried the dust so far (world units), w how fast the air moves now
+ 
+ #   ifdef HLSL_CPU
+         RaytracingParams() {

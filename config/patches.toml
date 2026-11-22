@@ -1,0 +1,49 @@
+# Recompile the MIPS patch ELF into native C++.
+#
+# This is a SEPARATE run from the main recompilation, and it reads the patch ELF rather than the
+# ROM. Its output is linked ahead of the main output so the linker picks a patched function over
+# the original of the same name. That is the whole substitution mechanism: no registration, no call
+# sites, no dispatch.
+#
+# Paths are relative to this file.
+
+[input]
+elf_path = "../patches/patches.elf"
+output_func_path = "../RecompiledPatches"
+
+# One output file. There are a handful of patches, not thirteen thousand functions.
+single_file_output = true
+
+# Patches call runtime helpers through the dummy addresses in patches/syms.ld, which are absolute
+# symbols rather than anything in a section. Without this the recompiler refuses them as jump
+# targets.
+use_absolute_symbols = true
+
+# The symbol tables, so relocations inside a patch resolve against the real game. A patch that
+# calls a game function needs that function's address, and it comes from here.
+func_reference_syms_file = "../OoTRecompSyms/oot.ntsc-1.0.syms.toml"
+data_reference_syms_files = [
+    "../OoTRecompSyms/oot.ntsc-1.0.datasyms.toml",
+    "../patches/custom_syms.toml",
+    # Statics of the game's own files that a reproduced function shares with the rest of its
+    # file, which the exported table leaves out because they are local. Each address is read
+    # from our own decompilation ELF, never copied, and the file says which function needs it.
+    "../patches/game_static_syms.toml",
+]
+
+# The recompiler writes the binary itself rather than leaving it to objcopy, because it also has to
+# patch MIPS32 relocations while doing it.
+output_binary_path = "../patches/patches.bin"
+
+# What every generated patch file includes. The default `#include "recomp.h"` is not enough: a
+# patch calls GAME functions, and those are declared in the main output's funcs.h rather than the
+# patch output's, which only declares what the patches themselves define.
+recomp_include = "#include \"game/recomp_patch_decls.h\""
+
+# clang emits many unpaired LO16 relocations and they are not interesting here.
+unpaired_lo16_warnings = false
+
+# STRICT MODE IS ON, and it is the reason the proof patch is trustworthy. It validates that every
+# patched symbol actually exists in the game, so a misspelled patch name is an error rather than a
+# function that compiles, links, and silently never replaces anything.
+strict_patch_mode = true

@@ -1,0 +1,87 @@
+/* THE ON-SCREEN KEYBOARD (the menus plan, phase 110): a slate panel over the bottom of the window
+ * with the line being typed above five rows of keys, the focused key lit lime. Tokens only. */
+
+body.kb-doc
+{
+	width: 100%;
+	height: 100%;
+	font-family: var(--font-mono);
+	font-size: var(--size-value);
+	color: var(--color-ink);
+	background-color: var(--color-scrim);
+}
+
+.kb
+{
+	position: absolute;
+	left: 50%;
+	bottom: var(--kb-bottom);
+	width: var(--kb-width);
+	transform: translateX(-50%);
+	padding: var(--space-4);
+	background-color: var(--color-slate);
+	border: var(--rule) var(--color-line);
+	border-top: var(--edge-lit) var(--color-gold);
+}
+
+.kb-line
+{
+	height: var(--kb-line-height);
+	margin-bottom: var(--space-3);
+	padding: 0 var(--space-3);
+	display: flex;
+	align-items: center;
+	background-color: var(--color-slate-deep);
+	border: var(--rule) var(--color-line);
+	white-space: nowrap;
+	overflow: hidden;
+}
+
+.kb-row
+{
+	display: flex;
+	margin-bottom: var(--kb-key-gap);
+}
+
+.key
+{
+	flex: 1 1 0;
+	height: var(--kb-key-height);
+	margin-right: var(--kb-key-gap);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background-color: var(--color-slate-raised);
+	border: var(--rule) var(--color-line);
+	transition: background-color var(--duration-fast) var(--ease);
+}
+
+.key:last-child
+{
+	margin-right: 0;
+}
+
+.key.wide
+{
+	flex: 2 1 0;
+	font-family: var(--font-body);
+	font-size: var(--size-note);
+}
+
+.key:hover
+{
+	background-color: var(--color-plate-on);
+}
+
+.key.is-f
+{
+	background-color: var(--color-plate-on);
+	border-color: var(--color-lime);
+	color: var(--color-lime);
+}
+
+.key.on
+{
+	color: var(--color-gold);
+	border-color: var(--color-gold);
+}

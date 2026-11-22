@@ -1,0 +1,27 @@
+<rml>
+<head>
+    <title>Frame</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="case.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="window.rcss"/>
+</head>
+<body class="overlay">
+    <!-- The game window's own frame (play milestone): a brass edge around the window, and the
+         header, the launcher's lid, riding over the picture when the pointer is at the top of
+         the window. The shell shows and hides the two; the window itself has no border of the
+         system's. -->
+    <div class="frame-edge hidden" id="frame-edge"></div>
+    <div class="frame-bar hidden" id="frame-bar">
+        <div class="head">
+            <div class="mark"></div>
+            <div class="title">OoT: Recompiled</div>
+        </div>
+        <div class="chrome">
+            <div class="win-btn" id="win-min"><svg class="win-ic" src="../icons/minus.svg"/></div>
+            <div class="win-btn" id="win-max"><svg class="win-ic" src="../icons/square.svg"/></div>
+            <div class="win-btn" id="win-close"><svg class="win-ic" src="../icons/x.svg"/></div>
+        </div>
+    </div>
+</body>
+</rml>

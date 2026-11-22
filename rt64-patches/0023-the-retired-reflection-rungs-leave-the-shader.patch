@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 7 Oct 2026 16:01:16 -0400
+Subject: [PATCH] The retired reflection rungs leave the shader
+
+Patch 0023 of the renderer series (OoT: Recompiled).
+
+The reflections were removed on 2026-09-30 and their six candidate rungs came off the Experiment
+row, but the tests that implemented them stayed in the shader and in the classification. That
+would only be dead code, except that the shade rungs of patch 0022 were given the numbers 31 to
+33, and candidates A (31) and C (33) live in radianceFrom, which the BOUNCE pass calls as well as
+the reflection pass. So "Shade: local after knee" also took the bounce's light from the frame
+times the direct light, and "Shade: both" also stopped the bounce reading the frame. Each of those
+rungs changed a second thing that its name did not mention, which is exactly what a rung exists
+not to do.
+
+What goes: candidates A, C and D in radianceFrom; B and E in the reflection pass, which never
+runs now that its value is held at zero; F, the water plane from the primary hit; and the wider
+probe of rungs 28 and 29. What changes: the water pass-through in both any hit shaders and the
+translucent bit on a reclassified draw both read "rung 30 and up", which meant rung 30 and every
+reflection candidate built on it. They now end at 33, the last live rung built on 30, so a rung
+numbered 34 or later can differ from Off in only the thing it names. Rungs 27 to 29 keep their
+classification, which is inert with the reflection pass standing down.
+
+With the Experiment row at Off none of this runs, and with the ray tracing row Off none of the
+shader runs at all.
+---
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -299,20 +299,10 @@ void PrimaryRayGen() {
+         // normal and the distance), nothing writes it during traversal, and no real coverage is
+         // ever below zero, so it cannot be confused with one.
+         water.coverage = -1.0f;
+-        // REFLECTION CANDIDATE B (patch 0018, rungs 28 and 29): the PROBE looks wider, rather than
+-        // any instance's mask changing. Water carries the depth mask now that the foliage rule
+-        // classifies it as solid, so a probe that also traces depth finds it again, and no tree's
+-        // mask is touched, which means the tree work cannot regress by construction. That is the
+-        // whole argument for it over candidate A, which was tried in the default and cost the
+-        // trees for reasons the code did not explain.
+-        //
+-        // The risk is the opposite one and is why this is a rung too: everything opaque carries
+-        // the depth mask, so the probe can now meet a horizontal FLOOR and the test below would
+-        // call it water. The test is the only thing standing between this and a reflective field.
+-        const uint probeMask = ((RtParams.tuneExperiment.x == 28.0f) || (RtParams.tuneExperiment.x == 29.0f))
+-                                   ? (TranslucentRayQueryMask | DepthRayQueryMask)
+-                                   : TranslucentRayQueryMask;
+-        TraceRay(SceneBVH, RAY_FLAG_NONE, probeMask, 0, 0, 0, probe, water);
++        // The wider probe of reflection candidate B (patch 0018, rungs 28 and 29) left with the
++        // reflection rows (patch 0023). Rungs 28 and 29 stay on the Experiment row only because
++        // removing them would renumber every rung after them.
++        TraceRay(SceneBVH, RAY_FLAG_NONE, TranslucentRayQueryMask, 0, 0, 0, probe, water);
+         // Water is a horizontal translucent surface seen from ABOVE (the hit normal faces the
+         // ray, so it points up): a translucent surface seen from below (Death Mountain's ring
+         // of smoke over Kakariko, a ceiling's haze) is not water, and the reflection pass drew
+@@ -321,17 +311,8 @@ void PrimaryRayGen() {
+         if ((water.instanceId >= 0) && (water.hitNormal.y > 0.9f)) {
+             gShadingSpecular[launchIndex] = float4(water.hitNormal, water.hitDistance);
+         }
+-        // F (rung 36): THE PRIMARY HIT ITSELF IS THE PLANE when it is water. Every rung
+-        // before this one had to choose: water as a traced surface so a fairy can light it,
+-        // or water NOT the opaque hit so this probe can find something in front of it. They
+-        // are the same question answered two ways, and the way out is to stop asking the
+-        // probe for a surface in FRONT. The payload already carries the normal and the
+-        // distance of the hit the frame shows; where that hit is a horizontal face of a
+-        // depthless translucent draw, it IS the water, and it is lit like any other surface.
+-        if ((RtParams.tuneExperiment.x == 36.0f) && (payload.instanceId >= 0) &&
+-            (payload.hitNormal.y > 0.9f) && instanceIsDepthlessTranslucent(payload.instanceId)) {
+-            gShadingSpecular[launchIndex] = float4(payload.hitNormal, payload.hitDistance);
+-        }
++        // Candidate F (rung 36, the primary hit as the water's plane) left with the reflection
++        // rows (patch 0023).
+     }
+     if (payload.instanceId >= 0) {
+         // A hit is lit by the passes: the diffuse alpha is what the composite reads to apply the
+@@ -729,27 +710,17 @@ float3 radianceFrom(float3 hitPosition, float3 shadedColor, bool hit, int pixelI
+             const float frameLuma = dot(frame, float3(0.299f, 0.587f, 0.114f));
+             const float estimateLuma = dot(estimate, float3(0.299f, 0.587f, 0.114f));
+             if (frameLuma <= estimateLuma * OverlayRatio + 0.02f) {
+-                // A (31): this frame is the game's RASTER, before the composite multiplies
+-                // it by the light, so a reflection of a dark scene comes back undarkened.
+-                if (RtParams.tuneExperiment.x == 31.0f) {
+-                    return frame * gDirectLightAccum[pixel].rgb;
+-                }
+-                // C (33): the frame is not used at all; the surface's own lit color stands
+-                // in everywhere, which is what this already falls back to.
+-                if (RtParams.tuneExperiment.x != 33.0f) {
+-                    return frame;
+-                }
++                return frame;
+             }
+         }
+     }
+ 
+-    // D (34): the estimate is the surface's lit VERTEX color times a constant standing in
+-    // for its texture's average, so for a BLACK surface it hands back a pale color. That is
+-    // the shape of "black turns white in reflections no matter the time of day", and it
+-    // needs no inversion to produce. Here the fog's color stands in instead.
+-    if (RtParams.tuneExperiment.x == 34.0f) {
+-        return fogColorOf(pixelInstance);
+-    }
++    // THE REFLECTION CANDIDATES A, C AND D LEFT THIS FUNCTION (patch 0023). They were rungs 31,
++    // 33 and 34 of patch 0021, the reflections were removed on 2026-09-30, and the rungs were
++    // renumbered for the shade work of patch 0022 while these tests stayed. This function is the
++    // BOUNCE pass's as well as the reflection pass's, so "Shade: local after knee" (31) also
++    // took the bounce's light from the frame times the direct light, and "Shade: both" (33) also
++    // stopped the bounce reading the frame: two rungs that each changed a second, unnamed thing.
+     return estimate;
+ }
+ 
+@@ -1211,16 +1182,7 @@ void ReflectionRayGen() {
+             const float2 viewportOrigin = RtParams.viewport.xy;
+             const float2 viewportSize = RtParams.viewport.zw;
+             const float2 inViewport = clamp(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * viewportSize, 0.0f, viewportSize - 1.0f);
+-            // E (35): the clamp to the viewport's edge smears one pixel along the whole
+-            // reflection, which is the stretching trail he sees. The comment above says the
+-            // fog color was tried and rejected for drawing a gray wedge; both are now
+-            // visible so the trade can be judged rather than assumed.
+-            if (RtParams.tuneExperiment.x == 35.0f) {
+-                radiance = fogColorOf(gInstanceId[launchIndex]);
+-            }
+-            else {
+-                radiance = SrgbToLinear(gBackgroundColor.Load(int3(int2(viewportOrigin + inViewport), 0)).rgb);
+-            }
++            radiance = SrgbToLinear(gBackgroundColor.Load(int3(int2(viewportOrigin + inViewport), 0)).rgb);
+         }
+         else {
+             radiance = fogColorOf(gInstanceId[launchIndex]);
+@@ -1229,12 +1191,9 @@ void ReflectionRayGen() {
+ 
+     const float cosTheta = saturate(dot(-direction, normal));
+     const float fresnel = 0.02f + 0.98f * pow(1.0f - cosTheta, 5.0f);
+-    // B (32): the whole reflection is dimmed by the light falling on the WATER itself, so a
+-    // reflection lying in shadow is dark even when the thing it reflects is lit.
+-    float3 reflectionOut = radiance * (fresnel * RtParams.tuneReflection.x);
+-    if (RtParams.tuneExperiment.x == 32.0f) {
+-        reflectionOut *= gDirectLightAccum[launchIndex].rgb;
+-    }
++    // Candidates B (32) and E (35) left with the reflection rows (patch 0023); the pass itself
++    // stays, as patch 0007 wrote it, and never runs with the value held at zero.
++    const float3 reflectionOut = radiance * (fresnel * RtParams.tuneReflection.x);
+     gReflection[launchIndex] = float4(reflectionOut, 1.0f);
+ }
+ 
+@@ -1646,8 +1605,12 @@ void SurfaceAnyHit(inout SurfacePayload payload, in BuiltInTriangleIntersectionA
+     // classified. A horizontal face of a depthless translucent draw is passed through exactly as
+     // it was before the foliage work, so the primary reaches the bed, the shadow lands on the bed,
+     // and the probe finds the water in front of it. A vertical one is foliage and is unaffected.
++    //
++    // Rung 30 and the shade rungs built on it (31 to 33, patch 0022) carry this; the range ended
++    // at 36 while rungs 31 to 35 were the reflection candidates, which have gone (patch 0023), so
++    // it now ends where the live rungs do and leaves 34 onward free of it.
+     if ((payload.coverage >= 0.0f) && hitIsWaterLike(InstanceID(), PrimitiveIndex()) &&
+-        (RtParams.tuneExperiment.x >= 30.0f) && (RtParams.tuneExperiment.x < 36.0f)) {
++        (RtParams.tuneExperiment.x >= 30.0f) && (RtParams.tuneExperiment.x < 34.0f)) {
+         IgnoreHit();
+         return;
+     }
+@@ -1673,7 +1636,7 @@ void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAtt
+     // Water casts nothing either (patch 0019, rung 30), for the same reason and so that the two
+     // rays agree about what water is.
+     if (hitIsWaterLike(InstanceID(), PrimitiveIndex()) && (RtParams.tuneExperiment.x >= 30.0f) &&
+-        (RtParams.tuneExperiment.x < 36.0f)) {
++        (RtParams.tuneExperiment.x < 34.0f)) {
+         IgnoreHit();
+         return;
+     }
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1985,8 +1985,13 @@ namespace RT64 {
+                         // and the trees came back wrong (the user, 2026-09-30: "you just regressed
+                         // all the fixes for trees back"). Reading the code did not explain how, so
+                         // it is offered as something to observe rather than as a fix.
++                        //
++                        // CLOSED AT 33 (patch 0023). It read "30 and up" while every rung past 30
++                        // was a reflection candidate built on rung 30; those have gone, the shade
++                        // rungs 31 to 33 are still built on 30 and keep it, and 34 onward are new
++                        // questions that must differ from Off only in what they name.
+                         if ((wasTranslucent && solidDraw) &&
+-                            ((cutoutRule == 27) || (cutoutRule == 29) || (cutoutRule >= 30))) {
++                            ((cutoutRule == 27) || (cutoutRule == 29) || ((cutoutRule >= 30) && (cutoutRule < 34)))) {
+                             raytracing.queryMask |= TranslucentRayQueryMask;
+                         }
+                         if (drawData.extraParams[call.callDesc.callIndex].shadowCatcherFactor > 0.0f) {

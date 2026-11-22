@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Thu, 8 Oct 2026 14:14:55 -0400
+Subject: [PATCH] Dust floats in the light and not in the shadow
+
+Patch 0035 of the renderer series (OoT: Recompiled).
+
+The user, 2026-10-08, looking up at the Temple of Time's tall window: "maybe just have particle
+ambience throughout the air that would cause this kind of ... thing. And in the shadows, the
+particles are not shown. So, like, really, really subtle particles that float through light areas
+only".
+
+The air pass now also looks for motes of dust along the eye's ray, as far as the surface it sees
+and no more than a thousand units: one mote at most in each forty unit cell of a grid, placed and
+kept by a hash of the cell, drifting slowly about its place. A mote the ray passes shows as a soft
+speck one to three pixels across, lit by the light that actually reaches it, each light followed
+by a shadow ray: a window's or a shaft's light, the sun's under a sky, the game's own lights within
+their reach. In shadow a mote is not there at all. The shadow rays are spent only on motes the ray
+passes, a few pixels in a hundred.
+
+A new configuration value, the Dust in the light row (0 to 1, in the reflections' last spare
+slot), sets how bright; 0 turns it off and is the default.
+
+diff --git a/src/render/rt64_raytracing_resources.cpp b/src/render/rt64_raytracing_resources.cpp
+--- a/src/render/rt64_raytracing_resources.cpp
++++ b/src/render/rt64_raytracing_resources.cpp
+@@ -834,8 +834,10 @@ namespace RT64 {
+         // names them.
+         rtParams.tuneOcclusion = hlslpp::float4(rtConfig.occlusionStrength, rtConfig.occlusionRadius, rtConfig.shadowStrength, rtConfig.lightStrength);
+         rtParams.tuneBounce = hlslpp::float4(rtConfig.bounceStrength, rtConfig.bounceRange, std::max(rtConfig.glowSize, 0.0f), 0.0f);   // z the Glow size row (2026-09-24)
+-        // z the Light brightness row (patch 0033), in the reflections' spare slot.
+-        rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, std::clamp(rtConfig.lightBrightness, 0.0f, 1.0f), 0.0f);
++        // z the Light brightness row (patch 0033) and w the Dust in the light row (patch 0035), in
++        // the reflections' spare slots.
++        rtParams.tuneReflection = hlslpp::float4(rtConfig.reflectionStrength, rtConfig.reflectionRangeScale, std::clamp(rtConfig.lightBrightness, 0.0f, 1.0f),
++                                                 std::clamp(rtConfig.dust, 0.0f, 1.0f));
+         rtParams.tuneScatter = hlslpp::float4(rtConfig.lightGlow, rtConfig.sunHaze, rtConfig.hazeRange, rtConfig.lightReach);
+         rtParams.tuneFade = hlslpp::float4(rtConfig.fogFade, rtConfig.distanceFade, rtConfig.shadowSoftness, rtConfig.historyBlend);
+         // y the Darkness row, z the Shadow rays row: how many samples over the sun's disc every
+diff --git a/src/render/rt64_raytracing_resources.h b/src/render/rt64_raytracing_resources.h
+--- a/src/render/rt64_raytracing_resources.h
++++ b/src/render/rt64_raytracing_resources.h
+@@ -95,6 +95,7 @@ namespace RT64 {
+         int experiment = 0;                  // the lighting menu's Experiment row: 0 off, else a variant of a disputed sum
+         float darkness = 0.0f;               // the Darkness row (2026-09-24): how much of the game's own ambient is taken away where no traced light falls; 0 off
+         float lightBrightness = 0.0f;        // the Light brightness row (patch 0033): how far traced light may lift a surface above the game's own full light; 0 the knee as it was, 1 none
++        float dust = 0.0f;                   // the Dust in the light row (patch 0035): how bright the motes in lit air are; 0 off
+         int shadowRays = 4;                  // the Shadow rays row (2026-09-24): samples over the sun's disc per lit pixel, a moving surface twice
+         float indoorLight = 0.5f;            // the Indoor light row (2026-09-24): a sun of our own where the place has no sky, as a share of the room's ambient taken out of it
+         int motionBlurSamples = 0;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -1455,6 +1455,119 @@ static const float ScatterFadeEnd = 1400.0f;
+ static const float SunScatter = 0.0f;          // per world unit of sunlit air
+ static const float LightScatter = 0.002f;      // per world unit at a light's center
+ 
++// DUST IN THE LIGHT (patch 0035, the user, 2026-10-08: "maybe just have particle ambience
++// throughout the air ... And in the shadows, the particles are not shown. So, like, really, really
++// subtle particles that float through light areas only"). Motes hang in the air round the eye, one
++// at most in each cell of a grid, each at its own place in its cell and drifting slowly. A mote
++// shows as a soft speck one to three pixels across, and only where light actually reaches it: a
++// window's or a shaft's light, the sun's under a sky, the game's own lights within their reach,
++// each followed by a shadow ray. In shadow it is not there at all. Only motes in front of the
++// surface the eye sees and within DustRange; the Dust in the light row says how bright
++// (tuneReflection.w, 0 off). The shadow rays are spent only on a mote the eye's ray actually
++// passes, which is a few pixels in a hundred.
++static const float DustCell = 40.0f;          // world units; at most one mote in each
++static const float DustChance = 0.35f;        // the share of cells that hold one
++static const float DustRange = 1000.0f;       // world units from the eye
++static const float DustNear = 20.0f;          // no mote closer to the eye than this
++static const float DustSize = 0.3f;           // a mote's own radius in world units, held between one and three pixels
++static const float DustDrift = 0.3f;          // how far a mote wanders from its place, as a share of its cell
++static const float DustBrightness = 0.6f;     // a fully lit mote at the row's top, as a share of the light on it
++
++uint4 dustHash(uint4 v) {
++    v = v * 1664525u + 1013904223u;
++    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
++    v ^= v >> 16u;
++    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
++    return v;
++}
++
++// The light reaching a point in the air, from every light that could show a mote there.
++float3 dustLightAt(float3 p, uint2 launchIndex) {
++    float3 local = 0.0f;
++    float3 unused = 0.0f;
++    const uint count = min(RtParams.lightsCount, RtParams.maxLights);
++    for (uint i = 0; i < count; i++) {
++        const PointLight light = SceneLights[i];
++        if ((light.groupBits & WindowLightBit) != 0u) {
++            windowLight(light, p, -light.direction, 0.0f, launchIndex, i, 1u, local, unused);
++            continue;
++        }
++
++        if ((light.groupBits & BeamLightBit) != 0u) {
++            beamLight(light, p, -light.direction, 0.0f, launchIndex, i, 1u, local, unused);
++            continue;
++        }
++
++        const float3 toLight = light.position - p;
++        const float distance2 = dot(toLight, toLight);
++        const float radius = light.attenuationRadius * RtParams.tuneScatter.w;
++        const float radius2 = radius * radius;
++        if ((distance2 <= 0.0f) || (distance2 >= radius2)) {
++            continue;
++        }
++
++        const float distance = sqrt(distance2);
++        const float clearance = ((light.groupBits & 4u) != 0u) ? light.pointRadius : max(light.pointRadius, LightClearance);
++        const float tMax = max(distance - clearance, 0.0f);
++        float hitDistance;
++        const float visibility = (tMax > 1.0f) ? traceVisibilityRange(p, toLight / distance, 0.0f, tMax, hitDistance) : 1.0f;
++        const float core2 = light.attenuationExponent * light.attenuationExponent;
++        local += light.diffuseColor * (lightFalloff(distance2, radius2, core2) * visibility);
++    }
++
++    float3 arrived = local * RtParams.tuneOcclusion.w;
++    if ((RtParams.sunShadows == 1u) && any(RtParams.sunColor.rgb > 0.0f)) {
++        float hitDistance;
++        arrived += RtParams.sunColor.rgb * traceVisibility(p, RtParams.sunDirection.xyz, 1.0e6f, hitDistance);
++    }
++
++    return arrived;
++}
++
++float3 dustInLight(float3 origin, float3 direction, float end, uint2 launchIndex, float strength) {
++    const float range = min(end, DustRange);
++    const float stepLength = DustCell * 0.5f;
++    const uint steps = min(uint(range / stepLength) + 1u, 64u);
++    const float pixelAngle = RtParams.fovRadians / max(RtParams.viewport.w, 1.0f);
++    const float seconds = float(FrParams.frameCount) * (1.0f / 60.0f);
++    int3 lastCell = int3(2147483647, 2147483647, 2147483647);
++    float3 sum = 0.0f;
++    for (uint s = 0; s < steps; s++) {
++        const float3 p = origin + direction * (float(s) * stepLength);
++        const int3 cell = int3(floor(p / DustCell));
++        if (all(cell == lastCell)) {
++            continue;
++        }
++
++        lastCell = cell;
++        const float4 h = float4(dustHash(uint4(uint3(cell), 0x2545F491u))) * (1.0f / 4294967295.0f);
++        if (h.w > DustChance) {
++            continue;
++        }
++
++        const float3 phase = h.xyz * 6.28318531f;
++        const float3 drift = sin(seconds * float3(0.21f, 0.13f, 0.17f) + phase) * (DustCell * DustDrift);
++        const float3 mote = (float3(cell) + 0.2f + h.xyz * 0.6f) * DustCell + drift;
++        const float along = dot(mote - origin, direction);
++        if ((along <= DustNear) || (along >= range)) {
++            continue;
++        }
++
++        const float apart = length(mote - (origin + direction * along));
++        const float size = clamp(DustSize, along * pixelAngle, along * pixelAngle * 3.0f);
++        const float cover = 1.0f - smoothstep(0.0f, size, apart);
++        if (cover <= 0.0f) {
++            continue;
++        }
++
++        const float distanceFade = 1.0f - smoothstep(range * 0.6f, range, along);
++        const float twinkle = 0.5f + 0.5f * frac(h.w * 7.0f);
++        sum += dustLightAt(mote, launchIndex) * (cover * distanceFade * twinkle);
++    }
++
++    return sum * (strength * DustBrightness);
++}
++
+ [shader("raygeneration")]
+ void ScatterRayGen() {
+     const uint2 launchIndex = DispatchRaysIndex().xy;
+@@ -1484,7 +1597,8 @@ void ScatterRayGen() {
+     const float sunHaze = RtParams.tuneScatter.y;
+     const float fadeEnd = max(RtParams.tuneScatter.z, 10.0f);
+     const float fadeStart = fadeEnd * 0.35f;
+-    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f)) {
++    const float dust = saturate(RtParams.tuneReflection.w);   // the Dust in the light row (patch 0035)
++    if ((lightGlow <= 0.0f) && (sunHaze <= 0.0f) && (dust <= 0.0f)) {
+         gScatter[launchIndex] = 0.0f;
+         return;
+     }
+@@ -1539,6 +1653,11 @@ void ScatterRayGen() {
+         }
+     }
+ 
++    // The dust in the light, along the same ray to the same surface (patch 0035).
++    if (dust > 0.0f) {
++        sum += dustInLight(origin, direction, end, launchIndex, dust);
++    }
++
+     // No history here (patch 0008): the glow is smooth on its own and follows a moving light
+     // (Navi), and a history of it painted a trail behind her.
+     gScatter[launchIndex] = float4(sum, 1.0f);

@@ -1,0 +1,194 @@
+/* THE PROMPTS: a button of the device in use and what it does (the menus plan, phase 109). Drawn
+ * by the menu's footer (shell.rml, inside .sh-prompts) and by photo mode's button guide
+ * (photo-guide.rml, inside .pg), so both read from these rules and look the same. Their sizes are
+ * the footer's own tokens, held at their 100% size below 100% (tokens.rcss, .prompts-full-size).
+ */
+
+.pr
+{
+	display: flex;
+	flex-shrink: 0;
+	align-items: center;
+	margin-right: var(--pr-gap);
+}
+
+/* An unused slot of the footer (it keeps a fixed length, shell_model.h). */
+.pr.pr-empty
+{
+	display: none;
+}
+
+.pr:hover .pr-label
+{
+	color: var(--color-ink);
+}
+
+.pr .pr-md
+{
+	width: var(--md-prompt-size);
+	height: var(--md-prompt-height);
+}
+
+.pr-shape
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	image-color: var(--color-ink);
+}
+
+/* THE D-PAD AND THE STICKS (the pad prompts canvas, approved 2026-10-13): drawn in the medallion
+ * like a face button's shape, but in their own colors (lit arms and chevrons in ink, the rest dim),
+ * so the shape is left untinted. */
+.pr-shape.pr-drawn
+{
+	image-color: var(--color-untinted);
+}
+
+/* A SMALL SYSTEM BUTTON (Options, Share, Create, View, Menu, Mute, Home and the rest; the same
+ * canvas): one drawing, the button's shape over the left end of a stone carrying its word, on the
+ * plates' 190 high box, so it stands at the plates' height and its width follows the drawing. */
+.pr-art
+{
+	flex: 0 0 auto;
+	height: var(--plate-pr-height);
+}
+
+/* A letter on a face button, centered on the disc (90 of the medallion's 190, a little above the
+ * box's middle, hence the lift). Centered by the box, never by a share of the width: a percentage
+ * padding is a share of the WIDTH in RCSS, which is what pushed the plates' words off center. */
+.pr-letter
+{
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding-bottom: var(--plate-text-lift);
+	font-family: var(--font-mono);
+	font-weight: var(--weight-mono-strong);
+	font-size: var(--size-prompt);
+	color: var(--color-ink);
+}
+
+/* A word on its plate, centered on the plate's rounded rectangle, which is a little above the
+ * drawing's middle (the drawing also holds the ground shadow under it): 90 of its 190, so the
+ * word is lifted by half the padding. (The user, 2026-10-13: "make sure text in the rectangular
+ * button are properly centered in them".) */
+.pr-pad
+{
+	width: var(--pad-pr-width);
+	height: var(--plate-pr-height);
+	decorator: svg(prompts/touchpad.svg);
+	margin-right: var(--plate-pr-overlap);
+}
+
+/* THE PLATE WIDENS WITH ITS WORD (the user, 2026-10-13: "for like things like enter or you know
+ * other longer words, they need to actually expand and get a little bit wider ... especially for like
+ * options, which ... overlaps the edges"). Its two ends, with the leaves, keep their width; the
+ * straight middle between them is at least as wide again and grows with the word, so a short word
+ * draws the plate exactly as before and a long one a longer plate (tools/brand_art.mjs cuts the
+ * drawing). The word reaches a little into each end, where the rounded rectangle still runs flat. */
+.pr-plate
+{
+	display: flex;
+	height: var(--plate-pr-height);
+	margin-right: var(--plate-pr-overlap);
+}
+
+.pr-plate .pl-l,
+.pr-plate .pl-r
+{
+	flex: 0 0 var(--plate-cap-width);
+	width: var(--plate-cap-width);
+}
+
+.pr-plate .pl-l { decorator: svg(prompts/plate-left.svg); }
+.pr-plate .pl-r { decorator: svg(prompts/plate-right.svg); }
+
+/* The middle and its word paint above both ends: the word reaches into them, and the right end,
+   drawn after it, would otherwise cover its last letter ("Ente" for Enter). It also runs a pixel
+   under each end (--plate-seam), the same flat band their inner edges carry, so the pieces can
+   never round apart into a seam. */
+.pr-plate .pl-m
+{
+	position: relative;
+	z-index: var(--layer-plate-word);
+	flex: 1 0 auto;
+	margin-left: var(--plate-seam);
+	margin-right: var(--plate-seam);
+	min-width: var(--plate-cap-width);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding-bottom: var(--plate-text-lift);
+	decorator: svg(prompts/plate-mid.svg);
+}
+
+.pr-plate .pr-word
+{
+	margin: 0 var(--plate-word-reach);
+	white-space: nowrap;
+}
+
+.pr-word
+{
+	line-height: 1;
+	font-family: var(--font-mono);
+	font-weight: var(--weight-mono-strong);
+	font-size: var(--pr-word-size);
+	color: var(--color-ink);
+}
+
+.pr-label
+{
+	margin-left: var(--pr-label-gap);
+	white-space: nowrap;
+}
+
+/* The face buttons' pastels, as each family's controllers code them. */
+.t-xa .pr-letter { color: var(--color-xbox-a); }
+.t-xb .pr-letter { color: var(--color-xbox-b); }
+.t-xx .pr-letter { color: var(--color-xbox-x); }
+.t-xy .pr-letter { color: var(--color-xbox-y); }
+.t-pc .pr-shape { image-color: var(--color-ps-cross); }
+.t-po .pr-shape { image-color: var(--color-ps-circle); }
+.t-ps .pr-shape { image-color: var(--color-ps-square); }
+.t-pt .pr-shape { image-color: var(--color-ps-triangle); }
+
+/* ------------------------------------------------------------------------------------------
+ * PHOTO MODE'S BUTTON GUIDE (the user, 2026-10-13: "a row of buttons ... the small buttons kind of
+ * like in the footer of the launcher ... at the bottom of the screen when enabling the photo
+ * mode"): the footer's prompts on a band of the footer's ground, centered at the bottom of the
+ * picture, over the frozen game. It takes no clicks (body.overlay); its binding hides it.
+ */
+.pg
+{
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: var(--pg-bottom);
+	display: flex;
+	justify-content: center;
+}
+
+.pg-band
+{
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: center;
+	min-height: var(--prompts-height);
+	/* Each prompt keeps its gap after it, so the band's left padding is that gap: even both sides. */
+	padding: 0 0 0 var(--pr-gap);
+	background-color: var(--color-scrim);
+	border-top: var(--rule) var(--color-line);
+	font-size: var(--pr-text);
+	color: var(--color-dim);
+}
+

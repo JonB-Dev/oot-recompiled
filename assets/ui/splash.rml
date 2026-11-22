@@ -1,0 +1,38 @@
+<rml>
+<head>
+    <title>Splash</title>
+    <link type="text/rcss" href="tokens.rcss"/>
+    <link type="text/rcss" href="medallion.rcss"/>
+    <link type="text/rcss" href="mark.rcss"/>
+    <link type="text/rcss" href="cut.rcss"/>
+    <link type="text/rcss" href="splash.rcss"/>
+</head>
+<!-- THE SPLASH (the menus plan, phase 99; the user, 2026-10-12: "Loading for a few seconds
+     before the launher"), as decided on design-canvas://96729e1b, option D, Lockup: the medallion
+     over the left end of a carved stone slab, the name filling with gold from the left while the
+     program loads, "Developed by Jonathan Barnes" and the loading word along the foot. The slab
+     and the gold are drawn layers (assets/ui/brand/, tools/brand_art.mjs); the medallion is the
+     shipped Leaf fan with the mark's shader in its disc. Shown only before Play, in the
+     launcher's window, for at least a few seconds; the shell takes over as it fades. -->
+<body class="splash" id="splash">
+    <div class="survey"></div>
+    <!-- The launcher's own 960 by 620, centered in the window, which opens maximized
+         (the user, 2026-10-13). -->
+    <div class="splash-stage">
+    <div class="splash-slab"></div>
+    <div class="splash-pour" id="splash-pour"><div class="splash-gold"></div></div>
+    <div class="md splash-md">
+        <div class="ly shadows"></div>
+        <div class="ly leaf-l-o1"></div><div class="ly leaf-l-o2"></div><div class="ly leaf-l-i1"></div><div class="ly leaf-l-i2"></div><div class="ly leaf-l-c"></div>
+        <div class="ly leaf-r-o1"></div><div class="ly leaf-r-o2"></div><div class="ly leaf-r-i1"></div><div class="ly leaf-r-i2"></div><div class="ly leaf-r-c"></div>
+        <div class="ly rim"></div>
+        <div class="ly glint"></div>
+        <div class="mark splash-mark"></div>
+    </div>
+    <div class="splash-foot">
+        <span class="splash-by">Developed by Jonathan Barnes</span>
+        <span class="splash-loading"><span class="splash-pip"></span><span>Loading</span></span>
+    </div>
+    </div>
+</body>
+</rml>

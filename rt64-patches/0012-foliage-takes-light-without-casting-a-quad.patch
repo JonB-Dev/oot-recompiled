@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Barnes <hello@jonbarnes.dev>
+Date: Wed, 30 Sep 2026 17:40:00 +0100
+Subject: [PATCH] Foliage takes light without casting a quad
+
+Patch 0012 of the renderer series (OoT: Recompiled).
+
+The ladder in patch 0011 did its job. The user, 2026-09-30: "solid if reads depth is what makes
+navis light appear properly". So this game's foliage READS depth and never writes it, which is
+also why the rule that tested for a depth WRITE did nothing at all, and why patch 0010's coverage
+and alpha compare test never matched either.
+
+Reading depth is too wide a rule on its own, and his next sentence says exactly how: "it has
+harsh traiangular shadows and also has a weird mostly transparent triangular outline that its
+likely what is casting the shadow". Every glow, spark and shaft in the game is drawn in that same
+render mode, so all of them became solid too, and a transparent quad traced as solid casts the
+shadow of a quad. The outline and the shadow are the same two triangles seen twice.
+
+Two ways to narrow it, both on the Experiment row so the picture decides rather than another
+reading of the code. Exclude the sprites by triangle count, since a billboard is two triangles
+and a tree is many. And let a reclassified draw take light WITHOUT casting it: a new instance
+mask that every gathering ray traces and the shadow ray does not. Only the draws a rule
+reclassified lose their shadow, so geometry that was always opaque is untouched and nothing the
+game already shadowed stops shadowing.
+
+No shadow at all is not the end state. A leaf should cast a leaf, which means the alpha test at
+the hit on the shadow ray, and that is a later change worth making once the discriminator is
+settled. Until then a missing shadow is better than a wrong one.
+
+With the ray tracing row Off none of this runs.
+---
+diff --git a/src/common/rt64_common.h b/src/common/rt64_common.h
+--- a/src/common/rt64_common.h
++++ b/src/common/rt64_common.h
+@@ -33,6 +33,15 @@ namespace RT64 {
+     // A translucent draw (the microcode's XLU z mode), which no ray traces (patch 0006): a
+     // flame's billboard would otherwise stand between every surface and its torch.
+     static const unsigned int TranslucentRayQueryMask = 0x8;
++    // FOLIAGE THE RAYS LIGHT BUT NO SHADOW RAY SEES (patch 0012). A draw reclassified as
++    // solid by one of the cut-out rules can be given this instead of the depth mask: every
++    // gathering ray traces it, so the surface takes light and occludes like geometry, and the
++    // shadow ray does not, so it casts nothing. The reason is that this game draws its
++    // foliage as quads: traced as a shadow caster, a two triangle quad casts a two triangle
++    // shadow, which is the hard triangular darkening the user reported on 2026-09-30. A leaf
++    // shaped shadow needs the alpha test on the shadow ray, which is a later change; until
++    // then no shadow is better than a wrong one.
++    static const unsigned int FoliageRayQueryMask = 0x10;
+ 
+     // Error string for last error or exception that was caught.
+     extern std::string GlobalLastError;
+diff --git a/src/shaders/Raytracing.hlsl b/src/shaders/Raytracing.hlsl
+--- a/src/shaders/Raytracing.hlsl
++++ b/src/shaders/Raytracing.hlsl
+@@ -33,6 +33,10 @@ static const uint DepthRayQueryMask = 0x1;
+ static const uint NoDepthRayQueryMask = 0x2;
+ static const uint ShadowCatcherRayQueryMask = 0x4;
+ static const uint TranslucentRayQueryMask = 0x8;   // patch 0006: the XLU z mode, which only the water probe traces
++static const uint FoliageRayQueryMask = 0x10;      // patch 0012: lit and occluding, but no shadow ray sees it
++// What every gathering ray traces: the depth masked geometry and the foliage. The SHADOW ray
++// deliberately leaves the foliage out, which is the whole point of the separate bit.
++static const uint GatherRayQueryMask = DepthRayQueryMask | FoliageRayQueryMask;
+ 
+ // How much nearer than the rasterized depth a primary hit may be before it counts as a cut-out
+ // the raster did not draw (patch 0008), in the depth buffer's own units.
+@@ -157,7 +161,7 @@ void PrimaryRayGen() {
+     // call with depth test and write both off is the game painting a backdrop, and this game
+     // draws its sky as a box around the eye that way, which would otherwise stand in front of
+     // every ray. The no-depth instances are the background passes' concern.
+-    TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++    TraceRay(SceneBVH, RAY_FLAG_NONE, GatherRayQueryMask, 0, 0, 0, ray, payload);
+ 
+     gViewDirection[launchIndex] = float4(direction, 0.0f);
+ 
+@@ -214,7 +218,7 @@ void PrimaryRayGen() {
+             payload.shadedColor = 0.0f;
+             payload.hitVelocity = 0.0f;
+             payload.coverage = 1.0f;
+-            TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++            TraceRay(SceneBVH, RAY_FLAG_NONE, GatherRayQueryMask, 0, 0, 0, ray, payload);
+             // Nothing further along the ray at all: the picture shows what the rays cannot see.
+             depthDropped = (payload.instanceId < 0);
+         }
+@@ -1014,7 +1018,7 @@ void IndirectRayGen() {
+     payload.shadedColor = 0.0f;
+     payload.hitVelocity = 0.0f;
+     payload.coverage = 1.0f;
+-    TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++    TraceRay(SceneBVH, RAY_FLAG_NONE, GatherRayQueryMask, 0, 0, 0, ray, payload);
+ 
+     // A ray that leaves the scene brings nothing: the sky's light is what the game's ambient
+     // already is, and adding the horizon's color again washed the open field out.
+@@ -1065,7 +1069,7 @@ void ReflectionRayGen() {
+     payload.shadedColor = 0.0f;
+     payload.hitVelocity = 0.0f;
+     payload.coverage = 1.0f;
+-    TraceRay(SceneBVH, RAY_FLAG_NONE, DepthRayQueryMask, 0, 0, 0, ray, payload);
++    TraceRay(SceneBVH, RAY_FLAG_NONE, GatherRayQueryMask, 0, 0, 0, ray, payload);
+ 
+     float3 radiance;
+     if (payload.instanceId >= 0) {
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1836,9 +1836,29 @@ namespace RT64 {
+                         //            not the classification at all and the search moves to the
+                         //            raster order and the depth mask. It will be wrong for water
+                         //            and for every glow, which is the point: it is a probe.
++                        // THE SECOND RUNG (patch 0012). "Solid if reads depth" is the rule that
++                        // works: the user, 2026-09-30, "solid if reads depth is what makes navis
++                        // light appear properly". That tells us this game's foliage READS depth
++                        // and never writes it, which is why "writes depth" did nothing at all.
++                        //
++                        // But it is too wide, and his next sentence says how: "it has harsh
++                        // traiangular shadows and also has a weird mostly transparent triangular
++                        // outline that its likely what is casting the shadow". Every glow, spark
++                        // and shaft in the game is drawn in that same render mode, so they all
++                        // became solid too, and a transparent QUAD traced as solid casts the
++                        // shadow of a quad. He is right that the outline is what casts it: the
++                        // outline and the shadow are the same two triangles seen twice.
++                        //
++                        // Two ways to narrow it, both on the row so the picture decides again:
++                        // exclude the sprites by their triangle count (a billboard is two
++                        // triangles, a tree is many), and let these draws take light without
++                        // casting it (FoliageRayQueryMask, which every gathering ray traces and
++                        // the shadow ray does not).
+                         const uint32_t acMode = otherMode.alphaCompare();
+                         const int cutoutRule = int(rtResources->rtParams.tuneExperiment.x);
++                        const bool manyTriangles = (call.callDesc.triangleCount > 2);
+                         bool solidDraw;
++                        bool castsNothing = false;
+                         switch (cutoutRule) {
+                             case 8:  solidDraw = false; break;
+                             case 9:  solidDraw = otherMode.zUpd(); break;
+@@ -1846,12 +1866,22 @@ namespace RT64 {
+                             case 11: solidDraw = otherMode.alphaCvgSel(); break;
+                             case 12: solidDraw = !otherMode.forceBlend(); break;
+                             case 13: solidDraw = true; break;
++                            case 14: solidDraw = otherMode.zCmp(); castsNothing = true; break;
++                            case 15: solidDraw = otherMode.zCmp() && manyTriangles; break;
++                            case 16: solidDraw = otherMode.zCmp() && manyTriangles; castsNothing = true; break;
+                             default: solidDraw = otherMode.cvgXAlpha() || (acMode == G_AC_THRESHOLD) || (acMode == G_AC_DITHER); break;
+                         }
+                         // A translucent draw (the XLU z mode) gets a mask no ray carries (patch 0006).
+-                        if ((otherMode.zMode() == ZMODE_XLU) && !solidDraw) {
++                        const bool wasTranslucent = (otherMode.zMode() == ZMODE_XLU);
++                        if (wasTranslucent && !solidDraw) {
+                             raytracing.queryMask = TranslucentRayQueryMask;
+                         }
++                        else if (wasTranslucent && castsNothing) {
++                            // Only the draws this rule RECLASSIFIED lose their shadow. Geometry
++                            // that was always opaque is untouched, so nothing the game already
++                            // shadowed stops shadowing.
++                            raytracing.queryMask = FoliageRayQueryMask;
++                        }
+                         else {
+                             raytracing.queryMask = (otherMode.zCmp() || otherMode.zUpd()) ? DepthRayQueryMask : NoDepthRayQueryMask;
+                         }
